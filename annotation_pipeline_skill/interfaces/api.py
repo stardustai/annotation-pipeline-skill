@@ -1451,6 +1451,12 @@ class DashboardApi:
         # confirmation modal to surface the real (task-count) impact
         # before the operator commits.
         dry_run = bool(payload.get("dry_run"))
+        # Optional: skip the project convention write while still
+        # patching tasks. Used when the operator wants a one-off bulk
+        # task fix without polluting the convention table (e.g. for
+        # context-specific spans that shouldn't influence future tasks).
+        # Defaults to True for back-compat.
+        set_convention = bool(payload.get("set_convention", True))
         if not project_id or not span:
             return self._json_response(400, {"error": "project_and_span_required"})
         if entity_type_raw is None:
@@ -1465,7 +1471,7 @@ class DashboardApi:
 
         conv_svc = EntityConventionService(store)
         conv = None
-        if not dry_run:
+        if not dry_run and set_convention:
             try:
                 conv = conv_svc.record_decision(
                     project_id=project_id,
@@ -1627,12 +1633,14 @@ class DashboardApi:
             pass
 
         return self._json_response(200, {
-            "convention": {
-                "convention_id": conv.convention_id,
-                "span": conv.span_original or span,
-                "entity_type": conv.entity_type,
-                "status": conv.status,
-            },
+            "convention": (
+                None if conv is None else {
+                    "convention_id": conv.convention_id,
+                    "span": conv.span_original or span,
+                    "entity_type": conv.entity_type,
+                    "status": conv.status,
+                }
+            ),
             "fixed": fixed,
             "skipped": skipped,
             "errors": errors,
