@@ -13,6 +13,7 @@ import { DocumentsPanel } from "./components/DocumentsPanel";
 import { SchemaPanel } from "./components/SchemaPanel";
 import { EventLogPanel } from "./components/EventLogPanel";
 import { EntityKnowledgePanel } from "./components/EntityKnowledgePanel";
+import { TypeStatisticsPanel } from "./components/TypeStatisticsPanel";
 import { KanbanBoard } from "./components/KanbanBoard";
 import { OutputPanel } from "./components/OutputPanel";
 import { PosteriorAuditPanel } from "./components/PosteriorAuditPanel";
@@ -24,7 +25,7 @@ import type { KanbanSnapshot, ProjectSummary, StoreInfo, TaskCard, TaskDetail } 
 import { useUrlState, type UrlState } from "./url_state";
 
 const emptySnapshot: KanbanSnapshot = { project_id: null, columns: [] };
-type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "documents" | "schema" | "posterior-audit" | "entity-knowledge";
+type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "documents" | "schema" | "posterior-audit" | "entity-knowledge" | "statistics";
 
 const urlDefaults: UrlState = { view: "kanban", store: null, project: null, task: null };
 
@@ -251,6 +252,9 @@ export default function App() {
         <button className={viewMode === "entity-knowledge" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("entity-knowledge")}>
           Entity Knowledge
         </button>
+        <button className={viewMode === "statistics" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("statistics")}>
+          Statistics
+        </button>
       </nav>
 
       {error ? <div className="notice">{error}</div> : null}
@@ -298,6 +302,9 @@ export default function App() {
       ) : null}
       {viewMode === "entity-knowledge" ? (
         <EntityKnowledgePanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
+      ) : null}
+      {viewMode === "statistics" ? (
+        <TypeStatisticsPanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
       ) : null}
       <TaskDrawer
         task={selectedTask}

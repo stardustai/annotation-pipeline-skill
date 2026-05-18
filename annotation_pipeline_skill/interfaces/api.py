@@ -357,6 +357,142 @@ def write_posterior_audit_cache(
     store._conn.commit()
 
 
+def build_type_statistics(store, *, project_id: str) -> dict:
+    """Walk every ACCEPTED task in the project and aggregate counts by
+    entity type AND by json_structure phrase type. The "Statistics"
+    dashboard view renders these distributions.
+
+    Returns:
+      {
+        "entities": {type: {tasks: int, occurrences: int}, ...},
+        "json_structures": {type: {tasks: int, phrases: int}, ...},
+        "scanned_tasks": int,
+        "skipped_tasks": int,
+      }
+
+    `occurrences` counts every (span, type) pair (a span tagged in N
+    rows of one task counts N). `tasks` counts distinct tasks where
+    that type appears at all. Similar for json_structures.phrases.
+    """
+    from annotation_pipeline_skill.core.states import TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import _parse_llm_json
+    import re as _re
+
+    def _load_annotation(task):
+        arts = store.list_artifacts(task.task_id)
+        hr = [a for a in arts if a.kind == "human_review_answer"]
+        if hr:
+            try:
+                outer = json.loads((store.root / hr[-1].path).read_text(encoding="utf-8"))
+                return outer.get("answer") if isinstance(outer, dict) else None
+            except (json.JSONDecodeError, OSError):
+                return None
+        anns = [a for a in arts if a.kind == "annotation_result"]
+        # Walk in reverse: skip empty / unparseable artifacts (some failure
+        # modes write text="" — see the AnnotationView fallback).
+        for art in reversed(anns):
+            try:
+                outer = json.loads((store.root / art.path).read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            text = outer.get("text") if isinstance(outer, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                continue
+            cleaned = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL | _re.IGNORECASE).strip()
+            try:
+                return _parse_llm_json(cleaned)
+            except (ValueError, json.JSONDecodeError):
+                continue
+        return None
+
+    entity_occurrences: dict[str, int] = {}
+    entity_tasks: dict[str, int] = {}
+    js_phrases: dict[str, int] = {}
+    js_tasks: dict[str, int] = {}
+    scanned = 0
+    skipped = 0
+    for task in store.list_tasks_by_pipeline(project_id):
+        if task.status is not TaskStatus.ACCEPTED:
+            continue
+        payload = _load_annotation(task)
+        if not isinstance(payload, dict):
+            skipped += 1
+            continue
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            skipped += 1
+            continue
+        task_entity_types: set[str] = set()
+        task_js_types: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            output = row.get("output")
+            if not isinstance(output, dict):
+                continue
+            entities = output.get("entities")
+            if isinstance(entities, dict):
+                for typ, items in entities.items():
+                    if not isinstance(items, list):
+                        continue
+                    real_items = [s for s in items if isinstance(s, str) and s.strip()]
+                    if not real_items:
+                        continue
+                    entity_occurrences[typ] = entity_occurrences.get(typ, 0) + len(real_items)
+                    task_entity_types.add(typ)
+            js = output.get("json_structures")
+            if isinstance(js, dict):
+                for typ, phrases in js.items():
+                    if not isinstance(phrases, list):
+                        continue
+                    real_phrases = [p for p in phrases if isinstance(p, str) and p.strip()]
+                    if not real_phrases:
+                        continue
+                    js_phrases[typ] = js_phrases.get(typ, 0) + len(real_phrases)
+                    task_js_types.add(typ)
+        for typ in task_entity_types:
+            entity_tasks[typ] = entity_tasks.get(typ, 0) + 1
+        for typ in task_js_types:
+            js_tasks[typ] = js_tasks.get(typ, 0) + 1
+        scanned += 1
+
+    return {
+        "entities": {
+            typ: {"tasks": entity_tasks.get(typ, 0), "occurrences": entity_occurrences[typ]}
+            for typ in sorted(entity_occurrences, key=lambda k: -entity_occurrences[k])
+        },
+        "json_structures": {
+            typ: {"tasks": js_tasks.get(typ, 0), "phrases": js_phrases[typ]}
+            for typ in sorted(js_phrases, key=lambda k: -js_phrases[k])
+        },
+        "scanned_tasks": scanned,
+        "skipped_tasks": skipped,
+    }
+
+
+def read_type_statistics_cache(store, *, project_id: str) -> dict | None:
+    row = store._conn.execute(
+        "SELECT payload_json, created_at FROM type_statistics_cache WHERE project_id=?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"payload": json.loads(row["payload_json"]), "created_at": row["created_at"]}
+
+
+def write_type_statistics_cache(
+    store, *, project_id: str, payload: dict, created_at: str,
+) -> None:
+    store._conn.execute(
+        "INSERT INTO type_statistics_cache (project_id, payload_json, created_at) "
+        "VALUES (?,?,?) "
+        "ON CONFLICT(project_id) DO UPDATE SET "
+        "payload_json=excluded.payload_json, created_at=excluded.created_at",
+        (project_id, json.dumps(payload, ensure_ascii=False), created_at),
+    )
+    store._conn.commit()
+
+
 CONFIG_FILE_DEFINITIONS: dict[str, str] = {
     "annotation_rules.yaml": "Annotation Rules",
     "annotators.yaml": "Annotation Agents",
@@ -506,6 +642,19 @@ class DashboardApi:
                 "current_accepted_hash": current_hash,
                 "stale": cached["accepted_hash"] != current_hash,
             })
+        if route == "/api/type-statistics":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            cached = read_type_statistics_cache(store, project_id=project_id)
+            if cached is None:
+                return self._json_response(200, {
+                    "cached": False, "payload": None, "generated_at": None,
+                })
+            return self._json_response(200, {
+                "cached": True,
+                "payload": cached["payload"],
+                "generated_at": cached["created_at"],
+            })
         if route == "/api/typical-text":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -625,6 +774,18 @@ class DashboardApi:
                 "cached_accepted_hash": accepted_hash,
                 "current_accepted_hash": accepted_hash,
                 "stale": False,
+            })
+        if route == "/api/type-statistics":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            payload = build_type_statistics(store, project_id=project_id)
+            from annotation_pipeline_skill.core.models import utc_now
+            created_at = utc_now().isoformat()
+            write_type_statistics_cache(
+                store, project_id=project_id, payload=payload, created_at=created_at,
+            )
+            return self._json_response(200, {
+                "cached": True, "payload": payload, "generated_at": created_at,
             })
         if route == "/api/documents":
             return self._post_document_response(store, body)

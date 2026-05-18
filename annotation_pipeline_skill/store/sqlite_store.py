@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS posterior_audit_cache (
     accepted_hash TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
+
+-- Cached per-project distribution of entity types and json_structure
+-- phrase types across ACCEPTED tasks. Powers the Statistics dashboard
+-- view. Recomputed on POST /api/type-statistics (GET serves cache).
+CREATE TABLE IF NOT EXISTS type_statistics_cache (
+    project_id   TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
 """
 
 
