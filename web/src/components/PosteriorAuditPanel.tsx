@@ -313,6 +313,20 @@ function DeviationsTable({
   // the fix patches this task only and doesn't promote to a project rule.
   const [saveConv, setSaveConv] = useState<Record<string, boolean>>({});
   const getSaveConv = (key: string) => saveConv[key] ?? true;
+  // Apply-to-all flow: confirmation dialog + per-span progress + final
+  // summary. Keyed by span (not row key) since one apply-to-all affects
+  // every row sharing the same span.
+  const [pendingApplyAll, setPendingApplyAll] = useState<
+    | { span: string; type: string; otherCount: number; totalCount: number; sharePct: number }
+    | null
+  >(null);
+  const [retroProgress, setRetroProgress] = useState<
+    Record<string, { processed: number; total: number }>
+  >({});
+  const [retroResult, setRetroResult] = useState<
+    Record<string, { fixed: number; skipped: number; errors: number }>
+  >({});
+  const [applyingAllSpan, setApplyingAllSpan] = useState<string | null>(null);
 
   // Dedupe: backend may emit multiple rows for the same (task, span) when
   // the span occurs in multiple input rows of one task. The operator's
@@ -378,8 +392,172 @@ function DeviationsTable({
     }
   }
 
+  function requestApplyAll(d: DedupedDeviation, type: string) {
+    const otherCount = type === NOT_ENTITY
+      ? d.prior_total
+      : d.prior_total - (d.prior_distribution[type] || 0);
+    if (otherCount <= 0) return;
+    const sharePct = d.prior_total > 0
+      ? Math.round((otherCount / d.prior_total) * 100)
+      : 0;
+    setPendingApplyAll({
+      span: d.span,
+      type,
+      otherCount,
+      totalCount: d.prior_total,
+      sharePct,
+    });
+  }
+
+  async function runApplyAllSweep(span: string, type: string, expectedTotal: number) {
+    setApplyingAllSpan(span);
+    setRetroProgress((prev) => ({ ...prev, [span]: { processed: 0, total: expectedTotal } }));
+    let totalFixed = 0;
+    let totalSkipped = 0;
+    let totalErrors = 0;
+    let serverTotal = expectedTotal;
+    try {
+      const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
+      const body = {
+        project_id: projectId,
+        span,
+        entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
+        actor: "posterior_audit_retroactive_ui",
+        batch_size: 25,
+      };
+      for (let safety = 0; safety < 1000; safety++) {
+        const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
+        }
+        const data = (await r.json()) as {
+          fixed: number;
+          skipped: number;
+          errors: { task_id: string; reason: string }[];
+          remaining: number;
+          done: boolean;
+        };
+        totalFixed += data.fixed;
+        totalSkipped += data.skipped;
+        totalErrors += data.errors?.length ?? 0;
+        if (safety === 0) {
+          serverTotal = data.fixed + data.errors.length + data.remaining;
+        }
+        const processed = serverTotal - data.remaining;
+        setRetroProgress((prev) => ({
+          ...prev,
+          [span]: { processed, total: serverTotal },
+        }));
+        if (data.done) break;
+      }
+      setRetroResult((prev) => ({
+        ...prev,
+        [span]: { fixed: totalFixed, skipped: totalSkipped, errors: totalErrors },
+      }));
+      onAfterFix();
+    } catch (e) {
+      // Surface via per-span pseudo-status; map onto every row sharing
+      // this span via the rowStatus map.
+      const msg = e instanceof Error ? e.message : String(e);
+      setRowStatus((s) => {
+        const next = { ...s };
+        for (const r of deduped) {
+          if (r.span === span) {
+            const k = `${r.task_id}|${r.span}|${r.current_type}`;
+            next[k] = `error: ${msg}`;
+          }
+        }
+        return next;
+      });
+    } finally {
+      setApplyingAllSpan(null);
+      setRetroProgress((prev) => {
+        const next = { ...prev };
+        delete next[span];
+        return next;
+      });
+    }
+  }
+
+  async function handleApplyAllConfirm() {
+    if (!pendingApplyAll) return;
+    const { span, type, otherCount } = pendingApplyAll;
+    setPendingApplyAll(null);
+    await runApplyAllSweep(span, type, otherCount);
+  }
+
   return (
     <>
+      {pendingApplyAll ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+          }}
+          onClick={() => setPendingApplyAll(null)}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: "6px",
+              padding: "1.25rem 1.5rem",
+              maxWidth: "520px",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: "0.75rem", fontSize: "1rem" }}>
+              Confirm bulk retroactive fix
+            </h3>
+            <p style={{ margin: "0 0 0.75rem", fontSize: "0.9rem", lineHeight: 1.5 }}>
+              Apply <strong>'{pendingApplyAll.span}'</strong> → type{" "}
+              <strong>
+                {pendingApplyAll.type === NOT_ENTITY
+                  ? "🚫 not_an_entity (delete)"
+                  : pendingApplyAll.type}
+              </strong>{" "}
+              to all <strong>{pendingApplyAll.otherCount}</strong> occurrence(s) currently
+              tagged differently ({pendingApplyAll.sharePct}% of {pendingApplyAll.totalCount} total)?
+            </p>
+            <p style={{ margin: "0 0 1rem", fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+              This will declare a project convention AND rewrite each task's
+              annotation. Original annotation_result preserved for audit.
+            </p>
+            <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                onClick={() => setPendingApplyAll(null)}
+                style={{ fontSize: "0.85rem" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleApplyAllConfirm}
+                style={{
+                  fontSize: "0.85rem",
+                  background: "var(--primary, #1e40af)",
+                  color: "white",
+                }}
+              >
+                Apply to {pendingApplyAll.otherCount}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <div style={{ margin: "0.4rem 0" }}>
         <input
           type="search"
@@ -407,11 +585,17 @@ function DeviationsTable({
             <tr style={THEAD_ROW}>
               <th style={TH_FIRST}>Task</th>
               <th style={TH}>Span</th>
-              <th style={{ ...TH, width: "24%" }}>Original text</th>
+              <th style={{ ...TH, width: "22%" }}>Original text</th>
               <th style={TH}>Current</th>
-              <th style={{ ...TH, width: "14%" }}>Distribution</th>
-              <th style={{ ...TH, width: "26%" }}>Set type</th>
+              <th style={{ ...TH, width: "12%" }}>Distribution</th>
+              <th style={{ ...TH, width: "22%" }}>Set type</th>
               <th style={TH}></th>
+              <th
+                style={{ ...TH, width: "16%" }}
+                title="Declare convention AND retroactively patch every ACCEPTED task that has this span tagged differently"
+              >
+                Apply to all
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -538,6 +722,80 @@ function DeviationsTable({
                         {err}
                       </p>
                     ) : null}
+                  </td>
+                  <td style={TD}>
+                    {retroProgress[d.span] ? (
+                      (() => {
+                        const { processed, total } = retroProgress[d.span];
+                        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+                        return (
+                          <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                            <div style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
+                              {processed} / {total} — {pct}%
+                            </div>
+                            <div
+                              style={{
+                                width: "100%",
+                                height: "6px",
+                                background: "var(--border, #e5e7eb)",
+                                borderRadius: "3px",
+                                overflow: "hidden",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  width: `${pct}%`,
+                                  height: "100%",
+                                  background: "var(--primary, #1e40af)",
+                                  transition: "width 0.2s ease-out",
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : retroResult[d.span] ? (
+                      <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
+                        fixed {retroResult[d.span].fixed} task(s)
+                        {retroResult[d.span].skipped > 0
+                          ? `, skipped ${retroResult[d.span].skipped}`
+                          : ""}
+                        {retroResult[d.span].errors > 0
+                          ? `, ${retroResult[d.span].errors} error(s)`
+                          : ""}
+                      </span>
+                    ) : (() => {
+                      const otherCount = sel
+                        ? (sel === NOT_ENTITY
+                            ? d.prior_total
+                            : d.prior_total - (d.prior_distribution[sel] || 0))
+                        : 0;
+                      const noun = otherCount === 1 ? "occurrence" : "occurrences";
+                      const label = sel
+                        ? `Apply to other ${otherCount} ${noun}`
+                        : "Apply to all";
+                      const disabled = !sel || otherCount === 0 || isSubmitting || applyingAllSpan !== null || isSubmitted;
+                      return (
+                        <button
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => sel && requestApplyAll(d, sel)}
+                          title={
+                            sel
+                              ? `Declare '${d.span}' → ${sel === NOT_ENTITY ? "not_an_entity" : sel} as project convention AND retroactively patch ${otherCount} other ACCEPTED task annotation(s) tagged differently`
+                              : "Pick a type first"
+                          }
+                          style={{
+                            fontSize: "0.8rem",
+                            background: !disabled ? "var(--primary, #1e40af)" : undefined,
+                            color: !disabled ? "white" : undefined,
+                            opacity: disabled ? 0.6 : 1,
+                          }}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })()}
                   </td>
                 </tr>
               );
