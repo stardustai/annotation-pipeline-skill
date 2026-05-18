@@ -46,6 +46,16 @@ class QCParseError(ValueError):
         self.diagnostics = {"error_kind": "parse_error", "raw_text": raw_text}
 
 
+# Mirror ``schema_validation._TRAILING_SENTENCE_PUNCT`` so the in-runtime
+# auto-align can prefer the punct-trimmed form when the source helper would
+# otherwise flag it at apply time.
+_TRAILING_SENTENCE_PUNCT_RT = ".,;:!?。，；：！？"
+
+
+def _strip_trailing_sentence_punct(span: str) -> str:
+    return span.rstrip(_TRAILING_SENTENCE_PUNCT_RT)
+
+
 def _is_rate_limited(exc: BaseException) -> bool:
     """Detect provider rate-limit / quota errors across SDKs and local-CLI clients.
 
@@ -1319,6 +1329,16 @@ class SubagentRuntime:
                         if not isinstance(span, str) or not span:
                             continue
                         if span in input_text:
+                            # Already verbatim, but trailing sentence punct
+                            # might still trip find_trailing_punctuation_spans
+                            # at the apply step. Mirror that helper's rule:
+                            # if the trimmed form is ALSO in input.text, the
+                            # trailing punct is sentence boundary, not part
+                            # of the entity — prefer trimmed.
+                            trimmed = _strip_trailing_sentence_punct(span)
+                            if trimmed and trimmed != span and trimmed in input_text:
+                                items[i] = trimmed
+                                rewrites += 1
                             continue
                         aligned = try_align_to_verbatim(span, input_text)
                         if aligned is not None:
