@@ -739,42 +739,48 @@ function ContestedTable({
                     )}
                   </td>
                   <td style={TD}>
-                    {committedType ? (
-                      retroResult[c.span] ? (
-                        <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
-                          fixed {retroResult[c.span].fixed} task(s)
-                          {retroResult[c.span].skipped > 0
-                            ? `, skipped ${retroResult[c.span].skipped}`
-                            : ""}
-                          {retroResult[c.span].errors > 0
-                            ? `, ${retroResult[c.span].errors} error(s)`
-                            : ""}
-                        </span>
-                      ) : (
-                        <span className="runtime-muted" style={{ fontSize: "0.75rem" }}>
-                          —
-                        </span>
-                      )
-                    ) : (
-                      <button
-                        type="button"
-                        disabled={!pickedType || isSubmitting}
-                        onClick={() => pickedType && handleConfirmAndApplyAll(c.span, pickedType)}
-                        title={
-                          pickedType
-                            ? `Declare convention AND retroactively patch every existing ACCEPTED task in the project that has '${c.span}' tagged differently`
-                            : "Pick a type in the Set Convention column first"
-                        }
-                        style={{
-                          fontSize: "0.8rem",
-                          background: pickedType ? "var(--primary, #1e40af)" : undefined,
-                          color: pickedType ? "white" : undefined,
-                          opacity: !pickedType || isSubmitting ? 0.6 : 1,
-                        }}
-                      >
-                        {isSubmitting ? "…" : "Confirm & apply to all"}
-                      </button>
-                    )}
+                    {retroResult[c.span] ? (
+                      // Retroactive fix already ran — show the summary.
+                      <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
+                        fixed {retroResult[c.span].fixed} task(s)
+                        {retroResult[c.span].skipped > 0
+                          ? `, skipped ${retroResult[c.span].skipped}`
+                          : ""}
+                        {retroResult[c.span].errors > 0
+                          ? `, ${retroResult[c.span].errors} error(s)`
+                          : ""}
+                      </span>
+                    ) : (() => {
+                      // After plain Confirm, committedType is set but no
+                      // retro happened yet — still let the operator trigger
+                      // the retroactive sweep against the committed type.
+                      // Before any confirm, the button uses pickedType.
+                      const triggerType = committedType ?? pickedType;
+                      const label = committedType
+                        ? "Apply to all"
+                        : "Confirm & apply to all";
+                      const title = triggerType
+                        ? (committedType
+                            ? `Retroactively patch every existing ACCEPTED task that has '${c.span}' tagged as something other than ${committedType === NOT_ENTITY ? "not_an_entity" : committedType}`
+                            : `Declare convention AND retroactively patch every existing ACCEPTED task that has '${c.span}' tagged differently`)
+                        : "Pick a type in the Set Convention column first";
+                      return (
+                        <button
+                          type="button"
+                          disabled={!triggerType || isSubmitting}
+                          onClick={() => triggerType && handleConfirmAndApplyAll(c.span, triggerType)}
+                          title={title}
+                          style={{
+                            fontSize: "0.8rem",
+                            background: triggerType ? "var(--primary, #1e40af)" : undefined,
+                            color: triggerType ? "white" : undefined,
+                            opacity: !triggerType || isSubmitting ? 0.6 : 1,
+                          }}
+                        >
+                          {isSubmitting ? "…" : label}
+                        </button>
+                      );
+                    })()}
                   </td>
                 </tr>
               );
