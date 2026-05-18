@@ -61,7 +61,29 @@ function urlWithStore(base: string, projectId: string, storeKey: string | null |
 
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
-  return iso.replace("T", " ").slice(0, 19) + " UTC";
+  // Parse the (UTC-tagged) backend timestamp and render in the browser's
+  // local timezone with a stable YYYY-MM-DD HH:mm:ss TZ format. The
+  // backend writes ISO 8601 with explicit offset (e.g. "+00:00"), so
+  // `new Date(iso)` parses correctly without ambiguity.
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mi = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+  // Pull the timezone abbreviation from Intl so the user sees their
+  // actual zone (e.g. PDT / GMT+8) instead of a misleading "UTC".
+  let tz = "";
+  try {
+    const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(d);
+    tz = parts.find((p) => p.type === "timeZoneName")?.value ?? "";
+  } catch {
+    tz = "";
+  }
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}${tz ? " " + tz : ""}`;
 }
 
 export function PosteriorAuditPanel({
