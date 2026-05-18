@@ -53,6 +53,54 @@ def _is_rate_limited(exc: BaseException) -> bool:
     return "rate limit" in text or "429" in text or "too many requests" in text
 
 
+def _is_provider_transient_error(exc: BaseException) -> bool:
+    """Detect provider-side errors worth retrying through the fallback target:
+    rate-limiting (429) AND server-side errors (5xx). Without 5xx handling
+    a single bad upstream wedges the worker pool in a tight worker_bail
+    loop (lease released, exception swallowed, task re-claimed, same 500,
+    repeat — observed ~1 req/sec, 4000+ events/min).
+
+    Explicitly EXCLUDES 4xx errors other than 429 (404 wrong endpoint, 401
+    bad key, 400 schema mismatch, etc.). These are configuration problems
+    that retrying won't fix; ``_is_provider_permanent_error`` short-circuits
+    them straight to HR instead of consuming the 5-bail cap.
+    """
+    if _is_rate_limited(exc):
+        return True
+    name = type(exc).__name__
+    if "InternalServerError" in name or "ServiceUnavailable" in name or "BadGateway" in name:
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 500 <= status < 600:
+        return True
+    text = str(exc).lower()
+    return any(s in text for s in (" 500 ", " 502 ", " 503 ", " 504 ",
+                                    "internal server error", "service unavailable",
+                                    "bad gateway", "gateway timeout"))
+
+
+def _is_provider_permanent_error(exc: BaseException) -> bool:
+    """Detect provider 4xx errors that won't change on retry: 404 (wrong
+    endpoint/model), 401 (bad api_key), 400 (malformed request). 429 is
+    intentionally NOT covered — it's transient. These errors are config
+    bugs; retrying or falling-back to the same broken config is pure
+    waste, so the worker should skip the 5-bail dance and route straight
+    to HR with the operator-actionable error message.
+    """
+    if _is_rate_limited(exc):
+        return False
+    name = type(exc).__name__
+    if name in {"NotFoundError", "AuthenticationError", "PermissionDeniedError",
+                "BadRequestError", "UnprocessableEntityError"}:
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in {400, 401, 403, 404, 422}:
+        return True
+    text = str(exc).lower()
+    return any(s in text for s in ("not found", "unauthorized", "forbidden",
+                                    " 400 ", " 401 ", " 403 ", " 404 ", " 422 "))
+
+
 class SubagentRuntime:
     def __init__(
         self,
@@ -298,8 +346,8 @@ class SubagentRuntime:
                 task,
                 TaskStatus.HUMAN_REVIEW,
                 reason=(
-                    f"arbiter exhausted {count} mechanical retries without an "
-                    "actionable verdict; routing to human review"
+                    f"Arbiter retried {count} times but kept failing to return a usable answer "
+                    "(JSON parse / non-verbatim correction / LLM error); routing to human review"
                 ),
                 stage=stage,
                 attempt_id=attempt_id,
@@ -364,7 +412,7 @@ class SubagentRuntime:
                     self._transition(
                         task,
                         TaskStatus.HUMAN_REVIEW,
-                        reason="arbiter unresolved verdicts; needs human judgment",
+                        reason="Arbiter flagged its own answer as uncertain (tentative/unsure verdict); needs human review",
                         stage="validation",
                         attempt_id=annotation_attempt_id,
                         metadata={
@@ -397,6 +445,10 @@ class SubagentRuntime:
         # Currently: duplicate same-type spans (auto-deduped at serialize,
         # but worth flagging so the annotator learns).
         self._record_duplicate_warning_feedback(task, annotation_attempt_id, annotation_final_text)
+        # Annotation succeeded — reset the scheduler's worker_bail_count so
+        # a streak of past failures doesn't trip the bail-cap if the task
+        # re-enters annotation later via a normal QC rerun.
+        task.metadata.pop("worker_bail_count", None)
         self._transition(
             task,
             TaskStatus.QC,
@@ -561,7 +613,7 @@ class SubagentRuntime:
                     self._transition(
                         task,
                         TaskStatus.HUMAN_REVIEW,
-                        reason="arbiter unresolved verdicts; needs human judgment",
+                        reason="Arbiter flagged its own answer as uncertain (tentative/unsure verdict); needs human review",
                         stage="qc",
                         attempt_id=qc_attempt_id,
                         metadata={
@@ -938,8 +990,8 @@ class SubagentRuntime:
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         try:
             return await self._call_client(target, request)
-        except Exception as exc:  # noqa: BLE001 — fall back on any rate-limit signal
-            if target == "fallback" or not _is_rate_limited(exc):
+        except Exception as exc:  # noqa: BLE001 — try fallback on transient provider errors
+            if target == "fallback" or not _is_provider_transient_error(exc):
                 raise
             return await self._call_client("fallback", request)
 
@@ -957,13 +1009,24 @@ class SubagentRuntime:
         self.store.append_artifact(artifact)
 
     def _next_attempt_id(self, task: Task) -> str:
-        # Derive from MAX(idx) of already-persisted attempts rather than
-        # task.current_attempt: the latter can be reset to 0 by an import
-        # UPSERT, which would otherwise produce a colliding attempt-1 and
-        # blow up on the attempts.attempt_id UNIQUE constraint.
-        existing = self.store.list_attempts(task.task_id)
-        max_idx = max((a.index for a in existing), default=0)
-        return f"{task.task_id}-attempt-{max_idx + 1}"
+        # Parse the numeric suffix out of existing attempt_ids and pick
+        # max+1. We can't use task.current_attempt (resettable by import
+        # UPSERT) and we can't use max(idx) either: the arbiter path can
+        # write a row whose attempt_id ends in `-12` while idx stays at
+        # 11 (single arbiter run produces multiple attempt rows sharing
+        # the same logical round). Looking at idx in that case yields
+        # `attempt-12` again on the next call, blowing up on the
+        # UNIQUE(attempt_id) constraint and trapping the task in a
+        # silent re-pickup loop. The id-suffix is the durable identity
+        # of the row, so derive next from it directly.
+        import re as _re
+        suffixes: list[int] = []
+        for a in self.store.list_attempts(task.task_id):
+            m = _re.search(r"-attempt-(\d+)(?:-|$)", a.attempt_id)
+            if m:
+                suffixes.append(int(m.group(1)))
+        next_n = max(suffixes, default=-1) + 1
+        return f"{task.task_id}-attempt-{next_n}"
 
     def _record_validation_feedback(
         self,
@@ -1259,7 +1322,31 @@ class SubagentRuntime:
             if not self._latest_annotation_is_valid_json(task):
                 arb["mechanical_fail"] += 1
                 return None
+            # ALSO re-validate verbatim / cross-type / trailing-punct on the
+            # current annotation_result. The annotator-wins path was the
+            # gap: a re-run annotation that introduced non-verbatim spans
+            # could pass QC (no automated verbatim check there) and reach
+            # arbiter, which then sides with the annotator and accepts the
+            # bad data without ever re-verifying. The defect-fix path
+            # (_apply_arbiter_correction) already runs these checks; mirror
+            # them here so both arbiter outcomes guarantee the same minimum
+            # quality before ACCEPTED.
             annotation_artifact = self._latest_annotation_artifact(task.task_id)
+            try:
+                _payload = self._load_annotation_payload(annotation_artifact)
+            except Exception:  # noqa: BLE001
+                _payload = None
+            if isinstance(_payload, dict):
+                from annotation_pipeline_skill.core.schema_validation import (
+                    find_cross_type_collisions,
+                    find_trailing_punctuation_spans,
+                    find_verbatim_violations,
+                )
+                if find_verbatim_violations(task, _payload) \
+                        or find_cross_type_collisions(_payload) \
+                        or find_trailing_punctuation_spans(task, _payload):
+                    arb["mechanical_fail"] += 1
+                    return None
             self._increment_entity_statistics_for_task(
                 task, annotation_artifact, weight=1
             )
@@ -1551,7 +1638,7 @@ class SubagentRuntime:
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
-                reason="three-way disagreement: first arbiter, second arbiter, and prior all differ",
+                reason="Three-way disagreement: first arbiter, second arbiter (different LLM family), and project history each picked a different type for the same span; needs human review",
                 stage="prior_verifier",
                 attempt_id=attempt_id,
                 metadata={
@@ -1649,13 +1736,35 @@ class SubagentRuntime:
         falls back to HUMAN_REVIEW.
         """
         attempt_id = self._next_attempt_id(task)
-        arb = await self._arbitrate_and_apply(
-            task,
-            attempt_id,
-            stage="arbitration",
-            include_closed_feedbacks=True,
-            require_rebuttal=False,
-        )
+        # Wrap the arbiter call: any internal exception (LLM error, JSON
+        # parse fail, SQLite IntegrityError on attempt insertion, etc.)
+        # must be converted into a mechanical_fail outcome rather than
+        # propagating up to the worker pool — the pool's catch-all
+        # `except Exception: pass` would otherwise swallow the error,
+        # release the lease without saving any metadata change, and let
+        # the scheduler re-claim the task indefinitely (no audit event,
+        # no retry counter advancing). Mechanical_fail goes through
+        # _handle_arbiter_mechanical_fail which bumps the per-task retry
+        # counter and forces HR at the 3-retry cap.
+        try:
+            arb = await self._arbitrate_and_apply(
+                task,
+                attempt_id,
+                stage="arbitration",
+                include_closed_feedbacks=True,
+                require_rebuttal=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            arb = {
+                "ran": False,
+                "closed": 0,
+                "fixed": 0,
+                "unresolved": 0,
+                "mechanical_fail": 1,
+                "corrected_annotation": None,
+                "exception_class": type(exc).__name__,
+                "exception_message": str(exc)[:200],
+            }
         terminal = self._terminal_from_arbiter(task, attempt_id, "arbitration", arb)
         if terminal is None:
             # HR only on tentative/unsure arbiter verdicts. Mechanical
@@ -1666,7 +1775,7 @@ class SubagentRuntime:
                 self._transition(
                     task,
                     TaskStatus.HUMAN_REVIEW,
-                    reason="arbiter unresolved verdicts; needs human judgment",
+                    reason="Arbiter flagged its own answer as uncertain (tentative/unsure verdict); needs human review",
                     stage="arbitration",
                     attempt_id=attempt_id,
                     metadata={
@@ -2143,11 +2252,16 @@ class SubagentRuntime:
             return None
         if not matches:
             return None
-        lines = [
-            f"  - {m.span_original!r} → entities.{m.entity_type}"
-            + (f"  (notes: {m.notes})" if m.notes else "")
-            for m in matches[:50]  # cap at 50 to bound prompt size
-        ]
+        lines = []
+        for m in matches[:50]:  # cap at 50 to bound prompt size
+            note_suffix = f"  (notes: {m.notes})" if m.notes else ""
+            if m.entity_type == "not_an_entity":
+                lines.append(
+                    f"  - {m.span_original!r} → DO NOT TAG (this span is "
+                    f"intentionally NOT an entity in this project)" + note_suffix
+                )
+            else:
+                lines.append(f"  - {m.span_original!r} → entities.{m.entity_type}" + note_suffix)
         return (
             "KNOWN ENTITY CONVENTIONS FOR THIS PROJECT (established by prior "
             "QC consensus, arbiter rulings, or human review — apply them so "
