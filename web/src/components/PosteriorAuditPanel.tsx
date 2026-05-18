@@ -506,6 +506,17 @@ function DeviationsTable({
         ...prev,
         [span]: { fixed: totalFixed, skipped: totalSkipped, errors: totalErrors },
       }));
+      // Recount entity_statistics so contested-spans classification
+      // reflects current task state. Best-effort.
+      try {
+        await fetch(`/api/entity-statistics/recount${storeQ}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project_id: projectId, span }),
+        });
+      } catch {
+        // best-effort
+      }
       onAfterFix();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1066,6 +1077,18 @@ function ContestedTable({
         ...prev,
         [span]: { fixed: totalFixed, skipped: totalSkipped, errors: totalErrors },
       }));
+      // Recount entity_statistics for this span so the contested-spans
+      // classification reflects current task state, not historical vote
+      // accumulation. Best-effort: failures don't surface to the user.
+      try {
+        await fetch(`/api/entity-statistics/recount${storeQ}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project_id: projectId, span }),
+        });
+      } catch {
+        // best-effort
+      }
       onAfterRetroactiveFix?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

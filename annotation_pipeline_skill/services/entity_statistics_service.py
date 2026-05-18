@@ -73,6 +73,101 @@ class EntityStatisticsService:
             (project_id, span_lower, entity_type, weight, now),
         )
 
+    def recount_span(self, *, project_id: str, span: str) -> dict[str, int]:
+        """Rebuild entity_statistics for one span from the ground truth:
+        the current annotation of every ACCEPTED task in the project
+        that mentions the span.
+
+        Why this exists: entity_statistics is a vote-accumulator (every
+        ACCEPTED decision +1, every HR commit +5). Over a project's
+        lifetime it accumulates inflated historical counts that don't
+        match current task state — especially after bulk Apply-to-all
+        sweeps. Recounting after a sweep gives an honest "how many
+        ACCEPTED tasks currently tag this span as what" distribution,
+        so contested-span classification reflects reality.
+
+        Returns the new distribution (entity_type → count) so callers
+        can preview the effect.
+        """
+        import json as _json
+        import re as _re
+
+        span_strip = span.strip()
+        if not span_strip:
+            return {}
+        span_lower = span_strip.lower()
+        # Same prefilter the retroactive-fix endpoint uses — narrows from
+        # ~all tasks to ~few hundred candidates.
+        span_lower_json = _json.dumps(span_lower, ensure_ascii=True)[1:-1]
+        rows = self.store._conn.execute(
+            "SELECT task_id FROM tasks "
+            "WHERE pipeline_id=? AND status='accepted' "
+            "AND (lower(source_ref_json) LIKE ? OR lower(source_ref_json) LIKE ?)",
+            (project_id, f"%{span_lower}%", f"%{span_lower_json}%"),
+        ).fetchall()
+
+        # Reuse the same "prefer human_review_answer, fall back to
+        # annotation_result" load semantics that build_posterior_audit
+        # and find_typical_text_for_span use.
+        def _load_latest(task_id: str) -> dict | None:
+            arts = self.store.list_artifacts(task_id)
+            hr = [a for a in arts if a.kind == "human_review_answer"]
+            if hr:
+                try:
+                    outer = _json.loads((self.store.root / hr[-1].path).read_text(encoding="utf-8"))
+                    return outer.get("answer") if isinstance(outer, dict) else None
+                except (OSError, _json.JSONDecodeError):
+                    return None
+            anns = [a for a in arts if a.kind == "annotation_result"]
+            if not anns:
+                return None
+            try:
+                outer = _json.loads((self.store.root / anns[-1].path).read_text(encoding="utf-8"))
+            except (OSError, _json.JSONDecodeError):
+                return None
+            text = outer.get("text") if isinstance(outer, dict) else None
+            if not isinstance(text, str):
+                return None
+            text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL | _re.IGNORECASE).strip()
+            try:
+                return _json.loads(text)
+            except (ValueError, _json.JSONDecodeError):
+                return None
+
+        new_counts: dict[str, int] = {}
+        for row in rows:
+            payload = _load_latest(row["task_id"])
+            if not isinstance(payload, dict):
+                continue
+            # Find every (Instagram, type) occurrence in this task's
+            # rows. iter_span_decisions already does the walk for us.
+            seen_types: set[str] = set()
+            for s, t in iter_span_decisions(payload):
+                if s.lower() == span_lower:
+                    seen_types.add(t)
+            # Count this task once per distinct type it tags the span
+            # as. Most tasks have only one (correct) type — multi-type
+            # tasks are unusual and indicate per-row context variance.
+            for t in seen_types:
+                new_counts[t] = new_counts.get(t, 0) + 1
+
+        # Replace entity_statistics rows for this (project, span)
+        # atomically: DELETE then INSERT. Other spans untouched.
+        now = datetime.now(timezone.utc).isoformat()
+        with self.store._conn:
+            self.store._conn.execute(
+                "DELETE FROM entity_statistics WHERE project_id=? AND span_lower=?",
+                (project_id, span_lower),
+            )
+            for entity_type, count in new_counts.items():
+                self.store._conn.execute(
+                    "INSERT INTO entity_statistics "
+                    "(project_id, span_lower, entity_type, count, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (project_id, span_lower, entity_type, count, now),
+                )
+        return new_counts
+
     def distribution(self, *, project_id: str, span: str) -> dict[str, int]:
         """Return {entity_type: count} for the given span. Empty if unseen."""
         span_lower = span.strip().lower()

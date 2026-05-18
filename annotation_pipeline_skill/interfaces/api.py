@@ -123,19 +123,21 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
                 "prior_total": r.total,
             })
 
-    # Filter contested spans by operator-declared conventions. A span
-    # the operator has explicitly resolved should disappear from the
-    # contested list — if they want to revisit it, they can Unset the
-    # convention (and it'll re-appear on next scan because the
-    # entity_statistics distribution is still split). Previous design
-    # kept the row visible with a `resolved_convention_type` badge so
-    # the change was observable, but in practice operators expect
-    # "Apply → row goes away" and were confused by the persistent row.
+    # Annotate (don't filter) contested spans with an explicit
+    # operator-declared convention. The contested classification is
+    # driven by entity_statistics — after Apply-to-all + recount_span,
+    # the distribution naturally collapses to a single type and the row
+    # falls out of contested on its own (no filter needed). Keeping the
+    # `resolved_convention_type` field for the UI's "✓ set" badge when
+    # the row IS still present for some other reason (stats not yet
+    # recounted, or partial Apply).
     contested_all = svc.contested_spans(project_id=project_id)
-    contested = [
-        c for c in contested_all
-        if c.get("span", "").lower() not in convention_index
-    ]
+    contested = []
+    for c in contested_all:
+        conv_type = convention_index.get(c.get("span", "").lower())
+        if conv_type is not None:
+            c = {**c, "resolved_convention_type": conv_type}
+        contested.append(c)
     return {
         "task_deviations": deviations,
         "contested_spans": contested,
@@ -600,6 +602,8 @@ class DashboardApi:
             return self._runtime_run_once_response()
         if route == "/api/posterior-audit/retroactive-fix":
             return self._post_posterior_audit_retroactive_fix(store, body)
+        if route == "/api/entity-statistics/recount":
+            return self._post_entity_statistics_recount(store, body)
         if route == "/api/posterior-audit":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -1147,6 +1151,39 @@ class DashboardApi:
         store.save_task(task)
         store.append_event(event)
         return self._json_response(200, {"ok": True, "task": task.to_dict()})
+
+    def _post_entity_statistics_recount(
+        self, store: SqliteStore, body: bytes,
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Rebuild entity_statistics for one span from the current state
+        of ACCEPTED tasks (see EntityStatisticsService.recount_span).
+
+        Body: {"project_id", "span"}
+        Returns: {"distribution": {type: count}, "total": int}
+        """
+        from annotation_pipeline_skill.services.entity_statistics_service import (
+            EntityStatisticsService,
+        )
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+        if not isinstance(payload, dict):
+            return self._json_response(400, {"error": "invalid_payload"})
+        project_id = payload.get("project_id")
+        span = payload.get("span")
+        if not project_id or not span:
+            return self._json_response(400, {"error": "project_and_span_required"})
+        try:
+            dist = EntityStatisticsService(store).recount_span(
+                project_id=project_id, span=span,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._json_response(500, {"error": "recount_failed", "detail": str(exc)})
+        return self._json_response(200, {
+            "distribution": dist,
+            "total": sum(dist.values()),
+        })
 
     def _post_posterior_audit_retroactive_fix(
         self, store: SqliteStore, body: bytes,
