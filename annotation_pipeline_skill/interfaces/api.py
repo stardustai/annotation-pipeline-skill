@@ -1364,10 +1364,17 @@ class DashboardApi:
                 ]
                 cache_payload["task_deviations"] = kept_devs
                 cache_payload["contested_spans"] = kept_contested
-                accepted_hash = compute_accepted_hash(store, project_id=project_id)
+                # PRESERVE the old accepted_hash so the dashboard's stale-
+                # cache indicator fires: we've patched N task annotations
+                # (changing their updated_at), so the cache is no longer
+                # in sync with reality — even though we cleaned out the
+                # specific deviations we just resolved, NEW divergences
+                # may have been introduced (e.g. retro-patched span
+                # interacts with other spans in the same task). Operator
+                # should re-check to confirm.
                 write_posterior_audit_cache(
                     store, project_id=project_id, payload=cache_payload,
-                    accepted_hash=accepted_hash,
+                    accepted_hash=cached["accepted_hash"],
                     created_at=cached["created_at"],
                 )
         except Exception:  # noqa: BLE001 — cache update is best-effort
