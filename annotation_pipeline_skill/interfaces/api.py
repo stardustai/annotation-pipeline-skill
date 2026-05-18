@@ -596,6 +596,8 @@ class DashboardApi:
         project_id = query.get("project", [None])[0]
         if route == "/api/runtime/run-once":
             return self._runtime_run_once_response()
+        if route == "/api/posterior-audit/retroactive-fix":
+            return self._post_posterior_audit_retroactive_fix(store, body)
         if route == "/api/posterior-audit":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -1143,6 +1145,165 @@ class DashboardApi:
         store.save_task(task)
         store.append_event(event)
         return self._json_response(200, {"ok": True, "task": task.to_dict()})
+
+    def _post_posterior_audit_retroactive_fix(
+        self, store: SqliteStore, body: bytes,
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Declare a project convention for `span -> entity_type` AND
+        retroactively patch every ACCEPTED task in the project whose
+        current annotation has the span tagged differently.
+
+        Body: {"project_id", "span", "entity_type", "actor"}.
+        `entity_type` may be the sentinel "not_an_entity" (or null), in
+        which case matching tasks have the span removed entirely.
+
+        Returns: {convention, fixed: int, skipped: int,
+                  errors: [{task_id, reason}]}
+        Errors per task are collected, not raised — a single bad
+        annotation doesn't block the rest of the batch.
+        """
+        from annotation_pipeline_skill.core.states import TaskStatus
+        from annotation_pipeline_skill.services.entity_convention_service import (
+            EntityConventionService,
+        )
+        from annotation_pipeline_skill.services.human_review_service import (
+            HumanReviewService,
+        )
+        from annotation_pipeline_skill.services.entity_statistics_service import (
+            iter_span_decisions,
+        )
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+        if not isinstance(payload, dict):
+            return self._json_response(400, {"error": "invalid_payload"})
+        project_id = payload.get("project_id")
+        span = payload.get("span")
+        entity_type_raw = payload.get("entity_type")
+        actor = payload.get("actor") or "posterior_audit_retroactive"
+        if not project_id or not span:
+            return self._json_response(400, {"error": "project_and_span_required"})
+        if entity_type_raw is None:
+            entity_type_str = "not_an_entity"
+        else:
+            entity_type_str = str(entity_type_raw)
+        # "not_an_entity" means delete the span; apply_posterior_fix takes
+        # None for that, and EntityConventionService stores the sentinel
+        # string so callers can distinguish "no entity here" from "no
+        # convention declared".
+        fix_new_type = None if entity_type_str == "not_an_entity" else entity_type_str
+
+        conv_svc = EntityConventionService(store)
+        try:
+            conv = conv_svc.record_decision(
+                project_id=project_id,
+                span=span,
+                entity_type=entity_type_str,
+                source=f"declared:{actor}",
+                task_id=None,
+            )
+            if conv.status == "disputed":
+                conv = conv_svc.clear_dispute(
+                    convention_id=conv.convention_id,
+                    resolved_type=entity_type_str,
+                    actor=actor,
+                    notes="resolved via posterior audit retroactive fix",
+                )
+        except (ValueError, TypeError) as exc:
+            return self._json_response(
+                400, {"error": "convention_failed", "detail": str(exc)},
+            )
+
+        # Walk ACCEPTED tasks; find ones where the span is tagged with a
+        # type different from the target. iter_span_decisions reads the
+        # latest annotation (preferring human_review_answer over
+        # annotation_result, same as build_posterior_audit's _load_annotation).
+        hr = HumanReviewService(store)
+        span_lower = span.lower()
+        fixed = 0
+        skipped = 0
+        errors: list[dict[str, str]] = []
+        for task in store.list_tasks_by_pipeline(project_id):
+            if task.status is not TaskStatus.ACCEPTED:
+                continue
+            ann = hr._latest_annotation_payload(task.task_id)
+            if not isinstance(ann, dict):
+                skipped += 1
+                continue
+            # Find the current type the annotation gives this span (case-
+            # sensitive match on the actual stored form, since
+            # apply_posterior_fix's payload swap is case-sensitive too).
+            current_type: str | None = None
+            current_span_form: str | None = None
+            for s, t in iter_span_decisions(ann):
+                if s.lower() == span_lower:
+                    current_type = t
+                    current_span_form = s
+                    break
+            if current_type is None:
+                # Span no longer present in this task's annotation; nothing
+                # to fix.
+                skipped += 1
+                continue
+            if current_type == entity_type_str:
+                # Already matches the target.
+                skipped += 1
+                continue
+            try:
+                hr.apply_posterior_fix(
+                    task_id=task.task_id,
+                    span=current_span_form or span,
+                    current_type=current_type,
+                    new_type=fix_new_type,
+                    actor=actor,
+                    save_as_convention=False,  # convention already declared above
+                )
+                fixed += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"task_id": task.task_id, "reason": str(exc)})
+
+        # Cache surgery: drop deviations / contested entries this fix
+        # resolves so the dashboard reflects the change on next GET
+        # without forcing a full rescan.
+        try:
+            cached = read_posterior_audit_cache(store, project_id=project_id)
+            if cached is not None:
+                cache_payload = cached["payload"]
+                devs = cache_payload.get("task_deviations", [])
+                kept_devs = [
+                    d for d in devs
+                    if not (
+                        (d.get("span") or "").lower() == span_lower
+                    )
+                ]
+                contested = cache_payload.get("contested_spans", [])
+                kept_contested = [
+                    c for c in contested
+                    if (c.get("span") or "").lower() != span_lower
+                ]
+                cache_payload["task_deviations"] = kept_devs
+                cache_payload["contested_spans"] = kept_contested
+                accepted_hash = compute_accepted_hash(store, project_id=project_id)
+                write_posterior_audit_cache(
+                    store, project_id=project_id, payload=cache_payload,
+                    accepted_hash=accepted_hash,
+                    created_at=cached["created_at"],
+                )
+        except Exception:  # noqa: BLE001 — cache update is best-effort
+            pass
+
+        return self._json_response(200, {
+            "convention": {
+                "convention_id": conv.convention_id,
+                "span": conv.span_original or span,
+                "entity_type": conv.entity_type,
+                "status": conv.status,
+            },
+            "fixed": fixed,
+            "skipped": skipped,
+            "errors": errors,
+        })
 
     def _post_human_review_response(self, store: SqliteStore, task_id: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
         try:

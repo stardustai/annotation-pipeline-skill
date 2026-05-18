@@ -92,6 +92,14 @@ export function PosteriorAuditPanel({
       .finally(() => setLoading(false));
   }, [projectId, storeKey]);
 
+  function reloadCache() {
+    if (!projectId) return;
+    fetch(urlWithStore("/api/posterior-audit", projectId, storeKey))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) setCache(d); })
+      .catch(() => {});
+  }
+
   async function handleCheck() {
     if (!projectId) {
       setError("Select a project first.");
@@ -267,6 +275,7 @@ export function PosteriorAuditPanel({
                   projectId={projectId!}
                   storeKey={storeKey ?? null}
                   onDeclare={onDeclareCanonical}
+                  onAfterRetroactiveFix={reloadCache}
                 />
               ) : (
                 <p className="runtime-muted">No contested spans.</p>
@@ -551,11 +560,13 @@ function ContestedTable({
   projectId,
   storeKey,
   onDeclare,
+  onAfterRetroactiveFix,
 }: {
   items: ContestedSpan[];
   projectId: string;
   storeKey: string | null;
   onDeclare: (span: string, entityType: string) => Promise<void> | void;
+  onAfterRetroactiveFix?: () => void;
 }): React.ReactElement {
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(0);
@@ -563,6 +574,9 @@ function ContestedTable({
   const [picked, setPicked] = useState<Record<string, string | null>>({});
   const [committed, setCommitted] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState<string | null>(null);
+  const [retroResult, setRetroResult] = useState<
+    Record<string, { fixed: number; skipped: number; errors: number }>
+  >({});
   const [error, setError] = useState<string | null>(null);
 
   const lower = filter.trim().toLowerCase();
@@ -584,6 +598,48 @@ function ContestedTable({
       await onDeclare(span, type);
       setCommitted((prev) => ({ ...prev, [span]: type }));
       setPicked((prev) => ({ ...prev, [span]: null }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleConfirmAndApplyAll(span: string, type: string) {
+    setSubmitting(span);
+    setError(null);
+    try {
+      const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
+      const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId,
+          span,
+          entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
+          actor: "posterior_audit_retroactive_ui",
+        }),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
+      }
+      const data = (await r.json()) as {
+        fixed: number;
+        skipped: number;
+        errors: { task_id: string; reason: string }[];
+      };
+      setCommitted((prev) => ({ ...prev, [span]: type }));
+      setPicked((prev) => ({ ...prev, [span]: null }));
+      setRetroResult((prev) => ({
+        ...prev,
+        [span]: {
+          fixed: data.fixed,
+          skipped: data.skipped,
+          errors: data.errors?.length ?? 0,
+        },
+      }));
+      onAfterRetroactiveFix?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -647,12 +703,25 @@ function ContestedTable({
                   </td>
                   <td style={TD}>
                     {committedType ? (
-                      <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                        ✓ set convention:{" "}
-                        <strong>
-                          {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
-                        </strong>
-                      </span>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+                        <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
+                          ✓ set convention:{" "}
+                          <strong>
+                            {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
+                          </strong>
+                        </span>
+                        {retroResult[c.span] ? (
+                          <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
+                            retroactively fixed {retroResult[c.span].fixed} task(s)
+                            {retroResult[c.span].skipped > 0
+                              ? `, skipped ${retroResult[c.span].skipped}`
+                              : ""}
+                            {retroResult[c.span].errors > 0
+                              ? `, ${retroResult[c.span].errors} error(s)`
+                              : ""}
+                          </span>
+                        ) : null}
+                      </div>
                     ) : (
                       <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
                         <TopNTypeSelector
@@ -661,11 +730,12 @@ function ContestedTable({
                           topN={3}
                           onSelect={(t) => setPicked((p) => ({ ...p, [c.span]: t }))}
                         />
-                        <div style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
+                        <div style={{ display: "flex", gap: "0.4rem", alignItems: "center", flexWrap: "wrap" }}>
                           <button
                             type="button"
                             disabled={!pickedType || isSubmitting}
                             onClick={() => pickedType && handleConfirm(c.span, pickedType)}
+                            title="Save as project convention only — future tasks; existing ACCEPTED tasks are NOT changed"
                             style={{
                               fontSize: "0.8rem",
                               background: pickedType ? "var(--success, #047857)" : undefined,
@@ -674,6 +744,24 @@ function ContestedTable({
                             }}
                           >
                             {isSubmitting ? "…" : "Confirm"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!pickedType || isSubmitting}
+                            onClick={() => pickedType && handleConfirmAndApplyAll(c.span, pickedType)}
+                            title={
+                              pickedType
+                                ? `Declare convention AND retroactively patch every existing ACCEPTED task in the project that has '${c.span}' tagged differently`
+                                : "Pick a type first"
+                            }
+                            style={{
+                              fontSize: "0.8rem",
+                              background: pickedType ? "var(--primary, #1e40af)" : undefined,
+                              color: pickedType ? "white" : undefined,
+                              opacity: !pickedType || isSubmitting ? 0.6 : 1,
+                            }}
+                          >
+                            {isSubmitting ? "…" : "Confirm & apply to all"}
                           </button>
                           {pickedType ? (
                             <span className="runtime-muted" style={{ fontSize: "0.75rem" }}>
