@@ -227,12 +227,44 @@ class EntityConventionService:
     # letters, "CA" etc). They substring-match almost any input and pollute
     # the prompt with noise like "'1' → entities.number".
     MIN_INJECTION_SPAN_LEN = 4
-    # Require at least this many evidence rows before injecting. Filters
-    # out one-off LLM choices that haven't accumulated as a pattern.
+    # Require at least this many evidence rows before injecting an
+    # auto-accumulated convention (qc_consensus only). Filters out one-off
+    # LLM choices that haven't accumulated as a pattern. Operator-declared
+    # conventions BYPASS this threshold — they're explicit policy calls,
+    # not statistical samples, and one operator click counts as the same
+    # authority as N qc_consensus events.
     MIN_INJECTION_EVIDENCE = 5
+    # Prefixes of ``created_by`` (or proposal source) that indicate an
+    # explicit operator/HR declaration — these bypass MIN_INJECTION_EVIDENCE.
+    OPERATOR_DECLARATION_SOURCE_PREFIXES: tuple[str, ...] = (
+        "declared:", "hr_correction:", "posterior_audit_operator",
+        "batch_operator_resolve", "batch_operator_correction",
+        "dispute_resolved_by:",
+    )
     # Entity types whose conventions we never inject — the catch-all type
     # is by design generic and shouldn't override the LLM's judgment.
     EXCLUDED_TYPES_FOR_INJECTION: tuple[str, ...] = ("entity",)
+
+    @classmethod
+    def _is_operator_declared(cls, conv: "EntityConvention") -> bool:
+        """True if any proposal in the convention's history came from an
+        operator/HR declaration. A single explicit operator declaration
+        anywhere in the chain is enough to bypass the evidence threshold —
+        the operator's call wins over later auto-accumulated qc_consensus
+        votes for the same span."""
+        if conv.created_by and any(
+            conv.created_by.startswith(p) for p in cls.OPERATOR_DECLARATION_SOURCE_PREFIXES
+        ):
+            return True
+        for prop in conv.proposals or ():
+            if not isinstance(prop, dict):
+                continue
+            src = prop.get("source") or ""
+            if isinstance(src, str) and any(
+                src.startswith(p) for p in cls.OPERATOR_DECLARATION_SOURCE_PREFIXES
+            ):
+                return True
+        return False
 
     def find_matches_in_text(
         self, project_id: str, text: str
@@ -250,7 +282,8 @@ class EntityConventionService:
             since ``\\b`` doesn't apply there.
           - The convention must have ``evidence_count >=
             MIN_INJECTION_EVIDENCE`` so we don't inject single
-            observations.
+            observations — UNLESS it was operator-declared, in which case
+            one click counts as policy.
         """
         if not text:
             return []
@@ -261,7 +294,10 @@ class EntityConventionService:
                 continue
             if len(conv.span_lower) < self.MIN_INJECTION_SPAN_LEN:
                 continue
-            if conv.evidence_count < self.MIN_INJECTION_EVIDENCE:
+            if (
+                conv.evidence_count < self.MIN_INJECTION_EVIDENCE
+                and not self._is_operator_declared(conv)
+            ):
                 continue
             if conv.entity_type in self.EXCLUDED_TYPES_FOR_INJECTION:
                 continue
