@@ -1533,7 +1533,25 @@ def make_handler(api: DashboardApi, static_root: Path | None = None) -> type[Bas
             suffix = candidate.suffix.lower()
             content_type = MIME_TYPES.get(suffix, "application/octet-stream")
             body = candidate.read_bytes()
-            self._send(200, {"content-type": content_type}, body)
+            # Cache strategy: index.html must always revalidate (entry
+            # point — points to the current hashed asset URLs). Hashed
+            # assets under /assets/ are safe to cache forever because
+            # Vite changes the filename on rebuild. Without this, browsers
+            # heuristic-cache the old JS for hours and users see stale
+            # behavior even after the server has the new bundle.
+            headers = {"content-type": content_type}
+            name = candidate.name.lower()
+            try:
+                rel_resolved = candidate.relative_to(resolved_static.resolve()).as_posix()
+            except ValueError:
+                rel_resolved = name
+            if name == "index.html":
+                headers["cache-control"] = "no-cache, must-revalidate"
+            elif rel_resolved.startswith("assets/"):
+                headers["cache-control"] = "public, max-age=31536000, immutable"
+            else:
+                headers["cache-control"] = "no-cache"
+            self._send(200, headers, body)
 
         def do_PUT(self) -> None:
             content_length = int(self.headers.get("content-length", "0"))
