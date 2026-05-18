@@ -756,25 +756,37 @@ function ContestedTable({
                       // the retroactive sweep against the committed type.
                       // Before any confirm, the button uses pickedType.
                       const triggerType = committedType ?? pickedType;
-                      const label = committedType
-                        ? "Apply to all"
-                        : "Confirm & apply to all";
+                      // Count annotations that DON'T match the target —
+                      // these are what the retroactive sweep will rewrite.
+                      // For NOT_ENTITY the target isn't a real type bucket,
+                      // so every prior_total annotation is an "other".
+                      const otherCount = triggerType
+                        ? (triggerType === NOT_ENTITY
+                            ? c.prior_total
+                            : c.prior_total - (c.prior_distribution[triggerType] || 0))
+                        : 0;
+                      const noun = otherCount === 1 ? "occurrence" : "occurrences";
+                      const verb = committedType ? "Apply" : "Confirm & apply";
+                      const label = triggerType
+                        ? `${verb} to other ${otherCount} ${noun}`
+                        : verb;
                       const title = triggerType
                         ? (committedType
-                            ? `Retroactively patch every existing ACCEPTED task that has '${c.span}' tagged as something other than ${committedType === NOT_ENTITY ? "not_an_entity" : committedType}`
-                            : `Declare convention AND retroactively patch every existing ACCEPTED task that has '${c.span}' tagged differently`)
+                            ? `Retroactively patch ${otherCount} ACCEPTED task annotation(s) where '${c.span}' is tagged as something other than ${committedType === NOT_ENTITY ? "not_an_entity" : committedType}`
+                            : `Declare convention AND retroactively patch ${otherCount} ACCEPTED task annotation(s) where '${c.span}' is tagged differently`)
                         : "Pick a type in the Set Convention column first";
+                      const disabled = !triggerType || otherCount === 0 || isSubmitting;
                       return (
                         <button
                           type="button"
-                          disabled={!triggerType || isSubmitting}
+                          disabled={disabled}
                           onClick={() => triggerType && handleConfirmAndApplyAll(c.span, triggerType)}
                           title={title}
                           style={{
                             fontSize: "0.8rem",
-                            background: triggerType ? "var(--primary, #1e40af)" : undefined,
-                            color: triggerType ? "white" : undefined,
-                            opacity: !triggerType || isSubmitting ? 0.6 : 1,
+                            background: !disabled ? "var(--primary, #1e40af)" : undefined,
+                            color: !disabled ? "white" : undefined,
+                            opacity: disabled ? 0.6 : 1,
                           }}
                         >
                           {isSubmitting ? "…" : label}
