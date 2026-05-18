@@ -577,6 +577,17 @@ function ContestedTable({
   const [retroResult, setRetroResult] = useState<
     Record<string, { fixed: number; skipped: number; errors: number }>
   >({});
+  // Per-row live progress while the retroactive sweep runs: {processed, total}.
+  // Rendered as a progress bar inside the Apply-to-all cell.
+  const [retroProgress, setRetroProgress] = useState<
+    Record<string, { processed: number; total: number }>
+  >({});
+  // Pending confirmation dialog: which (span, type, otherCount, totalCount)
+  // are we asking the operator to confirm before kicking off the sweep?
+  const [pendingConfirm, setPendingConfirm] = useState<
+    | { span: string; type: string; otherCount: number; totalCount: number; sharePct: number }
+    | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
 
   const lower = filter.trim().toLowerCase();
@@ -605,50 +616,169 @@ function ContestedTable({
     }
   }
 
-  async function handleConfirmAndApplyAll(span: string, type: string) {
+  // Open the confirmation dialog with the impact numbers; actual work
+  // starts in runRetroactiveSweep after the operator confirms.
+  function requestApplyToAll(c: ContestedSpan, type: string) {
+    const otherCount = type === NOT_ENTITY
+      ? c.prior_total
+      : c.prior_total - (c.prior_distribution[type] || 0);
+    if (otherCount <= 0) return;
+    const sharePct = c.prior_total > 0
+      ? Math.round((otherCount / c.prior_total) * 100)
+      : 0;
+    setPendingConfirm({
+      span: c.span,
+      type,
+      otherCount,
+      totalCount: c.prior_total,
+      sharePct,
+    });
+  }
+
+  // Poll the retroactive-fix endpoint with batch_size=25 until done.
+  // Updates retroProgress per poll so the UI can render a progress bar.
+  async function runRetroactiveSweep(span: string, type: string, expectedTotal: number) {
     setSubmitting(span);
     setError(null);
+    setRetroProgress((prev) => ({ ...prev, [span]: { processed: 0, total: expectedTotal } }));
+    let totalFixed = 0;
+    let totalSkipped = 0;
+    let totalErrors = 0;
+    let serverTotal = expectedTotal;  // updated on first response
     try {
       const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
-      const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          project_id: projectId,
-          span,
-          entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
-          actor: "posterior_audit_retroactive_ui",
-        }),
-      });
-      if (!r.ok) {
-        const txt = await r.text();
-        throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
-      }
-      const data = (await r.json()) as {
-        fixed: number;
-        skipped: number;
-        errors: { task_id: string; reason: string }[];
+      const body = {
+        project_id: projectId,
+        span,
+        entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
+        actor: "posterior_audit_retroactive_ui",
+        batch_size: 25,
       };
+      for (let safety = 0; safety < 1000; safety++) {
+        const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
+        }
+        const data = (await r.json()) as {
+          fixed: number;
+          skipped: number;
+          errors: { task_id: string; reason: string }[];
+          remaining: number;
+          done: boolean;
+        };
+        totalFixed += data.fixed;
+        totalSkipped += data.skipped;
+        totalErrors += data.errors?.length ?? 0;
+        // First poll reveals the actual total = processed_in_batch + remaining.
+        if (safety === 0) {
+          serverTotal = data.fixed + data.errors.length + data.remaining;
+        }
+        const processed = serverTotal - data.remaining;
+        setRetroProgress((prev) => ({
+          ...prev,
+          [span]: { processed, total: serverTotal },
+        }));
+        if (data.done) break;
+      }
       setCommitted((prev) => ({ ...prev, [span]: type }));
       setPicked((prev) => ({ ...prev, [span]: null }));
       setRetroResult((prev) => ({
         ...prev,
-        [span]: {
-          fixed: data.fixed,
-          skipped: data.skipped,
-          errors: data.errors?.length ?? 0,
-        },
+        [span]: { fixed: totalFixed, skipped: totalSkipped, errors: totalErrors },
       }));
       onAfterRetroactiveFix?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(null);
+      // Clear progress so the cell renders the final summary on next render.
+      setRetroProgress((prev) => {
+        const next = { ...prev };
+        delete next[span];
+        return next;
+      });
     }
+  }
+
+  async function handleConfirmDialog() {
+    if (!pendingConfirm) return;
+    const { span, type, otherCount } = pendingConfirm;
+    setPendingConfirm(null);
+    await runRetroactiveSweep(span, type, otherCount);
   }
 
   return (
     <>
+      {pendingConfirm ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+          }}
+          onClick={() => setPendingConfirm(null)}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: "6px",
+              padding: "1.25rem 1.5rem",
+              maxWidth: "520px",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: "0.75rem", fontSize: "1rem" }}>
+              Confirm bulk retroactive fix
+            </h3>
+            <p style={{ margin: "0 0 0.75rem", fontSize: "0.9rem", lineHeight: 1.5 }}>
+              Apply <strong>'{pendingConfirm.span}'</strong> → type{" "}
+              <strong>
+                {pendingConfirm.type === NOT_ENTITY ? "🚫 not_an_entity (delete)" : pendingConfirm.type}
+              </strong>{" "}
+              to all{" "}
+              <strong>{pendingConfirm.otherCount}</strong> occurrence(s) currently tagged
+              differently ({pendingConfirm.sharePct}% of {pendingConfirm.totalCount} total)?
+            </p>
+            <p style={{ margin: "0 0 1rem", fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+              This will declare a project convention AND rewrite each task's
+              annotation (writing new human_review_answer artifacts; original
+              annotation_result preserved for audit).
+            </p>
+            <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                onClick={() => setPendingConfirm(null)}
+                style={{ fontSize: "0.85rem" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDialog}
+                style={{
+                  fontSize: "0.85rem",
+                  background: "var(--primary, #1e40af)",
+                  color: "white",
+                }}
+              >
+                Apply to {pendingConfirm.otherCount}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <div style={{ margin: "0.4rem 0" }}>
         <input
           type="search"
@@ -750,16 +880,43 @@ function ContestedTable({
                           ? `, ${retroResult[c.span].errors} error(s)`
                           : ""}
                       </span>
+                    ) : retroProgress[c.span] ? (
+                      // Active sweep — render progress bar.
+                      (() => {
+                        const { processed, total } = retroProgress[c.span];
+                        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+                        return (
+                          <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                            <div style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
+                              {processed} / {total} task(s) — {pct}%
+                            </div>
+                            <div
+                              style={{
+                                width: "100%",
+                                height: "6px",
+                                background: "var(--border, #e5e7eb)",
+                                borderRadius: "3px",
+                                overflow: "hidden",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  width: `${pct}%`,
+                                  height: "100%",
+                                  background: "var(--primary, #1e40af)",
+                                  transition: "width 0.2s ease-out",
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })()
                     ) : (() => {
                       // After plain Confirm, committedType is set but no
                       // retro happened yet — still let the operator trigger
                       // the retroactive sweep against the committed type.
                       // Before any confirm, the button uses pickedType.
                       const triggerType = committedType ?? pickedType;
-                      // Count annotations that DON'T match the target —
-                      // these are what the retroactive sweep will rewrite.
-                      // For NOT_ENTITY the target isn't a real type bucket,
-                      // so every prior_total annotation is an "other".
                       const otherCount = triggerType
                         ? (triggerType === NOT_ENTITY
                             ? c.prior_total
@@ -780,7 +937,7 @@ function ContestedTable({
                         <button
                           type="button"
                           disabled={disabled}
-                          onClick={() => triggerType && handleConfirmAndApplyAll(c.span, triggerType)}
+                          onClick={() => triggerType && requestApplyToAll(c, triggerType)}
                           title={title}
                           style={{
                             fontSize: "0.8rem",

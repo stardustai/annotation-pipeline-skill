@@ -1153,14 +1153,28 @@ class DashboardApi:
         retroactively patch every ACCEPTED task in the project whose
         current annotation has the span tagged differently.
 
-        Body: {"project_id", "span", "entity_type", "actor"}.
+        Body: {
+          "project_id", "span", "entity_type", "actor",
+          "batch_size": int | null  # optional, when set, processes at most
+                                    # this many matching tasks per call.
+                                    # The caller polls with the same body
+                                    # until "remaining" reaches 0.
+        }
+
         `entity_type` may be the sentinel "not_an_entity" (or null), in
         which case matching tasks have the span removed entirely.
 
-        Returns: {convention, fixed: int, skipped: int,
-                  errors: [{task_id, reason}]}
-        Errors per task are collected, not raised — a single bad
-        annotation doesn't block the rest of the batch.
+        Returns: {
+          convention,
+          fixed: int,       # tasks fixed in THIS call
+          skipped: int,     # tasks skipped in THIS call
+          errors: [{task_id, reason}],
+          remaining: int,   # tasks still tagged with non-target type AFTER
+                            # this call — caller polls again if > 0
+          done: bool,       # remaining == 0 (terminal call)
+        }
+        record_decision is idempotent on identical (source, type), so
+        multiple polls don't inflate the convention's evidence_count.
         """
         from annotation_pipeline_skill.core.states import TaskStatus
         from annotation_pipeline_skill.services.entity_convention_service import (
@@ -1182,6 +1196,13 @@ class DashboardApi:
         span = payload.get("span")
         entity_type_raw = payload.get("entity_type")
         actor = payload.get("actor") or "posterior_audit_retroactive"
+        batch_size_raw = payload.get("batch_size")
+        try:
+            batch_size = int(batch_size_raw) if batch_size_raw is not None else None
+        except (TypeError, ValueError):
+            batch_size = None
+        if batch_size is not None and batch_size < 1:
+            batch_size = None
         if not project_id or not span:
             return self._json_response(400, {"error": "project_and_span_required"})
         if entity_type_raw is None:
@@ -1221,9 +1242,12 @@ class DashboardApi:
         # annotation_result, same as build_posterior_audit's _load_annotation).
         hr = HumanReviewService(store)
         span_lower = span.lower()
-        fixed = 0
+        # Pre-scan: collect all matching candidates first so we can split
+        # the work across multiple polls and report `remaining` to the
+        # caller. The scan itself is cheap (file reads of latest
+        # annotation per task); the expensive part is apply_posterior_fix.
+        candidates: list[tuple[str, str, str]] = []  # (task_id, current_span_form, current_type)
         skipped = 0
-        errors: list[dict[str, str]] = []
         for task in store.list_tasks_by_pipeline(project_id):
             if task.status is not TaskStatus.ACCEPTED:
                 continue
@@ -1231,9 +1255,6 @@ class DashboardApi:
             if not isinstance(ann, dict):
                 skipped += 1
                 continue
-            # Find the current type the annotation gives this span (case-
-            # sensitive match on the actual stored form, since
-            # apply_posterior_fix's payload swap is case-sensitive too).
             current_type: str | None = None
             current_span_form: str | None = None
             for s, t in iter_span_decisions(ann):
@@ -1241,19 +1262,25 @@ class DashboardApi:
                     current_type = t
                     current_span_form = s
                     break
-            if current_type is None:
-                # Span no longer present in this task's annotation; nothing
-                # to fix.
+            if current_type is None or current_type == entity_type_str:
+                # Span absent or already matches target — nothing to fix.
                 skipped += 1
                 continue
-            if current_type == entity_type_str:
-                # Already matches the target.
-                skipped += 1
-                continue
+            candidates.append((task.task_id, current_span_form or span, current_type))
+
+        # When batch_size is set, only process that many this call; the
+        # rest is reported back as `remaining` so the caller can poll.
+        if batch_size is not None:
+            to_process = candidates[:batch_size]
+        else:
+            to_process = candidates
+        fixed = 0
+        errors: list[dict[str, str]] = []
+        for task_id, span_form, current_type in to_process:
             try:
                 hr.apply_posterior_fix(
-                    task_id=task.task_id,
-                    span=current_span_form or span,
+                    task_id=task_id,
+                    span=span_form,
                     current_type=current_type,
                     new_type=fix_new_type,
                     actor=actor,
@@ -1261,7 +1288,8 @@ class DashboardApi:
                 )
                 fixed += 1
             except Exception as exc:  # noqa: BLE001
-                errors.append({"task_id": task.task_id, "reason": str(exc)})
+                errors.append({"task_id": task_id, "reason": str(exc)})
+        remaining = max(0, len(candidates) - len(to_process))
 
         # Cache surgery: drop deviations / contested entries this fix
         # resolves so the dashboard reflects the change on next GET
@@ -1303,6 +1331,8 @@ class DashboardApi:
             "fixed": fixed,
             "skipped": skipped,
             "errors": errors,
+            "remaining": remaining,
+            "done": remaining == 0,
         })
 
     def _post_human_review_response(self, store: SqliteStore, task_id: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
