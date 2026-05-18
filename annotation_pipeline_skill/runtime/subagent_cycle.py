@@ -359,17 +359,28 @@ class SubagentRuntime:
             # see what it tried to fix and decide whether to apply it
             # manually (after fixing the verbatim issue) or send back to
             # annotation.
-            if arb.get("verbatim_retry_exhausted"):
+            verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
+            if verbatim_exhausted:
                 metadata["arbiter_verbatim_retry_exhausted"] = True
                 metadata["arbiter_failed_correction"] = arb.get("failed_verbatim_correction")
                 metadata["arbiter_failed_verbatim_target"] = arb.get("failed_verbatim_target")
+            if verbatim_exhausted:
+                target = arb.get("failed_verbatim_target") or {}
+                reason_text = (
+                    f"Arbiter ruled qc/neither but could not produce a verbatim-compliant "
+                    f"correction after {count} pickup(s); routing to human review "
+                    f"(failed span: {target.get('span')!r} at "
+                    f"{target.get('field')!r} row {target.get('row_index')})"
+                )
+            else:
+                reason_text = (
+                    f"Arbiter retried {count} times but kept failing to return a usable answer "
+                    f"(JSON parse / shape errors / LLM exception); routing to human review"
+                )
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
-                reason=(
-                    f"Arbiter retried {count} times but kept failing to return a usable answer "
-                    "(JSON parse / non-verbatim correction / LLM error); routing to human review"
-                ),
+                reason=reason_text,
                 stage=stage,
                 attempt_id=attempt_id,
                 metadata=metadata,
@@ -1255,6 +1266,120 @@ class SubagentRuntime:
             "reason": "verbatim check failed",
             "target": first,
         }
+
+    def _auto_align_corrected_annotation(self, task: Task, corrected: dict) -> int:
+        """Mutate ``corrected`` in place: replace each non-verbatim span that
+        differs from a verbatim substring only by surrounding whitespace /
+        punctuation / quotes with the aligned form. Returns the number of
+        spans that were rewritten.
+
+        Letter-level edits are NEVER performed — ``try_align_to_verbatim``
+        only strips trim-safe characters from either end, so the entity's
+        semantic content is preserved. Spans that can't be safely aligned
+        are left untouched and will surface to the normal verbatim-failure
+        path below.
+        """
+        from annotation_pipeline_skill.core.schema_validation import try_align_to_verbatim
+        source_payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
+        if not isinstance(source_payload, dict):
+            return 0
+        source_rows = source_payload.get("rows")
+        if not isinstance(source_rows, list):
+            return 0
+        input_by_index: dict[int, str] = {}
+        for i, r in enumerate(source_rows):
+            if not isinstance(r, dict):
+                continue
+            idx = r.get("row_index") if isinstance(r.get("row_index"), int) else i
+            text = r.get("input")
+            if isinstance(text, str):
+                input_by_index[idx] = text
+        rows_out = corrected.get("rows") if isinstance(corrected, dict) else None
+        if not isinstance(rows_out, list):
+            return 0
+        rewrites = 0
+        for r in rows_out:
+            if not isinstance(r, dict):
+                continue
+            row_index = r.get("row_index") if isinstance(r.get("row_index"), int) else 0
+            input_text = input_by_index.get(row_index)
+            if not input_text:
+                continue
+            output = r.get("output")
+            if not isinstance(output, dict):
+                continue
+            for typ_dict_key in ("entities", "json_structures"):
+                type_dict = output.get(typ_dict_key)
+                if not isinstance(type_dict, dict):
+                    continue
+                for type_name, items in type_dict.items():
+                    if not isinstance(items, list):
+                        continue
+                    for i, span in enumerate(items):
+                        if not isinstance(span, str) or not span:
+                            continue
+                        if span in input_text:
+                            continue
+                        aligned = try_align_to_verbatim(span, input_text)
+                        if aligned is not None:
+                            items[i] = aligned
+                            rewrites += 1
+        return rewrites
+
+    def _verbatim_candidate_spans(
+        self, task: Task, *, row_index: int, failed_span: str, max_candidates: int = 6
+    ) -> list[str]:
+        """Suggest substrings from row ``row_index``'s input.text that
+        overlap with ``failed_span``. Used to guide the arbiter's retry —
+        instead of asking it to copy-paste blind, we hand it a short list
+        of "what's actually in the text" to choose from.
+
+        Heuristic: for each whitespace-separated word in ``failed_span``,
+        find the longest sentence-bounded substring of input.text that
+        contains that word, and return the top-k by length. Cheap, no
+        external deps, language-agnostic enough for our mixed-EN/CN inputs.
+        """
+        if not failed_span:
+            return []
+        source_payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
+        if not isinstance(source_payload, dict):
+            return []
+        source_rows = source_payload.get("rows")
+        if not isinstance(source_rows, list):
+            return []
+        input_text: str | None = None
+        for i, r in enumerate(source_rows):
+            if not isinstance(r, dict):
+                continue
+            idx = r.get("row_index") if isinstance(r.get("row_index"), int) else i
+            if idx == row_index:
+                text = r.get("input")
+                if isinstance(text, str):
+                    input_text = text
+                break
+        if not input_text:
+            return []
+        import re as _re
+        # Coarse sentence-ish chunking; we just want phrase-length candidates
+        # to surface, not a perfect segmentation.
+        chunks = [c.strip() for c in _re.split(r"[.!?。！？\n]+", input_text) if c.strip()]
+        words = [w for w in _re.split(r"\s+", failed_span.strip()) if len(w) >= 2]
+        if not words:
+            return []
+        seen: set[str] = set()
+        ranked: list[tuple[int, str]] = []
+        for chunk in chunks:
+            chunk_l = chunk.lower()
+            score = sum(1 for w in words if w.lower() in chunk_l)
+            if score == 0:
+                continue
+            if chunk in seen:
+                continue
+            seen.add(chunk)
+            # Sort key: highest overlap first, then shorter chunk first.
+            ranked.append((-score, len(chunk), chunk))
+        ranked.sort()
+        return [c for *_, c in ranked[:max_candidates]]
 
     def _record_annotator_replies(self, task: Task, attempt_id: str, final_text: str) -> int:
         try:
@@ -2339,10 +2464,33 @@ class SubagentRuntime:
                 raise _ArbiterCallFailed("arbiter response missing 'verdicts' list")
             corrected_check = payload.get("corrected_annotation") if isinstance(payload, dict) else None
             if isinstance(corrected_check, dict):
+                # First try a safe whitespace/punctuation auto-alignment of
+                # near-verbatim spans. Many "verbatim_exhausted" HR routes
+                # were caused by trivial trailing-period / wrapping-quote
+                # differences — fixing those locally avoids burning the
+                # arbiter retry budget on a no-op re-emission.
+                aligned_count = self._auto_align_corrected_annotation(task, corrected_check)
+                if aligned_count:
+                    payload["_verbatim_auto_aligned"] = (
+                        payload.get("_verbatim_auto_aligned", 0) + aligned_count
+                    )
                 verbatim_failure = self._check_verbatim_spans(task, corrected_check)
                 if verbatim_failure is not None:
                     if attempt_idx < max_retries:
                         target = verbatim_failure.get("target", {})
+                        candidates = self._verbatim_candidate_spans(
+                            task,
+                            row_index=int(target.get("row_index") or 0),
+                            failed_span=str(target.get("span") or ""),
+                        )
+                        candidates_block = ""
+                        if candidates:
+                            candidates_block = (
+                                "\nCANDIDATE VERBATIM SPANS from this row's input.text that "
+                                "share words with the failed span (copy one of these exactly, "
+                                "or pick a different verbatim substring of input.text):\n  - "
+                                + "\n  - ".join(repr(c) for c in candidates)
+                            )
                         retry_note = (
                             f"\n\nPREVIOUS ATTEMPT FAILED VERBATIM CHECK: "
                             f"span {target.get('span')!r} at {target.get('field')!r} "
@@ -2351,6 +2499,7 @@ class SubagentRuntime:
                             f"VERBATIM (exact character match including punctuation, "
                             f"whitespace, traditional vs simplified Chinese, case) in "
                             f"input.text. Do not paraphrase, normalize, or invent spans."
+                            + candidates_block
                         )
                         continue
                     # Retries exhausted. Keep the bad corrected_annotation

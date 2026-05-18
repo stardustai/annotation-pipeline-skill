@@ -119,6 +119,34 @@ def find_verbatim_violations(
     return violations
 
 
+_VERBATIM_ALIGN_TRIM_CHARS = " \t\n\r　.,;:!?。，；：！？\"'`“”‘’«»【】「」"
+
+
+def try_align_to_verbatim(span: str, input_text: str) -> str | None:
+    """Return a verbatim form of ``span`` if ``span`` is almost-verbatim in
+    ``input_text`` but differs only by surrounding whitespace, punctuation,
+    or quote characters. Returns ``None`` if the span cannot be aligned
+    safely.
+
+    Safety contract — alignment may ONLY remove characters from either end
+    of ``span`` (whitespace / sentence punctuation / quote chars). It may
+    NOT change letters, digits, or any internal character. This guarantees
+    we never silently rewrite the semantic content of an entity. The
+    caller can show the alignment to an auditor and trust it didn't change
+    what the span means — only where the span starts/ends.
+
+    Aligned result must be a non-empty substring of ``input_text``.
+    """
+    if not isinstance(span, str) or not span or not isinstance(input_text, str) or not input_text:
+        return None
+    if span in input_text:
+        return None  # already verbatim, caller shouldn't have asked
+    stripped = span.strip(_VERBATIM_ALIGN_TRIM_CHARS)
+    if stripped and stripped != span and stripped in input_text:
+        return stripped
+    return None
+
+
 def find_duplicate_spans(payload: Any) -> "list[dict[str, Any]]":
     """Return any spans that appear more than once under the same
     entities/json_structures type within a single row. Always a model
