@@ -675,6 +675,16 @@ class DashboardApi:
                         )
                     ]
                     payload_in_cache["task_deviations"] = kept
+                    # If this fix also wrote a project-wide convention,
+                    # stamp the matching contested_spans rows so the
+                    # Contested tab's badge reflects the new policy on
+                    # refresh (mirrors /api/conventions cache surgery).
+                    if save_as_convention:
+                        decided_type = new_type or "not_an_entity"
+                        span_lower = span.strip().lower()
+                        for c in payload_in_cache.get("contested_spans", []):
+                            if c.get("span", "").lower() == span_lower:
+                                c["resolved_convention_type"] = decided_type
                     new_hash = compute_accepted_hash(store, project_id=project_for_cache)
                     from annotation_pipeline_skill.core.models import utc_now as _utc_now
                     write_posterior_audit_cache(

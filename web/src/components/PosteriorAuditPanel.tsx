@@ -648,7 +648,10 @@ function ContestedTable({
                   <td style={TD}>
                     {committedType ? (
                       <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                        ✓ set convention: <strong>{committedType}</strong>
+                        ✓ set convention:{" "}
+                        <strong>
+                          {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
+                        </strong>
                       </span>
                     ) : (
                       <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
