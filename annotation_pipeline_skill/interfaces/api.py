@@ -170,19 +170,25 @@ def find_typical_text_for_span(
     import random
     import re as _re
     span_lower = span.lower()
+    # source_ref_json is stored with ensure_ascii=True, so non-ASCII chars
+    # appear as Unicode escapes (e.g. "毫秒" → "毫秒"). A LIKE
+    # pattern with the raw char would miss them — match the JSON-escaped
+    # form too. For ASCII-only spans both forms collapse to the same string.
+    span_lower_json = json.dumps(span_lower, ensure_ascii=True)[1:-1]
     if task_id_filter:
         rows = store._conn.execute(
             "SELECT task_id, source_ref_json FROM tasks "
             "WHERE pipeline_id=? AND task_id=? "
-            "AND lower(source_ref_json) LIKE ?",
-            (project_id, task_id_filter, f"%{span_lower}%"),
+            "AND (lower(source_ref_json) LIKE ? OR lower(source_ref_json) LIKE ?)",
+            (project_id, task_id_filter,
+             f"%{span_lower}%", f"%{span_lower_json}%"),
         ).fetchall()
     else:
         rows = store._conn.execute(
             "SELECT task_id, source_ref_json FROM tasks "
             "WHERE pipeline_id=? AND status='accepted' "
-            "AND lower(source_ref_json) LIKE ?",
-            (project_id, f"%{span_lower}%"),
+            "AND (lower(source_ref_json) LIKE ? OR lower(source_ref_json) LIKE ?)",
+            (project_id, f"%{span_lower}%", f"%{span_lower_json}%"),
         ).fetchall()
     excluded = set(exclude_task_ids or [])
     excluded_keys = set(exclude_keys or [])
