@@ -7,6 +7,7 @@ import {
   TopNTypeSelector,
   NOT_ENTITY,
 } from "../entityHelpers";
+import { clearConvention } from "../api";
 
 const PAGE_SIZE = 100;
 
@@ -535,6 +536,35 @@ function DeviationsTable({
     await runApplyAllSweep(span, type, otherCount);
   }
 
+  async function handleUnsetDeviationConvention(span: string, rowKey: string) {
+    if (!window.confirm(
+      `Unset the project convention for '${span}'? Future tasks won't see this rule. The task's annotation that this Submit patched is NOT reverted.`,
+    )) {
+      return;
+    }
+    setRowStatus((s) => ({ ...s, [rowKey]: "submitting" }));
+    try {
+      await clearConvention(projectId, span, storeKey);
+      // Drop the per-row "submitted" status so the row reverts to its
+      // initial Type-picker state. Also drop the apply-to-all summary
+      // (since the convention behind it is gone).
+      setRowStatus((s) => {
+        const next = { ...s };
+        delete next[rowKey];
+        return next;
+      });
+      setRetroResult((prev) => {
+        const next = { ...prev };
+        delete next[span];
+        return next;
+      });
+      onAfterFix();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setRowStatus((s) => ({ ...s, [rowKey]: `error: ${msg}` }));
+    }
+  }
+
   return (
     <>
       {pendingApplyAll ? (
@@ -688,9 +718,29 @@ function DeviationsTable({
                   </td>
                   <td style={TD}>
                     {isSubmitted ? (
-                      <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                        ✓ {status?.replace("submitted: ", "applied: ")}
-                      </span>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem", alignItems: "flex-start" }}>
+                        <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
+                          ✓ {status?.replace("submitted: ", "applied: ")}
+                        </span>
+                        {getSaveConv(rowKey) ? (
+                          <button
+                            type="button"
+                            onClick={() => handleUnsetDeviationConvention(d.span, rowKey)}
+                            title="Remove the project convention written by this Submit. The task's annotation IS already patched and is NOT reverted."
+                            style={{
+                              fontSize: "0.7rem",
+                              color: "var(--danger, #b91c1c)",
+                              background: "transparent",
+                              border: "1px solid var(--border, #d1d5db)",
+                              padding: "1px 6px",
+                              borderRadius: "3px",
+                              cursor: "pointer",
+                            }}
+                          >
+                            Unset convention
+                          </button>
+                        ) : null}
+                      </div>
                     ) : (
                       <TopNTypeSelector
                         selected={sel}
@@ -1036,6 +1086,36 @@ function ContestedTable({
     await runRetroactiveSweep(span, type, otherCount);
   }
 
+  async function handleUnsetConvention(span: string) {
+    if (!window.confirm(
+      `Unset the project convention for '${span}'? Future tasks won't see this rule. Already-modified task annotations are NOT reverted.`,
+    )) {
+      return;
+    }
+    setSubmitting(span);
+    setError(null);
+    try {
+      await clearConvention(projectId, span, storeKey);
+      // Drop the committed/result entries so the row reverts to its
+      // "pick a type" state.
+      setCommitted((prev) => {
+        const next = { ...prev };
+        delete next[span];
+        return next;
+      });
+      setRetroResult((prev) => {
+        const next = { ...prev };
+        delete next[span];
+        return next;
+      });
+      onAfterRetroactiveFix?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
   return (
     <>
       {pendingConfirm ? (
@@ -1160,12 +1240,32 @@ function ContestedTable({
                   </td>
                   <td style={TD}>
                     {committedType ? (
-                      <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                        ✓ set:{" "}
-                        <strong>
-                          {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
-                        </strong>
-                      </span>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem", alignItems: "flex-start" }}>
+                        <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
+                          ✓ set:{" "}
+                          <strong>
+                            {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
+                          </strong>
+                        </span>
+                        <button
+                          type="button"
+                          disabled={submitting === c.span}
+                          onClick={() => handleUnsetConvention(c.span)}
+                          title="Remove this convention from the project. Future tasks won't see this rule. Already-modified task annotations (via Apply to all) are NOT reverted."
+                          style={{
+                            fontSize: "0.7rem",
+                            color: "var(--danger, #b91c1c)",
+                            background: "transparent",
+                            border: "1px solid var(--border, #d1d5db)",
+                            padding: "1px 6px",
+                            borderRadius: "3px",
+                            cursor: "pointer",
+                            opacity: submitting === c.span ? 0.6 : 1,
+                          }}
+                        >
+                          Unset
+                        </button>
+                      </div>
                     ) : (
                       <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
                         <TopNTypeSelector

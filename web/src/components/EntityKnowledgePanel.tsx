@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import type { EntityConvention, EntityStatsItem } from "../types";
 import { DistributionBar, OriginalTextCell, Pagination, TypePill } from "../entityHelpers";
+import { clearConvention } from "../api";
 
 const PAGE_SIZE = 100;
 
@@ -50,6 +51,33 @@ export function EntityKnowledgePanel({
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(0);
+  const [unsetting, setUnsetting] = useState<string | null>(null);
+
+  async function handleUnset(span: string | null) {
+    if (!projectId || !span) return;
+    if (
+      !window.confirm(
+        `Unset the project convention for '${span}'? This removes the rule from future prompts. Any task annotations already modified via Apply-to-all are NOT reverted.`,
+      )
+    ) {
+      return;
+    }
+    setUnsetting(span);
+    setError(null);
+    try {
+      await clearConvention(projectId, span, storeKey);
+      // Optimistically drop from the in-memory list so the row vanishes
+      // immediately; re-fetch in the background for the source of truth.
+      setConventions((prev) =>
+        prev ? prev.filter((c) => (c.span ?? "").toLowerCase() !== span.toLowerCase()) : prev,
+      );
+      fetchData("conventions");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnsetting(null);
+    }
+  }
 
   function fetchData(which: Subtab) {
     if (!projectId) return;
@@ -227,6 +255,7 @@ export function EntityKnowledgePanel({
                 <th style={{ padding: "0.4rem 0.75rem" }}>Status</th>
                 <th style={{ padding: "0.4rem 0.75rem" }}>Evidence</th>
                 <th style={{ padding: "0.4rem 0.75rem" }}>Updated</th>
+                <th style={{ padding: "0.4rem 0.75rem" }}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -279,6 +308,26 @@ export function EntityKnowledgePanel({
                     }}
                   >
                     {c.updated_at.replace("T", " ").slice(0, 19)}
+                  </td>
+                  <td style={{ padding: "0.4rem 0.75rem" }}>
+                    <button
+                      type="button"
+                      disabled={!c.span || unsetting === c.span}
+                      onClick={() => handleUnset(c.span)}
+                      title="Remove this convention from the project. Future tasks won't see this rule injected. Already-modified task annotations are NOT reverted."
+                      style={{
+                        fontSize: "0.75rem",
+                        color: c.span ? "var(--danger, #b91c1c)" : undefined,
+                        background: "transparent",
+                        border: "1px solid var(--border, #d1d5db)",
+                        padding: "2px 8px",
+                        borderRadius: "3px",
+                        cursor: c.span ? "pointer" : "not-allowed",
+                        opacity: unsetting === c.span ? 0.6 : 1,
+                      }}
+                    >
+                      {unsetting === c.span ? "…" : "Unset"}
+                    </button>
                   </td>
                 </tr>
               ))}
