@@ -751,6 +751,33 @@ class DashboardApi:
             removed = EntityConventionService(store).delete_for_span(
                 project_id=pid, span=span,
             )
+            # Surgery: strip `resolved_convention_type` from any cached
+            # posterior-audit contested row matching this span. Without
+            # this the dashboard keeps showing the green "✓ set: type"
+            # badge after Unset because the cached payload still has
+            # the field — the GET reads cache, doesn't recompute.
+            if removed:
+                try:
+                    cached = read_posterior_audit_cache(store, project_id=pid)
+                    if cached is not None:
+                        cache_payload = cached["payload"]
+                        span_lower = span.strip().lower()
+                        contested = cache_payload.get("contested_spans", [])
+                        changed = False
+                        for c in contested:
+                            if (c.get("span") or "").lower() == span_lower and \
+                               "resolved_convention_type" in c:
+                                c.pop("resolved_convention_type", None)
+                                changed = True
+                        if changed:
+                            cache_payload["contested_spans"] = contested
+                            write_posterior_audit_cache(
+                                store, project_id=pid, payload=cache_payload,
+                                accepted_hash=cached["accepted_hash"],
+                                created_at=cached["created_at"],
+                            )
+                except Exception:  # noqa: BLE001 — cache update is best-effort
+                    pass
             return self._json_response(200, {"removed": removed})
         return self._json_response(404, {"error": "not_found"})
 
