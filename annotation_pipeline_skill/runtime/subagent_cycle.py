@@ -331,11 +331,16 @@ class SubagentRuntime:
             task, "continuity_handle",
             annotation_result.continuity_handle, annotation_result.provider,
         )
+        # Validation runs against the CLEANED text so any auto-fix done in
+        # _serialize_llm_json (boundary trims, near-verbatim alignments) is
+        # what the validators see. Without this, validation parsed the raw
+        # LLM output and could reject a span the artifact had already cleaned
+        # up — costing a free retry on a non-issue.
         await self._run_validation_and_qc(
             task,
             annotation_artifact,
             annotation_attempt_id,
-            annotation_result.final_text,
+            cleaned_annotation_text,
         )
 
     # Hard cap on consecutive arbiter mechanical retries. After this many
@@ -1278,73 +1283,12 @@ class SubagentRuntime:
         }
 
     def _auto_align_corrected_annotation(self, task: Task, corrected: dict) -> int:
-        """Mutate ``corrected`` in place: replace each non-verbatim span that
-        differs from a verbatim substring only by surrounding whitespace /
-        punctuation / quotes with the aligned form. Returns the number of
-        spans that were rewritten.
-
-        Letter-level edits are NEVER performed — ``try_align_to_verbatim``
-        only strips trim-safe characters from either end, so the entity's
-        semantic content is preserved. Spans that can't be safely aligned
-        are left untouched and will surface to the normal verbatim-failure
-        path below.
+        """Wrapper kept for callers in the arbiter retry loop. Delegates to
+        the shared ``auto_fix_safe_spans_in_place`` so annotation, arbiter,
+        and any future write paths share one safe-fix implementation.
         """
-        from annotation_pipeline_skill.core.schema_validation import try_align_to_verbatim
-        source_payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
-        if not isinstance(source_payload, dict):
-            return 0
-        source_rows = source_payload.get("rows")
-        if not isinstance(source_rows, list):
-            return 0
-        input_by_index: dict[int, str] = {}
-        for i, r in enumerate(source_rows):
-            if not isinstance(r, dict):
-                continue
-            idx = r.get("row_index") if isinstance(r.get("row_index"), int) else i
-            text = r.get("input")
-            if isinstance(text, str):
-                input_by_index[idx] = text
-        rows_out = corrected.get("rows") if isinstance(corrected, dict) else None
-        if not isinstance(rows_out, list):
-            return 0
-        rewrites = 0
-        for r in rows_out:
-            if not isinstance(r, dict):
-                continue
-            row_index = r.get("row_index") if isinstance(r.get("row_index"), int) else 0
-            input_text = input_by_index.get(row_index)
-            if not input_text:
-                continue
-            output = r.get("output")
-            if not isinstance(output, dict):
-                continue
-            for typ_dict_key in ("entities", "json_structures"):
-                type_dict = output.get(typ_dict_key)
-                if not isinstance(type_dict, dict):
-                    continue
-                for type_name, items in type_dict.items():
-                    if not isinstance(items, list):
-                        continue
-                    for i, span in enumerate(items):
-                        if not isinstance(span, str) or not span:
-                            continue
-                        if span in input_text:
-                            # Already verbatim, but trailing sentence punct
-                            # might still trip find_trailing_punctuation_spans
-                            # at the apply step. Mirror that helper's rule:
-                            # if the trimmed form is ALSO in input.text, the
-                            # trailing punct is sentence boundary, not part
-                            # of the entity — prefer trimmed.
-                            trimmed = _strip_trailing_sentence_punct(span)
-                            if trimmed and trimmed != span and trimmed in input_text:
-                                items[i] = trimmed
-                                rewrites += 1
-                            continue
-                        aligned = try_align_to_verbatim(span, input_text)
-                        if aligned is not None:
-                            items[i] = aligned
-                            rewrites += 1
-        return rewrites
+        from annotation_pipeline_skill.core.schema_validation import auto_fix_safe_spans_in_place
+        return auto_fix_safe_spans_in_place(task, corrected)
 
     def _verbatim_candidate_spans(
         self, task: Task, *, row_index: int, failed_span: str, max_candidates: int = 6
@@ -3085,27 +3029,36 @@ def _parse_llm_json(text: str) -> Any:
 
 
 def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
-    """Parse LLM output and re-serialize as canonical JSON. Returns the
-    original text if no JSON can be recovered (caller surfaces the error
-    downstream).
+    """Parse LLM output, run safe auto-fix, and re-serialize as canonical
+    JSON. Returns the original text if no JSON can be recovered (caller
+    surfaces the error downstream).
 
-    Dedupes within-type spans (annotators / arbiter sometimes emit the same
-    string twice under one entity type) but performs NO character-level
-    normalization of spans. Per the downstream GLiNER pipeline, spans must
-    be byte-for-byte substrings of input.text — any "cleanup" (CJK
-    whitespace collapse, trailing punctuation strip, Traditional↔Simplified,
-    LaTeX escape removal) breaks the verbatim guarantee training relies on.
+    Auto-fix steps (boundary-only, NEVER touches letters):
+      - Strip surrounding whitespace / sentence punctuation / quote chars
+        from spans whose only defect is the boundary (``try_align_to_verbatim``).
+      - For already-verbatim spans where the punct-trimmed form is ALSO
+        verbatim, prefer the trimmed form — matches ``find_trailing_punctuation_spans``
+        ("entity is the name, not the sentence boundary").
+      - Dedupe within-type duplicates.
 
-    Cross-type collisions and non-verbatim spans are NOT silently rewritten;
-    they fail the verification gate and surface as feedback.
+    Cross-type collisions, hallucinated (genuinely-non-verbatim) spans,
+    schema breakage, and empty annotations are NOT silently rewritten —
+    they fail the verification gate and surface as feedback. Auto-fix only
+    handles cases where the annotator's intent is clear but the boundary
+    was off by trim-safe characters.
     """
-    # `task` is accepted for API compatibility with callers that already
-    # pass it, but no normalization needs it today.
-    del task
     try:
         parsed = _parse_llm_json(text)
     except (ValueError, TypeError):
         return text
+    if task is not None:
+        try:
+            from annotation_pipeline_skill.core.schema_validation import (
+                auto_fix_safe_spans_in_place,
+            )
+            auto_fix_safe_spans_in_place(task, parsed)
+        except Exception:  # noqa: BLE001 — never block artifact write on auto-fix
+            pass
     _dedupe_within_type_spans(parsed)
     try:
         return json.dumps(parsed, ensure_ascii=False)

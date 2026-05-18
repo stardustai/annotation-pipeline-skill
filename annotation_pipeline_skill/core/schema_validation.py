@@ -147,6 +147,85 @@ def try_align_to_verbatim(span: str, input_text: str) -> str | None:
     return None
 
 
+def auto_fix_safe_spans_in_place(task: "Task", payload: Any) -> int:
+    """Mutate ``payload`` in place: rewrite spans whose only defect is
+    surrounding whitespace / sentence punctuation / quote characters into
+    the form that's both verbatim in input.text AND not trailing-punct
+    flagged. Returns the count of rewrites.
+
+    Two safe rules, in priority order:
+
+    1. If the span is non-verbatim but ``try_align_to_verbatim`` yields a
+       verbatim form that differs only by trim-safe chars, use that. Catches
+       things like ``"Mitul Mallik."`` when input has ``"Mitul Mallik "`` or
+       wrapping quotes ``"foo"`` when input has ``foo``.
+    2. If the span IS already verbatim but its punct-trimmed form is ALSO
+       verbatim, prefer the trimmed form. Mirrors
+       ``find_trailing_punctuation_spans`` semantics: the entity is the name,
+       not the sentence boundary. Without this, spans like ``"Va."`` pass
+       verbatim but fail trailing-punct validation downstream.
+
+    Letter-level edits are NEVER performed — alignment only strips trim-safe
+    characters from either end. The semantic content of the entity is
+    preserved; only its start/end boundary moves. Spans that can't be safely
+    aligned are left untouched and will surface to the normal validation
+    failure path.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    source_payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
+    if not isinstance(source_payload, dict):
+        return 0
+    source_rows = source_payload.get("rows")
+    if not isinstance(source_rows, list):
+        return 0
+    input_by_index: dict[int, str] = {}
+    for i, r in enumerate(source_rows):
+        if not isinstance(r, dict):
+            continue
+        idx = r.get("row_index") if isinstance(r.get("row_index"), int) else i
+        text = r.get("input")
+        if isinstance(text, str):
+            input_by_index[idx] = text
+    rows_out = payload.get("rows")
+    if not isinstance(rows_out, list):
+        return 0
+    rewrites = 0
+    for r in rows_out:
+        if not isinstance(r, dict):
+            continue
+        row_index = r.get("row_index") if isinstance(r.get("row_index"), int) else 0
+        input_text = input_by_index.get(row_index)
+        if not input_text:
+            continue
+        output = r.get("output")
+        if not isinstance(output, dict):
+            continue
+        for typ_dict_key in ("entities", "json_structures"):
+            type_dict = output.get(typ_dict_key)
+            if not isinstance(type_dict, dict):
+                continue
+            for type_name, items in type_dict.items():
+                if not isinstance(items, list):
+                    continue
+                for i, span in enumerate(items):
+                    if not isinstance(span, str) or not span:
+                        continue
+                    if span in input_text:
+                        # Already verbatim — preempt trailing-punct flag if
+                        # the trimmed form is also verbatim.
+                        trimmed = span.rstrip(_TRAILING_SENTENCE_PUNCT)
+                        if trimmed and trimmed != span and trimmed in input_text:
+                            items[i] = trimmed
+                            rewrites += 1
+                        continue
+                    aligned = try_align_to_verbatim(span, input_text)
+                    if aligned is not None:
+                        items[i] = aligned
+                        rewrites += 1
+    return rewrites
+
+
 def find_duplicate_spans(payload: Any) -> "list[dict[str, Any]]":
     """Return any spans that appear more than once under the same
     entities/json_structures type within a single row. Always a model
