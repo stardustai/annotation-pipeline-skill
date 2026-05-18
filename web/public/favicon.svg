@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>Annotation Pipeline</title>
+  <!-- Rounded background in the dashboard's primary teal. -->
+  <rect width="32" height="32" rx="6" fill="#2f6f73"/>
+
+  <!-- Two stylized lines of text, each with a colored "annotated span"
+       overlaying part of it: orange tag on the first line, green on
+       the second. Reads as "highlighted text" at any size. -->
+  <rect x="5"  y="9"  width="22" height="5" rx="1.5" fill="#ffffff" fill-opacity="0.28"/>
+  <rect x="5"  y="9"  width="13" height="5" rx="1.5" fill="#f4c63d"/>
+
+  <rect x="5"  y="18" width="22" height="5" rx="1.5" fill="#ffffff" fill-opacity="0.28"/>
+  <rect x="14" y="18" width="13" height="5" rx="1.5" fill="#5fb09c"/>
+</svg>

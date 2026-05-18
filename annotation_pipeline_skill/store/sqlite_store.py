@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS entity_statistics (
     PRIMARY KEY (project_id, span_lower, entity_type)
 );
 CREATE INDEX IF NOT EXISTS idx_entity_stats_span ON entity_statistics(project_id, span_lower);
+
+-- Cache of the most recent Posterior Audit scan per project, so the dashboard
+-- can auto-load the previous result without re-running the (expensive) full
+-- scan, and so we can show whether the cache is stale relative to current
+-- ACCEPTED tasks. ``accepted_hash`` is a sha256 over (task_id, updated_at) of
+-- all ACCEPTED tasks at scan time; comparing the cached hash to a freshly
+-- computed one tells us whether anything has changed since the cache was
+-- written.
+CREATE TABLE IF NOT EXISTS posterior_audit_cache (
+    project_id    TEXT PRIMARY KEY,
+    payload_json  TEXT NOT NULL,
+    accepted_hash TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
 """
 
 

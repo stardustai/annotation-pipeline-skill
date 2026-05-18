@@ -321,3 +321,25 @@ export type PosteriorAudit = {
   contested_spans: ContestedSpan[];
 };
 
+export type EntityConvention = {
+  convention_id: string;
+  project_id: string;
+  // API field is `span` (originally `span_original` in the DB). May be
+  // null in legacy rows where the original capitalization wasn't kept.
+  span: string | null;
+  entity_type: string | null;
+  status: string;
+  evidence_count: number;
+  created_by: string;
+  notes?: string | null;
+  proposals?: { entity_type: string; evidence_count: number }[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type EntityStatsItem = {
+  span: string;
+  distribution: Record<string, number>;
+  total: number;
+};
+
