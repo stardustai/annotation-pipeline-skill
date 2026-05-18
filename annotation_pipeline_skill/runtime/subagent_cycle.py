@@ -348,6 +348,15 @@ class SubagentRuntime:
     # bad correction), give up and route to HR. Prevents a stuck task from
     # looping forever when the LLM consistently fails on it.
     ARBITER_MECHANICAL_RETRY_CAP = 3
+    # Separate, much larger budget for verbatim-only failures. Reason:
+    # validation-layer auto-fix (auto_fix_safe_spans_in_place) absorbs
+    # boundary-only mismatches at write time, so verbatim-exhausted on the
+    # arbiter side typically means a genuine model hallucination — but it's
+    # also the LLM-noise-prone failure mode that tends to clear on the
+    # next pickup. Give it ~2× the mechanical budget before escalating; if
+    # the arbiter is consistently hallucinating on this task, HR is still
+    # the right destination, just not after 3 pickups.
+    ARBITER_VERBATIM_BAIL_CAP = 6
 
     def _handle_arbiter_mechanical_fail(
         self,
@@ -357,15 +366,25 @@ class SubagentRuntime:
         stage: str,
         hr_extra_metadata: dict,
     ) -> None:
-        """Bump the per-task mechanical-retry counter. If the cap is reached,
-        transition to HR. Otherwise leave the task in ARBITRATING for re-pickup.
+        """Bump the per-task arbiter-retry counter for the right failure
+        mode (mechanical shape/parse vs verbatim-exhausted). If the matching
+        cap is reached, transition to HR. Otherwise leave the task in
+        ARBITRATING for re-pickup — the next worker takes a fresh shot.
         """
-        count = int(task.metadata.get("arbiter_mechanical_retries", 0)) + 1
-        task.metadata["arbiter_mechanical_retries"] = count
-        if count >= self.ARBITER_MECHANICAL_RETRY_CAP:
+        verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
+        if verbatim_exhausted:
+            count = int(task.metadata.get("arbiter_verbatim_bail_count", 0)) + 1
+            task.metadata["arbiter_verbatim_bail_count"] = count
+            cap = self.ARBITER_VERBATIM_BAIL_CAP
+        else:
+            count = int(task.metadata.get("arbiter_mechanical_retries", 0)) + 1
+            task.metadata["arbiter_mechanical_retries"] = count
+            cap = self.ARBITER_MECHANICAL_RETRY_CAP
+        if count >= cap:
             metadata = {
                 **hr_extra_metadata,
-                "arbiter_mechanical_retries": count,
+                "arbiter_mechanical_retries": int(task.metadata.get("arbiter_mechanical_retries", 0)),
+                "arbiter_verbatim_bail_count": int(task.metadata.get("arbiter_verbatim_bail_count", 0)),
                 "arbiter_ran": arb["ran"],
                 "arbiter_unresolved": arb["unresolved"],
                 "arbiter_mechanical_fail": arb["mechanical_fail"],
@@ -374,7 +393,6 @@ class SubagentRuntime:
             # see what it tried to fix and decide whether to apply it
             # manually (after fixing the verbatim issue) or send back to
             # annotation.
-            verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
             if verbatim_exhausted:
                 metadata["arbiter_verbatim_retry_exhausted"] = True
                 metadata["arbiter_failed_correction"] = arb.get("failed_verbatim_correction")
