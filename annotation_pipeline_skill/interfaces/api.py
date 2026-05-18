@@ -123,17 +123,19 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
                 "prior_total": r.total,
             })
 
-    # Annotate (don't filter) contested spans with an explicit
-    # operator-declared convention. The operator wants to keep them
-    # visible after Set Convention so the change is observable; the UI
-    # renders a "✓ set convention: <type>" badge when this field is set.
+    # Filter contested spans by operator-declared conventions. A span
+    # the operator has explicitly resolved should disappear from the
+    # contested list — if they want to revisit it, they can Unset the
+    # convention (and it'll re-appear on next scan because the
+    # entity_statistics distribution is still split). Previous design
+    # kept the row visible with a `resolved_convention_type` badge so
+    # the change was observable, but in practice operators expect
+    # "Apply → row goes away" and were confused by the persistent row.
     contested_all = svc.contested_spans(project_id=project_id)
-    contested = []
-    for c in contested_all:
-        conv_type = convention_index.get(c.get("span", "").lower())
-        if conv_type is not None:
-            c = {**c, "resolved_convention_type": conv_type}
-        contested.append(c)
+    contested = [
+        c for c in contested_all
+        if c.get("span", "").lower() not in convention_index
+    ]
     return {
         "task_deviations": deviations,
         "contested_spans": contested,
