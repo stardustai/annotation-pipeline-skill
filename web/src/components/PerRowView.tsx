@@ -114,6 +114,55 @@ export function extractOutputsByIndex(
   return out;
 }
 
+/**
+ * Walk every `annotation_result` artifact in order and return a per-actor
+ * (span → type) map. The annotator's first artifact is tagged "annotator";
+ * artifacts whose metadata.source is "arbiter_correction" are tagged
+ * "arbiter". Used by Manual Review to surface side-by-side picks.
+ */
+export function extractProposalsByActor(
+  artifacts: TaskDetailArtifact[],
+): Array<{ actor: "annotator" | "arbiter"; spanType: Map<string, string> }> {
+  const result: Array<{
+    actor: "annotator" | "arbiter";
+    spanType: Map<string, string>;
+  }> = [];
+  let sawAnnotator = false;
+  for (const art of artifacts) {
+    if (art.kind !== "annotation_result") continue;
+    const cleaned = stripThinkBlocks(art.payload);
+    const unwrapped = unwrapJson(cleaned);
+    const rows = locateRowsArray(unwrapped);
+    if (!rows) continue;
+    const meta = (art.metadata ?? {}) as Record<string, unknown>;
+    const isArbiter = meta.source === "arbiter_correction";
+    const actor: "annotator" | "arbiter" = isArbiter ? "arbiter" : "annotator";
+    if (!isArbiter) sawAnnotator = true;
+    const spanType = new Map<string, string>();
+    for (const r of rows) {
+      if (r === null || typeof r !== "object") continue;
+      const output = (r as Record<string, unknown>).output;
+      if (output === null || typeof output !== "object") continue;
+      const entities = (output as Record<string, unknown>).entities;
+      if (!entities || typeof entities !== "object") continue;
+      for (const [type, spans] of Object.entries(entities as Record<string, unknown>)) {
+        if (!Array.isArray(spans)) continue;
+        for (const s of spans) {
+          if (typeof s !== "string") continue;
+          // Last write wins per span — fine for a single payload, and
+          // collisions within a single artifact are flagged elsewhere.
+          spanType.set(s, type);
+        }
+      }
+    }
+    result.push({ actor, spanType });
+  }
+  // If the first artifact happened to carry arbiter metadata (rare/legacy
+  // tasks), the annotator's view is missing — leave the list as-is.
+  void sawAnnotator;
+  return result;
+}
+
 function locateRowsArray(value: unknown): unknown[] | null {
   if (value === null || typeof value !== "object") return null;
   if (Array.isArray(value)) return value;

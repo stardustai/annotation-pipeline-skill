@@ -122,6 +122,23 @@ export async function postTaskMove(
   return response.json();
 }
 
+export async function clearConvention(
+  projectId: string,
+  span: string,
+  storeKey: string | null = null,
+): Promise<{ removed: boolean }> {
+  const response = await fetch(withStore("/api/conventions/clear", storeKey), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, span }),
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(err?.error ?? `Clear convention returned ${response.status}`);
+  }
+  return response.json() as Promise<{ removed: boolean }>;
+}
+
 export interface EntityConvention {
   convention_id: string;
   project_id: string;

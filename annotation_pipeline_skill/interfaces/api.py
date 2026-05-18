@@ -67,6 +67,21 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
             return None
 
     svc = EntityStatisticsService(store)
+
+    # Build the operator-declared convention index. Active conventions
+    # (i.e., the operator has made an explicit policy call for this span)
+    # override the empirical prior — they should suppress deviation /
+    # contested flagging so the operator doesn't keep seeing the same
+    # span show up after they've already adjudicated it. Disputed
+    # conventions don't suppress (the policy itself is in conflict).
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        EntityConventionService,
+    )
+    convention_index: dict[str, str] = {}
+    for c in EntityConventionService(store).list_for_project(project_id, include_disputed=False):
+        if c.entity_type:  # disputed conventions have entity_type=None — skip
+            convention_index[c.span_lower] = c.entity_type
+
     deviations = []
     for task in store.list_tasks_by_pipeline(project_id):
         if task.status is not TaskStatus.ACCEPTED:
@@ -75,6 +90,25 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
         if payload is None:
             continue
         for span, entity_type in iter_span_decisions(payload):
+            # Operator-declared convention takes precedence over prior.
+            conv_type = convention_index.get(span.lower())
+            if conv_type is not None:
+                # If convention matches the task's type → not divergent.
+                # If convention is "not_an_entity", the task SHOULD have
+                # dropped this span; flagging is still useful but framed
+                # differently — keep the deviation visible so operator can
+                # apply the fix.
+                if conv_type == entity_type:
+                    continue
+                if conv_type == "not_an_entity":
+                    # Operator declared this span shouldn't be tagged at
+                    # all but the task still has it — keep flagging until
+                    # the operator submits the delete fix.
+                    pass
+                # else: convention says some other type but task disagrees;
+                # this is a real divergence vs the operator's policy. Fall
+                # through and emit a deviation, but using conv_type as the
+                # target instead of the empirical dominant.
             r = svc.check(project_id=project_id, span=span, proposed_type=entity_type)
             if r.status != "divergent":
                 continue
@@ -84,14 +118,163 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
                                  # UI can still show "task-level" without it.
                 "span": r.span,
                 "current_type": r.proposed_type,
-                "prior_dominant_type": r.dominant_type,
+                "prior_dominant_type": conv_type or r.dominant_type,
                 "prior_distribution": r.distribution,
                 "prior_total": r.total,
             })
+
+    # Filter contested spans the same way: skip any with an explicit
+    # operator-declared convention (any type, including not_an_entity).
+    # The operator has already made the policy call.
+    contested_all = svc.contested_spans(project_id=project_id)
+    contested = [
+        c for c in contested_all
+        if c.get("span", "").lower() not in convention_index
+    ]
     return {
         "task_deviations": deviations,
-        "contested_spans": svc.contested_spans(project_id=project_id),
+        "contested_spans": contested,
     }
+
+
+def find_typical_text_for_span(
+    store,
+    *,
+    project_id: str,
+    span: str,
+    exclude_task_ids: list[str] | None = None,
+    exclude_keys: list[str] | None = None,
+    task_id_filter: str | None = None,
+) -> dict | None:
+    """Return one random ACCEPTED task whose source-ref input rows contain
+    the span. Cheap LIKE prefilter on ``source_ref_json`` then JSON parse +
+    case-insensitive contains check on each row. Returns ``None`` if no
+    match. Result shape:
+        {"task_id": str, "row_index": int, "text": str}
+
+    ``task_id_filter`` constrains the scan to a single ACCEPTED task — used
+    by Task deviations to show context from THE task in question rather
+    than any task containing the span. ``exclude_keys`` is for cycling
+    through matches within a single task; each key is ``"task_id:row_index"``.
+    """
+    import random
+    span_lower = span.lower()
+    if task_id_filter:
+        rows = store._conn.execute(
+            "SELECT task_id, source_ref_json FROM tasks "
+            "WHERE pipeline_id=? AND task_id=? "
+            "AND lower(source_ref_json) LIKE ?",
+            (project_id, task_id_filter, f"%{span_lower}%"),
+        ).fetchall()
+    else:
+        rows = store._conn.execute(
+            "SELECT task_id, source_ref_json FROM tasks "
+            "WHERE pipeline_id=? AND status='accepted' "
+            "AND lower(source_ref_json) LIKE ?",
+            (project_id, f"%{span_lower}%"),
+        ).fetchall()
+    excluded = set(exclude_task_ids or [])
+    excluded_keys = set(exclude_keys or [])
+    candidates: list[dict] = []
+    for r in rows:
+        if r["task_id"] in excluded:
+            continue
+        try:
+            sr = json.loads(r["source_ref_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        payload = sr.get("payload") if isinstance(sr, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        input_rows = payload.get("rows")
+        if not isinstance(input_rows, list):
+            continue
+        for ir in input_rows:
+            if not isinstance(ir, dict):
+                continue
+            text = ir.get("input")
+            if isinstance(text, dict):
+                text = text.get("text")
+            if not isinstance(text, str):
+                continue
+            if span_lower in text.lower():
+                row_index = ir.get("row_index", 0)
+                key = f"{r['task_id']}:{row_index}"
+                if key in excluded_keys:
+                    continue
+                candidates.append({
+                    "task_id": r["task_id"],
+                    "row_index": row_index,
+                    "text": text,
+                })
+                # We want diversity, so don't stop at the first match per
+                # task — but cap total candidates so a popular span like
+                # "google" doesn't materialize 1000s of rows.
+                if len(candidates) >= 200:
+                    break
+        if len(candidates) >= 200:
+            break
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+
+def compute_accepted_hash(store, *, project_id: str) -> str:
+    """SHA-256 over `(task_id, updated_at)` of every ACCEPTED task in the
+    project, sorted by task_id. Cheap (no artifact reads) and changes
+    whenever a task transitions in/out of ACCEPTED or its annotation gets
+    updated (every transition bumps updated_at).
+    """
+    import hashlib
+    rows = store._conn.execute(
+        "SELECT task_id, updated_at FROM tasks "
+        "WHERE pipeline_id=? AND status='accepted' "
+        "ORDER BY task_id",
+        (project_id,),
+    ).fetchall()
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(r["task_id"].encode("utf-8"))
+        h.update(b"\x1f")  # unit separator
+        h.update(r["updated_at"].encode("utf-8"))
+        h.update(b"\x1e")  # record separator
+    return f"sha256:{h.hexdigest()[:16]}:n={len(rows)}"
+
+
+def read_posterior_audit_cache(store, *, project_id: str) -> dict | None:
+    row = store._conn.execute(
+        "SELECT payload_json, accepted_hash, created_at "
+        "FROM posterior_audit_cache WHERE project_id=?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "payload": json.loads(row["payload_json"]),
+        "accepted_hash": row["accepted_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def write_posterior_audit_cache(
+    store,
+    *,
+    project_id: str,
+    payload: dict,
+    accepted_hash: str,
+    created_at: str,
+) -> None:
+    store._conn.execute(
+        "INSERT INTO posterior_audit_cache "
+        "(project_id, payload_json, accepted_hash, created_at) "
+        "VALUES (?,?,?,?) "
+        "ON CONFLICT(project_id) DO UPDATE SET "
+        "payload_json=excluded.payload_json, "
+        "accepted_hash=excluded.accepted_hash, "
+        "created_at=excluded.created_at",
+        (project_id, json.dumps(payload, ensure_ascii=False), accepted_hash, created_at),
+    )
+    store._conn.commit()
 
 
 CONFIG_FILE_DEFINITIONS: dict[str, str] = {
@@ -220,7 +403,69 @@ class DashboardApi:
         if route == "/api/posterior-audit":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
-            return self._json_response(200, build_posterior_audit(store, project_id=project_id))
+            # GET returns the cached scan result + a staleness flag derived
+            # from comparing the accepted_hash captured at cache time to the
+            # current hash. Running a fresh scan requires POST (cheap GET so
+            # auto-load on page mount doesn't pay the scan cost).
+            cached = read_posterior_audit_cache(store, project_id=project_id)
+            current_hash = compute_accepted_hash(store, project_id=project_id)
+            if cached is None:
+                return self._json_response(200, {
+                    "cached": False,
+                    "payload": None,
+                    "generated_at": None,
+                    "cached_accepted_hash": None,
+                    "current_accepted_hash": current_hash,
+                    "stale": False,
+                })
+            return self._json_response(200, {
+                "cached": True,
+                "payload": cached["payload"],
+                "generated_at": cached["created_at"],
+                "cached_accepted_hash": cached["accepted_hash"],
+                "current_accepted_hash": current_hash,
+                "stale": cached["accepted_hash"] != current_hash,
+            })
+        if route == "/api/typical-text":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            span = query.get("span", [None])[0]
+            if not span:
+                return self._json_response(400, {"error": "span_required"})
+            exclude = query.get("exclude", [])
+            exclude_keys = query.get("exclude_key", [])
+            task_id_filter = query.get("task", [None])[0]
+            result = find_typical_text_for_span(
+                store,
+                project_id=project_id,
+                span=span,
+                exclude_task_ids=exclude,
+                exclude_keys=exclude_keys,
+                task_id_filter=task_id_filter,
+            )
+            if result is None:
+                return self._json_response(200, {"found": False})
+            return self._json_response(200, {"found": True, **result})
+        if route == "/api/entity-statistics":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            rows = store._conn.execute(
+                """
+                SELECT span_lower, entity_type, count, updated_at
+                FROM entity_statistics
+                WHERE project_id = ?
+                ORDER BY span_lower, count DESC
+                """,
+                (project_id,),
+            ).fetchall()
+            spans: dict[str, dict] = {}
+            for r in rows:
+                span = r["span_lower"]
+                entry = spans.setdefault(span, {"span": span, "distribution": {}, "total": 0})
+                entry["distribution"][r["entity_type"]] = r["count"]
+                entry["total"] += r["count"]
+            items = sorted(spans.values(), key=lambda e: (-e["total"], e["span"]))
+            return self._json_response(200, {"items": items, "span_count": len(items)})
         if route == "/api/runtime":
             return self._json_response(200, self._runtime_snapshot(store).to_dict())
         if route == "/api/runtime/monitor":
@@ -240,6 +485,9 @@ class DashboardApi:
                 except FileNotFoundError:
                     return self._json_response(404, {"error": "version_not_found"})
                 return self._json_response(200, ver.to_dict())
+        if route.startswith("/api/tasks/") and route.endswith("/deviations"):
+            task_id = route.removeprefix("/api/tasks/").removesuffix("/deviations").strip("/")
+            return self._task_deviations_response(store, task_id)
         if route.startswith("/api/tasks/"):
             task_id = route.removeprefix("/api/tasks/")
             if not task_id:
@@ -269,8 +517,31 @@ class DashboardApi:
         route = parsed_path.path
         query = parse_qs(parsed_path.query)
         store = self._resolve_store(query)
+        project_id = query.get("project", [None])[0]
         if route == "/api/runtime/run-once":
             return self._runtime_run_once_response()
+        if route == "/api/posterior-audit":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            payload = build_posterior_audit(store, project_id=project_id)
+            accepted_hash = compute_accepted_hash(store, project_id=project_id)
+            from annotation_pipeline_skill.core.models import utc_now
+            created_at = utc_now().isoformat()
+            write_posterior_audit_cache(
+                store,
+                project_id=project_id,
+                payload=payload,
+                accepted_hash=accepted_hash,
+                created_at=created_at,
+            )
+            return self._json_response(200, {
+                "cached": True,
+                "payload": payload,
+                "generated_at": created_at,
+                "cached_accepted_hash": accepted_hash,
+                "current_accepted_hash": accepted_hash,
+                "stale": False,
+            })
         if route == "/api/documents":
             return self._post_document_response(store, body)
         if route.startswith("/api/documents/") and route.endswith("/versions"):
@@ -288,11 +559,99 @@ class DashboardApi:
         if route.startswith("/api/tasks/") and route.endswith("/move"):
             task_id = route.removeprefix("/api/tasks/").removesuffix("/move").strip("/")
             return self._post_task_move_response(store, task_id, body)
+        if route.startswith("/api/tasks/") and route.endswith("/posterior-fix"):
+            task_id = route.removeprefix("/api/tasks/").removesuffix("/posterior-fix").strip("/")
+            try:
+                payload = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(payload, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            span = payload.get("span")
+            current_type = payload.get("current_type")
+            new_type = payload.get("new_type")  # may be None or "not_an_entity" for delete
+            actor = payload.get("actor") or "posterior_audit_operator"
+            if not span or not current_type:
+                return self._json_response(400, {"error": "span_and_current_type_required"})
+            try:
+                result = HumanReviewService(store).apply_posterior_fix(
+                    task_id=task_id, span=span, current_type=current_type,
+                    new_type=new_type, actor=actor,
+                )
+                # Surgically update the Posterior Audit cache: remove the
+                # (task_id, span, current_type) deviations that this fix
+                # resolved and refresh the accepted_hash so the next GET
+                # returns an up-to-date, non-stale view. Without this,
+                # operators see "no change" on refresh after Submit and
+                # have to click Re-check to trigger a full rescan.
+                task = store.load_task(task_id)
+                project_for_cache = task.pipeline_id
+                cached = read_posterior_audit_cache(store, project_id=project_for_cache)
+                if cached is not None:
+                    payload_in_cache = cached["payload"]
+                    devs = payload_in_cache.get("task_deviations", [])
+                    kept = [
+                        d for d in devs
+                        if not (
+                            d.get("task_id") == task_id
+                            and d.get("span") == span
+                            and d.get("current_type") == current_type
+                        )
+                    ]
+                    payload_in_cache["task_deviations"] = kept
+                    new_hash = compute_accepted_hash(store, project_id=project_for_cache)
+                    from annotation_pipeline_skill.core.models import utc_now as _utc_now
+                    write_posterior_audit_cache(
+                        store,
+                        project_id=project_for_cache,
+                        payload=payload_in_cache,
+                        accepted_hash=new_hash,
+                        created_at=_utc_now().isoformat(),
+                    )
+                return self._json_response(200, result)
+            except InvalidTransition as exc:
+                return self._json_response(409, {"error": "invalid_state", "detail": str(exc)})
+            except SchemaValidationError as exc:
+                return self._json_response(400, {"error": "schema_invalid", "detail": str(exc), "errors": exc.errors})
+            except Exception as exc:  # noqa: BLE001
+                return self._json_response(500, {"error": "internal", "detail": str(exc)})
         if route == "/api/conventions":
-            return self._post_convention_response(store, project_id, body)
+            try:
+                payload = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(payload, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            return self._post_convention_response(store, project_id, payload)
         if route.startswith("/api/conventions/") and route.endswith("/resolve"):
             conv_id = route.removeprefix("/api/conventions/").removesuffix("/resolve").strip("/")
-            return self._post_convention_resolve_response(store, conv_id, body)
+            try:
+                payload = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(payload, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            return self._post_convention_resolve_response(store, conv_id, payload)
+        if route == "/api/conventions/clear":
+            try:
+                payload = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(payload, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            from annotation_pipeline_skill.services.entity_convention_service import (
+                EntityConventionService,
+            )
+            pid = payload.get("project_id") or project_id
+            span = payload.get("span")
+            if not pid:
+                return self._json_response(400, {"error": "project_required"})
+            if not isinstance(span, str) or not span.strip():
+                return self._json_response(400, {"error": "span_required"})
+            removed = EntityConventionService(store).delete_for_span(
+                project_id=pid, span=span,
+            )
+            return self._json_response(200, {"removed": removed})
         return self._json_response(404, {"error": "not_found"})
 
     def _post_convention_response(self, store: SqliteStore, project_id: str | None, body: dict) -> tuple:
@@ -454,6 +813,80 @@ class DashboardApi:
         store.save_document_version(ver)
         return self._json_response(200, ver.to_dict())
 
+    def _task_deviations_response(self, store: SqliteStore, task_id: str) -> tuple[int, dict[str, str], bytes]:
+        """Return per-(span, type) deviations for a single task against
+        the project's entity_statistics. Used by Manual Review to surface
+        prior-disagreeing spans inline so the operator can decide whether
+        to apply a posterior fix while reviewing.
+
+        Honors active operator conventions the same way build_posterior_audit
+        does: if a convention pins this span to a type, skip when matched.
+        """
+        try:
+            task = store.load_task(task_id)
+        except (FileNotFoundError, KeyError):
+            return self._json_response(404, {"error": "task_not_found"})
+        from annotation_pipeline_skill.services.entity_statistics_service import (
+            EntityStatisticsService,
+            iter_span_decisions,
+        )
+        from annotation_pipeline_skill.services.entity_convention_service import (
+            EntityConventionService,
+        )
+        from annotation_pipeline_skill.runtime.subagent_cycle import _parse_llm_json
+        import json as _json
+        import re
+
+        # Load latest annotation/HR answer payload.
+        arts = store.list_artifacts(task_id)
+        payload: dict | None = None
+        hr = [a for a in arts if a.kind == "human_review_answer"]
+        if hr:
+            outer = _json.loads((store.root / hr[-1].path).read_text(encoding="utf-8"))
+            payload = outer.get("answer") if isinstance(outer, dict) else None
+        else:
+            anns = [a for a in arts if a.kind == "annotation_result"]
+            if anns:
+                outer = _json.loads((store.root / anns[-1].path).read_text(encoding="utf-8"))
+                text = outer.get("text") if isinstance(outer, dict) else None
+                if isinstance(text, str):
+                    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+                    try:
+                        payload = _parse_llm_json(text)
+                    except (ValueError, _json.JSONDecodeError):
+                        payload = None
+        if payload is None:
+            return self._json_response(200, {"task_id": task_id, "deviations": []})
+
+        convention_index: dict[str, str] = {}
+        for c in EntityConventionService(store).list_for_project(task.pipeline_id, include_disputed=False):
+            if c.entity_type:
+                convention_index[c.span_lower] = c.entity_type
+
+        svc = EntityStatisticsService(store)
+        deviations: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for span, entity_type in iter_span_decisions(payload):
+            key = (span, entity_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            conv_type = convention_index.get(span.lower())
+            if conv_type is not None and conv_type == entity_type:
+                continue  # operator-declared policy matches; not divergent
+            r = svc.check(project_id=task.pipeline_id, span=span, proposed_type=entity_type)
+            if r.status != "divergent":
+                continue
+            deviations.append({
+                "span": r.span,
+                "current_type": r.proposed_type,
+                "prior_dominant_type": conv_type or r.dominant_type,
+                "prior_total": r.total,
+                "prior_distribution": r.distribution,
+                "has_convention": conv_type is not None,
+            })
+        return self._json_response(200, {"task_id": task_id, "deviations": deviations})
+
     def _task_detail_response(self, store: SqliteStore, task_id: str) -> tuple[int, dict[str, str], bytes]:
         try:
             task = store.load_task(task_id)
@@ -605,15 +1038,28 @@ class DashboardApi:
         if not isinstance(payload, dict):
             return self._json_response(400, {"error": "invalid_payload"})
         try:
+            picks = payload.get("picks")
+            if not isinstance(picks, list):
+                picks = None
             result = HumanReviewService(store).decide(
                 task_id=task_id,
                 action=str(payload.get("action") or ""),
                 actor=str(payload.get("actor") or "human-reviewer"),
                 feedback=str(payload.get("feedback") or ""),
                 correction_mode=str(payload.get("correction_mode") or "manual_annotation"),
+                picks=picks,
             )
         except FileNotFoundError:
             return self._json_response(404, {"error": "task_not_found"})
+        except SchemaValidationError as exc:
+            return self._json_response(
+                422,
+                {
+                    "error": "validation_blocked",
+                    "detail": str(exc),
+                    "errors": exc.errors,
+                },
+            )
         except (InvalidTransition, ValueError) as exc:
             return self._json_response(400, {"error": "invalid_human_review_decision", "detail": str(exc)})
         return self._json_response(200, result.to_dict())

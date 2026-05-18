@@ -216,6 +216,11 @@ class LocalRuntimeScheduler:
                     continue
                 task, lease, run = claim
                 busy_workers += 1
+                # Defaults read by the bail-counter logic in `finally`.
+                # Overwritten by the except branches when a worker exception
+                # actually fires.
+                last_exception_was_permanent = False
+                last_exception_summary = ""
                 try:
                     # Hard upper bound on a single task's run. If an LLM call
                     # (codex subprocess, HTTP stream) hangs past this, we cancel
@@ -247,10 +252,20 @@ class LocalRuntimeScheduler:
                         f"releasing lease and recycling",
                         file=sys.stderr,
                     )
-                except Exception:
+                    last_exception_was_permanent = False
+                except Exception as worker_exc:  # noqa: BLE001
                     # SubagentRuntime captures errors on the attempt record; the
                     # worker only needs to release records and keep going.
-                    pass
+                    # We do classify the exception though — permanent errors
+                    # (404 wrong endpoint, 401 bad key, 400 schema) skip the
+                    # 5-bail retry dance and go straight to HR.
+                    from annotation_pipeline_skill.runtime.subagent_cycle import (
+                        _is_provider_permanent_error,
+                    )
+                    last_exception_was_permanent = _is_provider_permanent_error(worker_exc)
+                    last_exception_summary = (
+                        f"{type(worker_exc).__name__}: {str(worker_exc)[:200]}"
+                    )
                 finally:
                     self.store.delete_active_run(run.run_id)
                     self.store.delete_runtime_lease(lease.lease_id)
@@ -275,15 +290,57 @@ class LocalRuntimeScheduler:
                                 InvalidTransition,
                                 transition_task,
                             )
+                            # Per-task worker-bail counter. Without a cap, a
+                            # task that consistently hits the same provider
+                            # error (e.g., LLM returns 500 on a specific
+                            # input) re-enters PENDING and gets re-claimed
+                            # immediately → a tight worker_bail loop at
+                            # roughly 1 attempt/sec. Cap at 5 bails; after
+                            # that, route the task to HUMAN_REVIEW so an
+                            # operator can decide manually.
+                            bails = int(latest.metadata.get("worker_bail_count", 0)) + 1
+                            latest.metadata["worker_bail_count"] = bails
+                            # Default cap = 5 for transient errors. Permanent
+                            # errors (404 wrong endpoint, 401 bad key, 400
+                            # schema) skip the dance — retry can't fix config
+                            # bugs; cap=1 routes them straight to HR on the
+                            # first failure with the error message embedded.
+                            ANNOTATION_BAIL_CAP = 1 if last_exception_was_permanent else 5
                             try:
-                                event = transition_task(
-                                    latest, TaskStatus.PENDING,
-                                    actor="scheduler",
-                                    reason="worker bailed mid-annotation; resetting to pending",
-                                    stage="recovery",
-                                    metadata={"recovery": "worker_bail",
-                                              "previous_status": "annotating"},
-                                )
+                                if bails >= ANNOTATION_BAIL_CAP:
+                                    err_suffix = (
+                                        f" — {last_exception_summary}"
+                                        if last_exception_was_permanent and last_exception_summary
+                                        else ""
+                                    )
+                                    event = transition_task(
+                                        latest, TaskStatus.HUMAN_REVIEW,
+                                        actor="scheduler",
+                                        reason=(
+                                            (
+                                                f"worker hit permanent provider error "
+                                                f"(404/401/400 — config bug, not retried)"
+                                                if last_exception_was_permanent
+                                                else f"worker bailed {bails} consecutive times "
+                                                     "during annotation (provider error / timeout)"
+                                            )
+                                            + f"; routing to human review{err_suffix}"
+                                        ),
+                                        stage="recovery",
+                                        metadata={"recovery": "worker_bail_cap",
+                                                  "worker_bail_count": bails,
+                                                  "permanent_error": last_exception_was_permanent},
+                                    )
+                                else:
+                                    event = transition_task(
+                                        latest, TaskStatus.PENDING,
+                                        actor="scheduler",
+                                        reason="worker bailed mid-annotation; resetting to pending",
+                                        stage="recovery",
+                                        metadata={"recovery": "worker_bail",
+                                                  "previous_status": "annotating",
+                                                  "worker_bail_count": bails},
+                                    )
                                 self.store.save_task(latest)
                                 self.store.append_event(event)
                             except InvalidTransition:
@@ -410,6 +467,27 @@ class LocalRuntimeScheduler:
           annotation_result on attempt 0).
         """
         from annotation_pipeline_skill.core.transitions import InvalidTransition, transition_task
+
+        # Human Review's request_changes route puts the task into ANNOTATING
+        # explicitly to force a re-annotation. The artifact heuristic below
+        # would otherwise see the (now-rejected) annotation_result and bounce
+        # straight to QC — defeating the operator's intent. Honor the marker
+        # and restart from annotation (PENDING).
+        if task.metadata.get("hr_request_changes"):
+            task.metadata.pop("hr_request_changes", None)
+            try:
+                event = transition_task(
+                    task, TaskStatus.PENDING,
+                    actor="scheduler",
+                    reason="resume after HR request_changes: restart from annotation",
+                    stage="recovery",
+                    metadata={"resume": "hr_request_changes_to_pending"},
+                )
+            except InvalidTransition:
+                return
+            self.store.save_task(task)
+            self.store.append_event(event)
+            return
 
         artifacts = self.store.list_artifacts(task.task_id)
         # An annotation artifact exists AND no qc_result follows it in

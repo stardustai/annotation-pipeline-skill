@@ -9,10 +9,11 @@ import {
 } from "../drawer_state";
 import { AnnotationView } from "./AnnotationView";
 import { JsonViewer } from "./JsonViewer";
-import { PerRowView, extractOutputsByIndex } from "./PerRowView";
+import { PerRowView, extractOutputsByIndex, extractProposalsByActor } from "./PerRowView";
 import type { TaskCard, TaskDetail, TaskDetailArtifact } from "../types";
 import type { ReactNode } from "react";
 import {
+  clearConvention,
   declareConvention,
   fetchConventions,
   resolveConventionDispute,
@@ -196,6 +197,9 @@ export function TaskDrawer({
                 taskId={detail.task.task_id}
                 sourceRef={detail.task.source_ref}
                 artifacts={detail.artifacts}
+                feedback={detail.feedback}
+                saving={saving}
+                onSubmitHumanReviewDecision={onSubmitHumanReviewDecision}
               />
             ) : null}
 
@@ -304,11 +308,6 @@ export function TaskDrawer({
                     </>
                   )}
                 </DetailSection>
-                {detail.task.status === "human_review" ? (
-                  <DetailSection title="Human Review Decision">
-                    <HumanReviewDecisionForm saving={saving} onSubmit={onSubmitHumanReviewDecision} />
-                  </DetailSection>
-                ) : null}
               </>
             ) : null}
 
@@ -574,7 +573,7 @@ function FeedbackAgreementCard({
             {consensusReached ? "Resolved" : "Open"}
           </span>
         </div>
-        <p className="feedback-message">{String(feedback.message)}</p>
+        <p className="feedback-message">{highlightQuotedSpans(String(feedback.message))}</p>
       </div>
 
       {discussions.length === 0 ? (
@@ -590,13 +589,49 @@ function FeedbackAgreementCard({
                 </span>
                 {entry.consensus ? <span className="discussion-consensus-badge">✓ Consensus</span> : null}
               </div>
-              <p className="discussion-message-body">{String(entry.message)}</p>
+              <p className="discussion-message-body">{highlightQuotedSpans(String(entry.message))}</p>
             </div>
           ))}
         </div>
       )}
     </div>
   );
+}
+
+// Render `text` with any quoted entity references highlighted. Catches the
+// most common patterns reviewers use: 'span', "span", `span`, and the
+// curly / CJK pairs “span”, ‘span’, 「span」, 『span』. Anything else is
+// plain text.
+//
+// The lookbehind `(?<![A-Za-z0-9])` rules out apostrophes inside words
+// (annotator's, don't, U.S.A.'s) so we don't grab the apostrophe in a
+// contraction as the start of a "quoted" run. Lookahead does the mirror
+// for typographic / CJK closing quotes.
+const QUOTE_RE = new RegExp(
+  [
+    String.raw`(?<![A-Za-z0-9])(['"\`])([^'"\`\n]{1,60}?)\1`,
+    String.raw`“([^”\n]{1,60}?)”`,
+    String.raw`‘([^’\n]{1,60}?)’`,
+    String.raw`「([^」\n]{1,60}?)」`,
+    String.raw`『([^』\n]{1,60}?)』`,
+  ].join("|"),
+  "g",
+);
+
+function highlightQuotedSpans(text: string): ReactNode[] {
+  const parts: ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  QUOTE_RE.lastIndex = 0;
+  while ((m = QUOTE_RE.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    const inner = m[2] ?? m[3] ?? m[4] ?? m[5] ?? m[6] ?? "";
+    parts.push(<mark className="discussion-span-hl" key={key++}>{inner}</mark>);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
 }
 
 function DetailSection({ title, children }: { title: string; children: ReactNode }) {
@@ -626,39 +661,247 @@ const ENTITY_TYPES = [
   "number", "event", "location", "technology", "entity",
 ] as const;
 
+// Pseudo-type for "this span should NOT be tagged as any entity". Stored
+// in the same convention table; the runtime formats it as a negative
+// instruction when injecting into prompts.
+const NOT_ENTITY = "not_an_entity";
+
 function ManualReviewTab({
   projectId,
   taskId,
   sourceRef,
   artifacts,
+  feedback,
+  saving,
+  onSubmitHumanReviewDecision,
 }: {
   projectId: string;
   taskId: string;
   sourceRef: unknown;
   artifacts: TaskDetailArtifact[];
+  feedback: Array<Record<string, unknown>>;
+  saving: boolean;
+  onSubmitHumanReviewDecision: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   return (
     <div className="manual-review-tab">
+      <DeviationsBox projectId={projectId} taskId={taskId} />
       <EntityConventionForm
         projectId={projectId}
         taskId={taskId}
         sourceRef={sourceRef}
         artifacts={artifacts}
+        feedback={feedback}
+        hrSaving={saving}
+        onSubmitHumanReviewDecision={onSubmitHumanReviewDecision}
       />
     </div>
   );
 }
 
-// Find the first occurrence of `span` in `text`, return the surrounding
-// window (±radius chars, truncated at the nearest sentence boundary if one
-// lands inside the window, otherwise snapped to a word boundary). Returns
-// null if the span isn't in the text. Handles English . ? ! and Chinese
-// 。？！sentence terminators.
-//
-// Periods inside acronyms ("U.S.", "e.g.") are NOT treated as sentence
-// boundaries — heuristic: a period preceded by a single uppercase letter
-// or by another period/letter-period pattern is part of an abbreviation.
-function spanContext(text: string, span: string, radius = 50): {
+type TaskDeviation = {
+  span: string;
+  current_type: string;
+  prior_dominant_type: string;
+  prior_total: number;
+  prior_distribution: Record<string, number>;
+  has_convention: boolean;
+};
+
+function DeviationsBox({
+  projectId,
+  taskId,
+}: {
+  projectId: string;
+  taskId: string;
+}) {
+  const [data, setData] = useState<TaskDeviation[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [submittingKey, setSubmittingKey] = useState<string | null>(null);
+  const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  function reload() {
+    setLoading(true);
+    fetch(`/api/tasks/${encodeURIComponent(taskId)}/deviations`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        setData(d?.deviations ?? []);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId]);
+
+  async function applyFix(d: TaskDeviation, newType: string | null) {
+    const key = `${d.span}|${d.current_type}`;
+    setSubmittingKey(key);
+    setError(null);
+    try {
+      const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/posterior-fix`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          span: d.span,
+          current_type: d.current_type,
+          new_type: newType,
+          actor: "manual_review_inline",
+        }),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
+      }
+      setRowStatus((s) => ({ ...s, [key]: `applied: ${newType ?? "deleted"}` }));
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmittingKey(null);
+    }
+  }
+
+  if (loading && data === null) return null;
+  if (!data || data.length === 0) return null;
+
+  return (
+    <section
+      style={{
+        background: "#fff4e0",
+        border: "1px solid #d97706",
+        borderRadius: "4px",
+        padding: "0.6rem 0.85rem",
+        marginBottom: "0.75rem",
+      }}
+      aria-label="Posterior audit deviations"
+    >
+      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.4rem" }}>
+        <strong style={{ color: "#92400e" }}>
+          ⚠ Posterior audit: {data.length} span{data.length === 1 ? "" : "s"} diverge from project prior
+        </strong>
+        <span style={{ fontSize: "0.75rem", color: "#92400e" }}>
+          (this task's annotation disagrees with the project's empirical distribution / operator convention)
+        </span>
+      </header>
+      {error ? (
+        <div style={{ color: "var(--danger, #b91c1c)", fontSize: "0.8rem", marginBottom: "0.4rem" }}>
+          {error}
+        </div>
+      ) : null}
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
+        <thead>
+          <tr style={{ borderBottom: "1px solid #d97706", textAlign: "left" }}>
+            <th style={{ padding: "0.3rem 0.5rem 0.3rem 0" }}>Span</th>
+            <th style={{ padding: "0.3rem 0.5rem" }}>Now</th>
+            <th style={{ padding: "0.3rem 0.5rem" }}>
+              Prior dominant{" "}
+              <span style={{ fontWeight: 400, fontSize: "0.7rem" }} title="Operator-declared convention if set, else empirical stats">
+                ⓘ
+              </span>
+            </th>
+            <th style={{ padding: "0.3rem 0.5rem" }}>Distribution</th>
+            <th style={{ padding: "0.3rem 0.5rem" }}>Apply fix</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((d) => {
+            const key = `${d.span}|${d.current_type}`;
+            const status = rowStatus[key];
+            const isSubmitting = submittingKey === key;
+            const isDone = status?.startsWith("applied:");
+            const pct =
+              d.prior_total > 0
+                ? Math.round((d.prior_distribution[d.prior_dominant_type] / d.prior_total) * 100)
+                : 0;
+            return (
+              <tr key={key} style={{ borderBottom: "1px solid #fcd34d" }}>
+                <td style={{ padding: "0.3rem 0.5rem 0.3rem 0", fontFamily: "monospace" }}>
+                  {d.span}
+                </td>
+                <td style={{ padding: "0.3rem 0.5rem", color: "var(--danger, #b91c1c)" }}>
+                  {d.current_type}
+                </td>
+                <td style={{ padding: "0.3rem 0.5rem" }}>
+                  <strong>{d.prior_dominant_type}</strong>{" "}
+                  <span style={{ color: "#6b7280", fontSize: "0.75rem" }}>
+                    {d.has_convention ? "(convention)" : `(${pct}%)`}
+                  </span>
+                </td>
+                <td style={{ padding: "0.3rem 0.5rem", fontSize: "0.75rem", color: "#6b7280" }}>
+                  {Object.entries(d.prior_distribution)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([t, c]) => `${t}:${c}`)
+                    .join(", ")}
+                </td>
+                <td style={{ padding: "0.3rem 0.5rem", whiteSpace: "nowrap" }}>
+                  {isDone ? (
+                    <span style={{ color: "var(--success, #047857)" }}>✓ {status?.replace("applied:", "applied")}</span>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={isSubmitting}
+                        onClick={() => applyFix(d, d.prior_dominant_type)}
+                        style={{
+                          fontSize: "0.75rem",
+                          padding: "0.15rem 0.5rem",
+                          marginRight: "0.3rem",
+                          background: "var(--success, #047857)",
+                          color: "white",
+                          border: "none",
+                          borderRadius: "3px",
+                          cursor: isSubmitting ? "wait" : "pointer",
+                          opacity: isSubmitting ? 0.6 : 1,
+                        }}
+                        title={`Change this task's '${d.span}' from ${d.current_type} → ${d.prior_dominant_type}`}
+                      >
+                        {isSubmitting ? "…" : `→ ${d.prior_dominant_type}`}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isSubmitting}
+                        onClick={() => applyFix(d, null)}
+                        style={{
+                          fontSize: "0.75rem",
+                          padding: "0.15rem 0.5rem",
+                          border: "1px dashed #6b7280",
+                          background: "white",
+                          color: "#6b7280",
+                          borderRadius: "3px",
+                          cursor: isSubmitting ? "wait" : "pointer",
+                        }}
+                        title={`Delete this span from the annotation (mark as not an entity)`}
+                      >
+                        🚫 delete
+                      </button>
+                    </>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p style={{ margin: "0.4rem 0 0", fontSize: "0.7rem", color: "#92400e" }}>
+        These are spans in <em>this task</em> whose type disagrees with the project prior (or an
+        operator-declared convention). Click <strong>→ type</strong> to overwrite the annotation,{" "}
+        <strong>🚫 delete</strong> to drop the span. The fix is applied in place; the task stays
+        ACCEPTED with the corrected artifact.
+      </p>
+    </section>
+  );
+}
+
+// Find the first occurrence of `span` in `text`, return at least
+// ``minTokens`` tokens of surrounding context on each side, snapped to a
+// word/character boundary. A token is either a whitespace-delimited word
+// (English / Latin scripts) or a single CJK character. Returns null when
+// the span isn't in the text.
+function spanContext(text: string, span: string, minTokens = 10): {
   before: string;
   match: string;
   after: string;
@@ -666,107 +909,59 @@ function spanContext(text: string, span: string, radius = 50): {
   const idx = text.indexOf(span);
   if (idx === -1) return null;
   const spanEnd = idx + span.length;
-  const initialStart = Math.max(0, idx - radius);
-  const initialEnd = Math.min(text.length, spanEnd + radius);
-  let start = initialStart;
-  let end = initialEnd;
-
-  // LEFT — find latest real sentence end inside the window. Falls back to
-  // the nearest word boundary so we don't cut a word in half.
-  const left = text.slice(initialStart, idx);
-  const leftBoundary = lastSentenceBoundary(left);
-  if (leftBoundary !== -1) {
-    start = initialStart + leftBoundary;
-  } else if (initialStart > 0) {
-    // No sentence boundary in window — snap forward to the next word start
-    // so the excerpt doesn't begin mid-word.
-    const ws = left.search(/\s/);
-    if (ws !== -1) start = initialStart + ws + 1;
-  }
-
-  // RIGHT — same, mirrored.
-  const right = text.slice(spanEnd, initialEnd);
-  const rightBoundary = firstSentenceBoundary(right);
-  if (rightBoundary !== -1) {
-    end = spanEnd + rightBoundary;
-  } else if (initialEnd < text.length) {
-    // Snap backward to the last whitespace so the excerpt doesn't end
-    // mid-word.
-    const lastWs = right.search(/\s\S*$/);
-    if (lastWs > 0) end = spanEnd + lastWs;
-  }
-
   return {
-    before: text.slice(start, idx),
+    before: text.slice(walkLeftTokens(text, idx, minTokens), idx),
     match: text.slice(idx, spanEnd),
-    after: text.slice(spanEnd, end),
+    after: text.slice(spanEnd, walkRightTokens(text, spanEnd, minTokens)),
   };
 }
 
-// Return the index in `text` immediately after the LAST sentence-end
-// punctuation, or -1 if none. An abbreviation period ("U.S.", "Mr.",
-// "e.g.") is NOT a sentence end — we filter it out by requiring that the
-// character before the period is NOT a single uppercase letter on its own
-// (preceded by another non-letter or start of string) or another period.
-function lastSentenceBoundary(text: string): number {
-  let result = -1;
-  const re = /([.?!]+["')\]]?\s+|[。？！])/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const punctStart = m.index;
-    if (looksLikeAbbreviation(text, punctStart)) continue;
-    result = punctStart + m[0].length;
+// CJK / Korean Hangul / fullwidth ranges. Each character in these ranges
+// is treated as a single "token" since CJK text rarely uses whitespace
+// word boundaries.
+const CJK_RE = /[　-鿿가-힯＀-￯]/;
+const WS_RE = /\s/;
+
+function walkLeftTokens(text: string, end: number, minTokens: number): number {
+  let pos = end;
+  let count = 0;
+  while (pos > 0 && count < minTokens) {
+    while (pos > 0 && WS_RE.test(text[pos - 1])) pos--;
+    if (pos === 0) break;
+    if (CJK_RE.test(text[pos - 1])) {
+      pos--;
+      count++;
+    } else {
+      while (pos > 0 && !WS_RE.test(text[pos - 1]) && !CJK_RE.test(text[pos - 1])) {
+        pos--;
+      }
+      count++;
+    }
   }
-  return result;
+  // Trim leading whitespace so the excerpt doesn't start with a space.
+  while (pos < end && WS_RE.test(text[pos])) pos++;
+  return pos;
 }
 
-function firstSentenceBoundary(text: string): number {
-  const re = /([.?!]+["')\]]?\s+|[。？！])/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    if (looksLikeAbbreviation(text, m.index)) continue;
-    return m.index + m[0].length;
+function walkRightTokens(text: string, start: number, minTokens: number): number {
+  let pos = start;
+  let count = 0;
+  while (pos < text.length && count < minTokens) {
+    while (pos < text.length && WS_RE.test(text[pos])) pos++;
+    if (pos >= text.length) break;
+    if (CJK_RE.test(text[pos])) {
+      pos++;
+      count++;
+    } else {
+      while (pos < text.length && !WS_RE.test(text[pos]) && !CJK_RE.test(text[pos])) {
+        pos++;
+      }
+      count++;
+    }
   }
-  return -1;
-}
-
-// A period at `idx` looks like an abbreviation when the chars right before
-// it form one of: a single capital letter ("U" before "U."), another
-// capital-period pair ("S" after "U." in "U.S."), or a known abbreviation
-// stem like "Mr", "Mrs", "Dr", "Inc", "Co", "etc", "vs".
-function looksLikeAbbreviation(text: string, periodIdx: number): boolean {
-  if (text[periodIdx] !== ".") return false;
-  // Check char immediately before the period.
-  const prev = text[periodIdx - 1] ?? "";
-  if (/[A-Z]/.test(prev)) {
-    const before = text[periodIdx - 2] ?? "";
-    // Sole uppercase letter ("A." at start of word) or "X.Y." chain.
-    if (before === "" || /[\s.([{]/.test(before)) return true;
-  }
-  // Check 2-3 char stems just before the period.
-  const stem = text.slice(Math.max(0, periodIdx - 4), periodIdx);
-  if (/(?:^|\W)(?:Mr|Mrs|Dr|Inc|Co|etc|vs|e\.g|i\.e|cf)$/.test(stem)) return true;
-  return false;
-}
-
-// Aggregate historical type proposals on an EntityConvention so the operator
-// sees what past annotator / QC / arbiter submissions claimed for this span.
-function summarizeProposals(
-  convention: EntityConvention | undefined,
-): { counts: Record<string, number>; total: number; label: string } {
-  const counts: Record<string, number> = {};
-  let total = 0;
-  for (const p of convention?.proposals ?? []) {
-    const t = String((p as { type?: unknown }).type ?? "").trim();
-    if (!t) continue;
-    counts[t] = (counts[t] ?? 0) + 1;
-    total += 1;
-  }
-  const label = Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([t, n]) => `${t}×${n}`)
-    .join(", ");
-  return { counts, total, label };
+  // Trim trailing whitespace so the excerpt doesn't end with a space.
+  while (pos > start && WS_RE.test(text[pos - 1])) pos--;
+  return pos;
 }
 
 function extractInputRows(sourceRef: unknown): Array<{ label: string | null; text: string }> {
@@ -799,16 +994,102 @@ function extractInputRows(sourceRef: unknown): Array<{ label: string | null; tex
   return out;
 }
 
+function HumanReviewSubmitGate({
+  totalSpans,
+  addressedCount,
+  saving,
+  onSubmit,
+}: {
+  totalSpans: number;
+  addressedCount: number;
+  saving: boolean;
+  onSubmit: (payload: Record<string, unknown>) => Promise<void>;
+}) {
+  const [feedback, setFeedback] = useState("");
+
+  async function submit(action: "request_changes" | "accept" | "reject") {
+    await onSubmit({
+      action,
+      correction_mode: "manual_annotation",
+      feedback: feedback.trim() || (
+        action === "accept"
+          ? "Accepted with operator's per-span convention picks applied."
+          : action === "request_changes"
+          ? "Operator requested annotator changes."
+          : "Rejected by operator."
+      ),
+      actor: "operator",
+    });
+    setFeedback("");
+  }
+
+  return (
+    <section className="hr-submit-gate">
+      <header className="hr-submit-gate-header">
+        <h4>Submit Human Review</h4>
+        <span
+          className="hr-submit-progress ok"
+          title="Operator picks are optional — unaddressed spans keep the annotator's call"
+        >
+          {totalSpans === 0
+            ? "no disputed spans"
+            : `${addressedCount} of ${totalSpans} span(s) picked`}
+        </span>
+      </header>
+      <textarea
+        className="hr-submit-feedback"
+        placeholder="Optional note to attach to this decision (e.g. summary of rule change you applied)."
+        value={feedback}
+        onChange={(e) => setFeedback(e.target.value)}
+        rows={2}
+      />
+      <div className="hr-submit-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={saving}
+          title="Accept the task; operator picks (if any) are applied to the annotation"
+          onClick={() => submit("accept")}
+        >
+          {saving ? "Submitting…" : "Accept"}
+        </button>
+        <button
+          type="button"
+          className="view-tab"
+          disabled={saving}
+          onClick={() => submit("request_changes")}
+        >
+          Request Changes
+        </button>
+        <button
+          type="button"
+          className="view-tab danger"
+          disabled={saving}
+          onClick={() => submit("reject")}
+        >
+          Reject
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function EntityConventionForm({
   projectId,
   taskId,
   sourceRef,
   artifacts,
+  feedback,
+  hrSaving,
+  onSubmitHumanReviewDecision,
 }: {
   projectId: string;
   taskId: string;
   sourceRef: unknown;
   artifacts: TaskDetailArtifact[];
+  feedback?: Array<Record<string, unknown>>;
+  hrSaving?: boolean;
+  onSubmitHumanReviewDecision?: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const inputRows = useMemo(() => extractInputRows(sourceRef), [sourceRef]);
   const [conventions, setConventions] = useState<EntityConvention[]>([]);
@@ -819,6 +1100,22 @@ function EntityConventionForm({
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [pendingPick, setPendingPick] = useState<string | null>(null);
+  // Spans the operator has explicitly clicked at least once this session.
+  // Used to gate the Submit button: every disputed span must be addressed
+  // before the operator can accept the task out of Human Review.
+  const [addressed, setAddressed] = useState<Set<string>>(() => new Set());
+  // One-off picks: lowercase span → chosen type (or null when explicitly
+  // cleared). Used when "Save as project convention" is unchecked so the
+  // pick is visible in the UI without polluting the project-wide convention
+  // table.
+  const [localPicks, setLocalPicks] = useState<Map<string, string | null>>(() => new Map());
+  // Per-card "Save as project convention" checkbox state, keyed by
+  // lowercase span. Default ON (set on first render when undefined).
+  const [saveAsConvention, setSaveAsConvention] = useState<Map<string, boolean>>(() => new Map());
+  const getSaveFlag = useCallback(
+    (lower: string) => saveAsConvention.get(lower) ?? true,
+    [saveAsConvention],
+  );
 
   const reload = useCallback(async () => {
     try {
@@ -833,8 +1130,25 @@ function EntityConventionForm({
     void reload();
   }, [reload]);
 
+  // Combined text of all QC/HR/arbiter feedback for this task. Used to
+  // filter Manual Review down to spans that some reviewer actually
+  // complained about — annotators emit dozens of entities per task and
+  // most of them aren't in dispute.
+  const feedbackBlob = useMemo(() => {
+    if (!feedback || feedback.length === 0) return "";
+    const parts: string[] = [];
+    for (const f of feedback) {
+      const msg = (f as { message?: unknown }).message;
+      if (typeof msg === "string") parts.push(msg);
+      const tgt = (f as { target?: unknown }).target;
+      if (tgt && typeof tgt === "object") parts.push(JSON.stringify(tgt));
+    }
+    return parts.join("\n").toLowerCase();
+  }, [feedback]);
+
   // Extract entity (span, current_type) pairs from this task's latest
-  // annotation so the operator can declare conventions in one click.
+  // annotation so the operator can declare conventions in one click. When
+  // we have feedback text, narrow to spans that show up in it.
   const quickPicks = useMemo(() => {
     const outputs = extractOutputsByIndex(artifacts);
     const seen = new Set<string>();
@@ -849,41 +1163,134 @@ function EntityConventionForm({
           const key = `${s}|${type}`;
           if (seen.has(key)) continue;
           seen.add(key);
+          if (feedbackBlob && !feedbackBlob.includes(s.toLowerCase())) continue;
           pairs.push({ span: s, currentType: type });
         }
       }
     }
     return pairs;
-  }, [artifacts]);
+  }, [artifacts, feedbackBlob]);
 
-  // Index conventions by span so we can mark spans that already have one.
+  // Build per-span proposal lists from (a) every annotation_result
+  // artifact tagged by actor (annotator vs arbiter) and (b) any QC
+  // feedback whose target embeds a structured (span, type) hint.
+  // Keys are lowercase span; values are de-duplicated `{actor, type}`
+  // entries in display order: annotator → QC → arbiter.
+  const proposalsBySpan = useMemo(() => {
+    const map = new Map<string, Array<{ actor: "annotator" | "qc" | "arbiter"; type: string }>>();
+    const push = (span: string, actor: "annotator" | "qc" | "arbiter", type: string) => {
+      const lower = span.toLowerCase();
+      const list = map.get(lower) ?? [];
+      // De-dupe by actor — keep the first type each actor proposed for a
+      // span (extra rounds of the same actor are noisy).
+      if (list.some((p) => p.actor === actor)) return;
+      list.push({ actor, type });
+      map.set(lower, list);
+    };
+    for (const { actor, spanType } of extractProposalsByActor(artifacts)) {
+      for (const [s, t] of spanType.entries()) push(s, actor, t);
+    }
+    // QC's proposals (when available) live in feedback[].target with
+    // varying shapes. Probe the common ones — single-span, types-array,
+    // and proposed_type variants.
+    for (const f of feedback ?? []) {
+      const tgt = (f as { target?: unknown }).target;
+      if (!tgt || typeof tgt !== "object") continue;
+      const t = tgt as Record<string, unknown>;
+      const span = typeof t.span === "string" ? t.span : undefined;
+      const type =
+        typeof t.proposed_type === "string"
+          ? t.proposed_type
+          : Array.isArray(t.types) && typeof t.types[0] === "string"
+            ? (t.types[0] as string)
+            : typeof t.type === "string"
+              ? (t.type as string)
+              : undefined;
+      if (span && type) push(span, "qc", type);
+    }
+    return map;
+  }, [artifacts, feedback]);
+
+  // Index conventions by lowercase span — backend matches on span_lower,
+  // so an annotation that produced "LockBit 2.0" should resolve to a
+  // convention previously declared as "lockbit 2.0" too.
   const conventionBySpan = useMemo(() => {
     const map = new Map<string, EntityConvention>();
-    for (const c of conventions) map.set(c.span, c);
+    for (const c of conventions) map.set(c.span.toLowerCase(), c);
     return map;
   }, [conventions]);
 
-  const declarePick = useCallback(
-    async (pickSpan: string, pickType: string) => {
+  // Toggle semantics for picking a type:
+  //  - Click a type that's NOT currently the effective convention →
+  //    declare/switch the convention to that type.
+  //  - Click the effective type (operator-set OR the original annotator
+  //    type when no convention exists) → clear the convention; future
+  //    runtime falls back to the annotator's call.
+  const togglePick = useCallback(
+    async (pickSpan: string, pickType: string, effectiveType: string | null) => {
+      const isCancel = pickType === effectiveType;
       const key = `${pickSpan}|${pickType}`;
+      const lower = pickSpan.toLowerCase();
+      const save = getSaveFlag(lower);
       setPendingPick(key);
       setBusy(true);
       setError(null);
       setMessage(null);
       try {
-        const conv = await declareConvention({
-          project_id: projectId,
-          span: pickSpan,
-          entity_type: pickType,
-          task_id: taskId,
-          actor: "operator",
+        if (save) {
+          // Project-convention path (default): persist to backend so the
+          // pick propagates to future tasks via convention injection.
+          if (isCancel) {
+            await clearConvention(projectId, pickSpan);
+            setMessage(`Cleared "${pickSpan}" — runtime falls back to annotator's call.`);
+          } else {
+            await declareConvention({
+              project_id: projectId,
+              span: pickSpan,
+              entity_type: pickType,
+              task_id: taskId,
+              actor: "operator",
+            });
+            setMessage(
+              pickType === NOT_ENTITY
+                ? `Set "${pickSpan}" → not an entity.`
+                : `Set "${pickSpan}" → ${pickType}.`,
+            );
+          }
+          // Drop any local-only pick for this span — the convention now
+          // owns the effective type.
+          setLocalPicks((prev) => {
+            if (!prev.has(lower)) return prev;
+            const next = new Map(prev);
+            next.delete(lower);
+            return next;
+          });
+          await reload();
+        } else {
+          // One-off path: update local state only — no project convention
+          // recorded. Pick is still visible (highlighted) and counts as
+          // addressed for the gate.
+          setLocalPicks((prev) => {
+            const next = new Map(prev);
+            next.set(lower, isCancel ? null : pickType);
+            return next;
+          });
+          setMessage(
+            isCancel
+              ? `Cleared "${pickSpan}" (one-off, not saved as convention).`
+              : pickType === NOT_ENTITY
+                ? `Set "${pickSpan}" → not an entity (one-off, not saved as convention).`
+                : `Set "${pickSpan}" → ${pickType} (one-off, not saved as convention).`,
+          );
+        }
+        // Mark this span as "addressed by the operator" regardless of
+        // whether they picked a type or cleared it, and regardless of
+        // whether the pick was saved as a convention.
+        setAddressed((prev) => {
+          const next = new Set(prev);
+          next.add(lower);
+          return next;
         });
-        setMessage(
-          conv.status === "disputed"
-            ? `Recorded "${pickSpan}" — now disputed (history conflicts)`
-            : `Recorded "${pickSpan}" → ${pickType}`,
-        );
-        await reload();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -891,7 +1298,7 @@ function EntityConventionForm({
         setPendingPick(null);
       }
     },
-    [projectId, taskId, reload],
+    [projectId, taskId, reload, getSaveFlag],
   );
 
   const onSubmit = useCallback(
@@ -950,11 +1357,47 @@ function EntityConventionForm({
   const disputed = conventions.filter((c) => c.status === "disputed");
   const active = conventions.filter((c) => c.status === "active");
 
+  // Picks payload sent to the backend on Accept. We surface a pick for
+  // every span the operator clicked this session — one-off picks live in
+  // localPicks, saved-as-convention picks come from the refreshed
+  // conventionBySpan. The backend rewrites the task's annotation payload
+  // so the operator's calls actually land in the exported data.
+  const picksPayload = useMemo<Array<{ span: string; entity_type: string | null }>>(() => {
+    const out: Array<{ span: string; entity_type: string | null }> = [];
+    const seen = new Set<string>();
+    for (const { span: pickSpan } of quickPicks) {
+      const lower = pickSpan.toLowerCase();
+      if (seen.has(lower)) continue;
+      const localPick = localPicks.get(lower);
+      if (localPick !== undefined) {
+        out.push({ span: pickSpan, entity_type: localPick });
+        seen.add(lower);
+        continue;
+      }
+      const conv = conventionBySpan.get(lower);
+      if (conv) {
+        out.push({ span: pickSpan, entity_type: conv.entity_type });
+        seen.add(lower);
+      }
+    }
+    return out;
+  }, [quickPicks, localPicks, conventionBySpan]);
+
+  const wrappedSubmit = useCallback(
+    async (payload: Record<string, unknown>) => {
+      if (!onSubmitHumanReviewDecision) return;
+      await onSubmitHumanReviewDecision({ ...payload, picks: picksPayload });
+    },
+    [onSubmitHumanReviewDecision, picksPayload],
+  );
+
   return (
     <section className="entity-convention-box">
       <p className="hint">
-        Click an entity span below to declare its type as a project-wide convention.
-        Future tasks will see it injected into annotator/QC/arbiter prompts.
+        Click a type to set the operator's pick for that span. By default the
+        pick is saved as a project-wide convention (injected into future
+        annotator / QC / arbiter prompts). Uncheck <em>Save as project
+        convention</em> on a card to mark it as a one-off fix instead.
       </p>
       {error ? <p className="convention-error">{error}</p> : null}
       {message ? <p className="convention-ok">{message}</p> : null}
@@ -962,7 +1405,10 @@ function EntityConventionForm({
       {quickPicks.length > 0 ? (
         <div className="convention-quick-picks">
           {quickPicks.map(({ span: pickSpan, currentType }) => {
-            const existing = conventionBySpan.get(pickSpan);
+            const lower = pickSpan.toLowerCase();
+            const existing = conventionBySpan.get(lower);
+            const localPick = localPicks.get(lower);
+            const saveFlag = getSaveFlag(lower);
             // First row whose input text contains this span — show its
             // surrounding sentence so the operator doesn't have to read the
             // whole task.
@@ -971,9 +1417,7 @@ function EntityConventionForm({
               ctx = spanContext(r.text, pickSpan);
               if (ctx) break;
             }
-            // Build the history line: count of each proposed type across
-            // past annotator/QC submissions for this span.
-            const history = summarizeProposals(existing);
+            const proposals = proposalsBySpan.get(lower) ?? [];
             return (
               <div className="convention-pick-card" key={`${pickSpan}|${currentType}`}>
                 {ctx ? (
@@ -983,47 +1427,134 @@ function EntityConventionForm({
                     {ctx.after ? <>{ctx.after}…</> : null}
                   </p>
                 ) : null}
+                {proposals.length > 0 ? (
+                  <div className="convention-pick-actors">
+                    {proposals.map(({ actor, type }) => {
+                      const effectiveType =
+                        localPick !== undefined
+                          ? localPick
+                          : existing?.entity_type ?? currentType;
+                      const isSelected = type === effectiveType;
+                      const key = `actor:${pickSpan}|${actor}|${type}`;
+                      const pending = pendingPick === `${pickSpan}|${type}`;
+                      const cls = [
+                        "convention-pick-actor-btn",
+                        `convention-pick-actor-${actor}`,
+                        isSelected ? "selected" : "",
+                      ].filter(Boolean).join(" ");
+                      const label =
+                        actor === "annotator" ? "Annotator"
+                          : actor === "arbiter" ? "Arbiter"
+                            : "QC";
+                      return (
+                        <button
+                          type="button"
+                          key={key}
+                          className={cls}
+                          disabled={busy}
+                          title={
+                            isSelected
+                              ? `Currently the effective type (set by ${actor}) — click again to clear`
+                              : `Adopt ${actor}'s call: ${pickSpan} → ${type}`
+                          }
+                          onClick={() => togglePick(pickSpan, type, effectiveType)}
+                        >
+                          {pending ? "…" : `${label}: ${type}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
                 <div className="convention-pick-row">
                   <code className="convention-pick-span">{pickSpan}</code>
                   <span className="convention-pick-sep">→</span>
-                  {ENTITY_TYPES.map((t) => {
-                    const isCurrent = t === currentType;
-                    const isExisting = existing?.entity_type === t;
-                    const key = `${pickSpan}|${t}`;
-                    const pending = pendingPick === key;
-                    const cls = [
-                      "convention-pick-btn",
-                      isCurrent ? "current" : "",
-                      isExisting ? "established" : "",
-                    ].filter(Boolean).join(" ");
-                    const historyCount = history.counts[t] ?? 0;
+                  {(() => {
+                    // The "effective" selection is whatever the runtime would
+                    // use right now: a one-off operator pick wins, else the
+                    // operator's saved convention, else the annotator's call.
+                    // Clicking it toggles off.
+                    const effectiveType =
+                      localPick !== undefined
+                        ? localPick
+                        : existing?.entity_type ?? currentType;
                     return (
-                      <button
-                        type="button"
-                        key={t}
-                        className={cls}
-                        disabled={busy}
-                        title={
-                          isExisting
-                            ? `Convention already set: ${pickSpan} → ${t}`
-                            : isCurrent
-                            ? `Current annotation type — click to lock in as convention`
-                            : `Declare ${pickSpan} → ${t}`
-                        }
-                        onClick={() => declarePick(pickSpan, t)}
-                      >
-                        {pending ? "…" : t}
-                        {historyCount > 0 ? (
-                          <span className="convention-pick-tally">×{historyCount}</span>
-                        ) : null}
-                      </button>
+                      <>
+                        {ENTITY_TYPES.map((t) => {
+                          const isSelected = t === effectiveType;
+                          const key = `${pickSpan}|${t}`;
+                          const pending = pendingPick === key;
+                          const cls = [
+                            "convention-pick-btn",
+                            isSelected ? "selected" : "",
+                          ].filter(Boolean).join(" ");
+                          return (
+                            <button
+                              type="button"
+                              key={t}
+                              className={cls}
+                              disabled={busy}
+                              title={
+                                isSelected
+                                  ? `Current selection — click again to clear (fallback to annotator)`
+                                  : `Set ${pickSpan} → ${t}`
+                              }
+                              onClick={() => togglePick(pickSpan, t, effectiveType)}
+                            >
+                              {pending ? "…" : t}
+                            </button>
+                          );
+                        })}
+                        {(() => {
+                          const isSelected = NOT_ENTITY === effectiveType;
+                          const key = `${pickSpan}|${NOT_ENTITY}`;
+                          const pending = pendingPick === key;
+                          const cls = [
+                            "convention-pick-btn",
+                            "convention-pick-btn-negative",
+                            isSelected ? "selected" : "",
+                          ].filter(Boolean).join(" ");
+                          return (
+                            <button
+                              type="button"
+                              className={cls}
+                              disabled={busy}
+                              title={
+                                isSelected
+                                  ? `Current selection — click again to clear`
+                                  : `Set ${pickSpan} → not an entity`
+                              }
+                              onClick={() => togglePick(pickSpan, NOT_ENTITY, effectiveType)}
+                            >
+                              {pending ? "…" : "✗ not entity"}
+                            </button>
+                          );
+                        })()}
+                      </>
                     );
-                  })}
+                  })()}
                 </div>
-                {history.total > 0 ? (
+                <label
+                  className="convention-pick-save-label"
+                  title="When checked, the pick is recorded as a project-wide convention. Uncheck for a one-off fix that won't affect future tasks."
+                >
+                  <input
+                    type="checkbox"
+                    checked={saveFlag}
+                    disabled={busy}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSaveAsConvention((prev) => {
+                        const next = new Map(prev);
+                        next.set(lower, checked);
+                        return next;
+                      });
+                    }}
+                  />
+                  <span>Save as project convention</span>
+                </label>
+                {existing?.status === "disputed" ? (
                   <p className="convention-pick-history">
-                    History: {history.label}
-                    {existing?.status === "disputed" ? <span className="convention-pick-disputed-tag"> · disputed</span> : null}
+                    <span className="convention-pick-disputed-tag">disputed</span>
                   </p>
                 ) : null}
               </div>
@@ -1031,7 +1562,11 @@ function EntityConventionForm({
           })}
         </div>
       ) : (
-        <p className="hint">No entities found in this task's annotation.</p>
+        <p className="hint">
+          {feedbackBlob
+            ? "No annotated entity matches anything in the QC / HR feedback for this task. Use the manual form below to declare a convention for a span not yet annotated."
+            : "No entities found in this task's annotation."}
+        </p>
       )}
 
       <details className="convention-manual">
@@ -1063,6 +1598,15 @@ function EntityConventionForm({
           </button>
         </form>
       </details>
+
+      {onSubmitHumanReviewDecision ? (
+        <HumanReviewSubmitGate
+          totalSpans={quickPicks.length}
+          addressedCount={addressed.size}
+          saving={!!hrSaving}
+          onSubmit={wrappedSubmit}
+        />
+      ) : null}
       {disputed.length > 0 ? (
         <div className="convention-disputed">
           <strong>Disputed conventions ({disputed.length})</strong>

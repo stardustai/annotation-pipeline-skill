@@ -12,6 +12,7 @@ import { DashboardStatsBar } from "./components/DashboardStatsBar";
 import { DocumentsPanel } from "./components/DocumentsPanel";
 import { SchemaPanel } from "./components/SchemaPanel";
 import { EventLogPanel } from "./components/EventLogPanel";
+import { EntityKnowledgePanel } from "./components/EntityKnowledgePanel";
 import { KanbanBoard } from "./components/KanbanBoard";
 import { OutputPanel } from "./components/OutputPanel";
 import { PosteriorAuditPanel } from "./components/PosteriorAuditPanel";
@@ -23,7 +24,7 @@ import type { KanbanSnapshot, ProjectSummary, StoreInfo, TaskCard, TaskDetail } 
 import { useUrlState, type UrlState } from "./url_state";
 
 const emptySnapshot: KanbanSnapshot = { project_id: null, columns: [] };
-type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "documents" | "schema" | "posterior-audit";
+type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "documents" | "schema" | "posterior-audit" | "entity-knowledge";
 
 const urlDefaults: UrlState = { view: "kanban", store: null, project: null, task: null };
 
@@ -247,6 +248,9 @@ export default function App() {
         <button className={viewMode === "posterior-audit" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("posterior-audit")}>
           Posterior Audit
         </button>
+        <button className={viewMode === "entity-knowledge" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("entity-knowledge")}>
+          Entity Knowledge
+        </button>
       </nav>
 
       {error ? <div className="notice">{error}</div> : null}
@@ -271,13 +275,15 @@ export default function App() {
       {viewMode === "posterior-audit" ? (
         <PosteriorAuditPanel
           projectId={selectedProjectId}
+          storeKey={selectedStoreKey}
           onSendToHr={async (taskId) => {
             await postTaskMove(taskId, "human_review", "posterior_audit", selectedStoreKey);
             setSnapshot(await fetchKanbanSnapshot(selectedProjectId, selectedStoreKey));
           }}
           onDeclareCanonical={async (span, entityType) => {
             if (!selectedProjectId) return;
-            await fetch("/api/conventions", {
+            const storeQ = selectedStoreKey ? `?store=${encodeURIComponent(selectedStoreKey)}` : "";
+            await fetch(`/api/conventions${storeQ}`, {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
@@ -289,6 +295,9 @@ export default function App() {
             });
           }}
         />
+      ) : null}
+      {viewMode === "entity-knowledge" ? (
+        <EntityKnowledgePanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
       ) : null}
       <TaskDrawer
         task={selectedTask}

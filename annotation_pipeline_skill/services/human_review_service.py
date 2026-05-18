@@ -56,12 +56,44 @@ class HumanReviewService:
         actor: str,
         feedback: str,
         correction_mode: str,
+        picks: list[dict] | None = None,
     ) -> HumanReviewDecisionResult:
         task = self.store.load_task(task_id)
         if task.status is not TaskStatus.HUMAN_REVIEW:
             raise InvalidTransition(f"task {task_id} is not in human_review")
 
         next_status, reason = self._transition_for_action(action)
+        # Accept-with-picks: operator clicked one or more entity-type picks
+        # in Manual Review that must patch the current task's annotation.
+        # Plain accept doesn't write a new artifact, so route through
+        # submit_correction with the patched payload instead.
+        if action == "accept" and picks:
+            answer = self._latest_annotation_payload(task_id)
+            if answer is not None:
+                if isinstance(answer, dict):
+                    answer.pop("discussion_replies", None)
+                    rows = answer.get("rows")
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if isinstance(row, dict):
+                                row.pop("discussion_replies", None)
+                n_applied = _apply_operator_picks(answer, picks)
+                if n_applied:
+                    note = f"accept with {n_applied} operator pick(s) applied"
+                    if feedback.strip():
+                        note = f"{note} — {feedback.strip()}"
+                    self.submit_correction(
+                        task_id=task_id, answer=answer, actor=actor,
+                        note=note, force=False,
+                    )
+                    return HumanReviewDecisionResult(
+                        task=self.store.load_task(task_id),
+                        decision={
+                            "task_id": task_id, "action": action, "actor": actor,
+                            "feedback": feedback, "correction_mode": correction_mode,
+                            "picks_applied": n_applied,
+                        },
+                    )
         # Verbatim guard on the "accept underlying annotation as-is" path.
         # The task likely landed in HR because the arbiter's verbatim retries
         # exhausted on a hallucinated span — accepting blindly would commit
@@ -78,7 +110,7 @@ class HumanReviewService:
                 if violations:
                     raise SchemaValidationError(
                         f"underlying annotation has {len(violations)} non-verbatim span(s); "
-                        f"use submit_correction (with verbatim spans) or request_changes",
+                        f"leave the task in Human Review until the annotator re-runs it (Request Changes), or move it to Rejected if it's unfixable",
                         [
                             {"kind": "non_verbatim_span",
                              "path": f"rows[{v['row_index']}].output.{v['field']}",
@@ -90,7 +122,7 @@ class HumanReviewService:
                 if collisions:
                     raise SchemaValidationError(
                         f"underlying annotation has {len(collisions)} cross-type entity collision(s); "
-                        f"use submit_correction or request_changes",
+                        f"leave the task in Human Review until the annotator re-runs it (Request Changes), or move it to Rejected if it's unfixable",
                         [
                             {"kind": "cross_type_collision",
                              "path": f"rows[{c['row_index']}].output.entities",
@@ -102,7 +134,7 @@ class HumanReviewService:
                 if trailing:
                     raise SchemaValidationError(
                         f"underlying annotation has {len(trailing)} span(s) with trailing sentence punctuation; "
-                        f"use submit_correction or request_changes",
+                        f"leave the task in Human Review until the annotator re-runs it (Request Changes), or move it to Rejected if it's unfixable",
                         [
                             {"kind": "trailing_punctuation_span",
                              "path": f"rows[{t['row_index']}].output.{t['field']}",
@@ -129,7 +161,7 @@ class HumanReviewService:
                 if _divergent:
                     raise SchemaValidationError(
                         f"underlying annotation disagrees with project prior on "
-                        f"{len(_divergent)} span(s); use submit_correction with force=True to override",
+                        f"{len(_divergent)} span(s); leave the task in Human Review until the annotator re-runs it (Request Changes), or move it to Rejected if it's unfixable",
                         [{
                             "kind": "prior_disagreement",
                             "path": f"output.entities[{_r.proposed_type}]",
@@ -158,6 +190,14 @@ class HumanReviewService:
                 "feedback": feedback,
             },
         )
+        # request_changes means the operator wants the annotator to redo the
+        # task — NOT to resume from the most recent annotation artifact.
+        # Without this marker, the scheduler's _prepare_annotating_for_resume
+        # would see the existing annotation_result and bounce the task into
+        # QC ("resume at QC"), short-circuiting the re-annotation entirely.
+        if action == "request_changes":
+            task.metadata["hr_request_changes"] = True
+            task.metadata.pop("runtime_next_stage", None)
         self.store.append_event(event)
         self.store.save_task(task)
 
@@ -395,3 +435,398 @@ class HumanReviewService:
         if action == "request_changes":
             return TaskStatus.ANNOTATING, "human review requested annotator changes"
         raise ValueError(f"unknown human review action: {action}")
+
+    def apply_posterior_fix(
+        self,
+        *,
+        task_id: str,
+        span: str,
+        current_type: str,
+        new_type: str | None,
+        actor: str,
+    ) -> dict:
+        """Operator-level in-place correction triggered from Posterior Audit.
+
+        The task must currently be ACCEPTED. We:
+          1. Move it to HUMAN_REVIEW with an audit reason
+          2. Load the latest annotation, swap (span, current_type) for
+             (span, new_type) in every row that contains it (or remove
+             entirely if new_type is None — "not_an_entity" / delete)
+          3. Call submit_correction(force=True) which validates and
+             transitions the task back to ACCEPTED with the corrected
+             artifact and HR_WEIGHT-tagged entity_statistics bump.
+        """
+        from annotation_pipeline_skill.core.transitions import transition_task
+        task = self.store.load_task(task_id)
+        if task.status is not TaskStatus.ACCEPTED:
+            raise InvalidTransition(
+                f"task {task_id} is not ACCEPTED (posterior fix only applies to ACCEPTED)"
+            )
+
+        annotation = self._latest_annotation_payload(task_id)
+        if not isinstance(annotation, dict):
+            raise ValueError("no parseable annotation_result on this task")
+
+        new_answer = _swap_span_type_in_payload(
+            annotation, span=span, current_type=current_type, new_type=new_type,
+        )
+        # Auto-clean pre-existing defects that submit_correction would
+        # block on. The operator's posterior-fix targets one (span, type)
+        # pair; pre-existing trailing-punctuation / cross-type-collision
+        # issues in *other* spans of the same task aren't theirs to
+        # adjudicate manually, but they will block submit_correction's
+        # strict checks. We auto-fix them deterministically so the
+        # operator's scoped edit doesn't get derailed by unrelated noise.
+        new_answer = _autoclean_pre_existing_defects(task, new_answer)
+
+        # Transition ACCEPTED → HUMAN_REVIEW so submit_correction's
+        # required-status check passes. Reason surfaces in audit log.
+        event = transition_task(
+            task, TaskStatus.HUMAN_REVIEW,
+            actor=actor,
+            reason=(
+                f"posterior audit fix: '{span}' / {current_type} → "
+                f"{new_type or 'delete (not_an_entity)'}"
+            ),
+            stage="posterior_audit",
+            metadata={
+                "posterior_fix": True,
+                "span": span,
+                "from_type": current_type,
+                "to_type": new_type or "not_an_entity",
+            },
+        )
+        self.store.save_task(task)
+        self.store.append_event(event)
+
+        # Record the explicit convention BEFORE submit_correction.
+        # submit_correction has its own convention-recording pass but it
+        # only fires on diffs between prior and answer — when the operator
+        # confirms the current type (new_type == current_type), the answer
+        # doesn't change so no convention gets written and the deviation
+        # re-flags forever. Recording here makes the operator's policy
+        # decision durable regardless of swap delta.
+        #
+        # If the (span) already has a convention that was previously
+        # marked DISPUTED (because an earlier source picked a different
+        # type), the normal record_decision call only appends a proposal
+        # — it doesn't reactivate. The operator's explicit posterior-audit
+        # declaration should be the tiebreaker, so we force-clear any
+        # existing dispute to the operator's pick.
+        decided_type = new_type or "not_an_entity"
+        try:
+            from annotation_pipeline_skill.services.entity_convention_service import (
+                EntityConventionService,
+            )
+            conv_svc = EntityConventionService(self.store)
+            conv = conv_svc.record_decision(
+                project_id=task.pipeline_id,
+                span=span,
+                entity_type=decided_type,
+                source="posterior_audit_operator",
+                task_id=task_id,
+            )
+            if conv.status == "disputed":
+                # Operator's explicit declaration overrides prior dispute.
+                conv_svc.clear_dispute(
+                    convention_id=conv.convention_id,
+                    resolved_type=decided_type,
+                    actor=actor,
+                    notes="resolved by posterior audit operator declaration",
+                )
+        except Exception:  # noqa: BLE001 — never let convention recording fail the fix
+            pass
+
+        try:
+            self.submit_correction(
+                task_id=task_id,
+                answer=new_answer,
+                actor=actor,
+                note=f"posterior audit fix: '{span}' / {current_type} → {new_type or 'delete'}",
+                force=True,
+            )
+        except Exception:
+            # Submit failed (schema / verbatim / etc). Roll the task back
+            # to ACCEPTED so it isn't stranded in HR. Re-raise so the
+            # operator sees the original error.
+            try:
+                rolled = self.store.load_task(task_id)
+                if rolled.status is TaskStatus.HUMAN_REVIEW:
+                    rb = transition_task(
+                        rolled, TaskStatus.ACCEPTED,
+                        actor="posterior_audit_rollback",
+                        reason="posterior fix submit failed; restoring ACCEPTED",
+                        stage="posterior_audit",
+                    )
+                    self.store.save_task(rolled)
+                    self.store.append_event(rb)
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        return {
+            "task_id": task_id,
+            "span": span,
+            "from_type": current_type,
+            "to_type": new_type or "not_an_entity",
+        }
+
+
+def _repair_non_verbatim_span(input_text: str, span: str) -> str | None:
+    """Try to recover a verbatim substring of ``input_text`` that the model
+    likely intended when it emitted ``span``. Returns the corrected substring
+    on success, or ``None`` when no reasonable match exists (caller should
+    then drop).
+
+    Strategies, in order of preference:
+      1. Case-insensitive match — keep input's original casing
+      2. Strip leading/trailing whitespace
+      3. Collapse runs of internal whitespace
+      4. Longest common substring via difflib, accepted if it covers ≥70 %
+         of the original span length (or 4 chars, whichever is larger)
+    """
+    import re
+    import difflib
+
+    if not span or not input_text:
+        return None
+    if span in input_text:
+        return span
+
+    lower_text = input_text.lower()
+    lower_span = span.lower()
+    idx = lower_text.find(lower_span)
+    if idx >= 0:
+        return input_text[idx : idx + len(span)]
+
+    stripped = span.strip()
+    if stripped and stripped != span:
+        if stripped in input_text:
+            return stripped
+        idx = lower_text.find(stripped.lower())
+        if idx >= 0:
+            return input_text[idx : idx + len(stripped)]
+
+    norm = re.sub(r"\s+", " ", span).strip()
+    if norm and norm != span:
+        if norm in input_text:
+            return norm
+        idx = lower_text.find(norm.lower())
+        if idx >= 0:
+            return input_text[idx : idx + len(norm)]
+
+    m = difflib.SequenceMatcher(None, lower_text, lower_span).find_longest_match(
+        0, len(lower_text), 0, len(lower_span)
+    )
+    if m.size >= max(4, int(len(span) * 0.7)):
+        return input_text[m.a : m.a + m.size]
+    return None
+
+
+def _input_text_by_row(task) -> dict[int, str]:
+    """Build a row_index → input.text map from the task's source payload.
+    Mirrors the lookup ``find_verbatim_violations`` uses."""
+    source_payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
+    if not isinstance(source_payload, dict):
+        return {}
+    rows = source_payload.get("rows")
+    if not isinstance(rows, list):
+        return {}
+    out: dict[int, str] = {}
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            continue
+        idx = r.get("row_index") if isinstance(r.get("row_index"), int) else i
+        text = r.get("input")
+        if isinstance(text, str):
+            out[idx] = text
+    return out
+
+
+def _autoclean_pre_existing_defects(task, payload: dict) -> dict:
+    """Mutate `payload` in place to clean defects that submit_correction
+    rejects:
+      - non-verbatim spans → first try to repair (case fix, whitespace
+        normalization, fuzzy substring match); drop only if no repair works
+      - trailing-sentence-punctuation spans → replace with trimmed form
+      - cross-type collisions (same span tagged under multiple entity
+        types in one row) → keep the first listed type, drop the others
+    Returns the same `payload` reference for chaining.
+    """
+    # Non-verbatim spans: repair first, drop only as last resort.
+    input_by_row = _input_text_by_row(task)
+    for v in find_verbatim_violations(task, payload):
+        input_text = input_by_row.get(v["row_index"], "")
+        repaired = _repair_non_verbatim_span(input_text, v["span"])
+        for row in payload.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            if row.get("row_index") != v["row_index"]:
+                continue
+            output = row.get("output")
+            if not isinstance(output, dict):
+                continue
+            type_key, type_name = (
+                v["field"].split(".", 1) if "." in v["field"] else (v["field"], "")
+            )
+            container = output.get(type_key)
+            if not isinstance(container, dict):
+                continue
+            items = container.get(type_name)
+            if not isinstance(items, list):
+                continue
+            if repaired is not None and repaired != v["span"]:
+                # Substitute the repaired (verbatim) form in place.
+                container[type_name] = [
+                    (repaired if s == v["span"] else s) for s in items
+                ]
+            elif repaired is None:
+                # No safe repair — drop the span entirely.
+                container[type_name] = [s for s in items if s != v["span"]]
+                if not container[type_name]:
+                    container.pop(type_name, None)
+    # Trailing punctuation: replace span with trimmed form in the same field.
+    for f in find_trailing_punctuation_spans(task, payload):
+        for row in payload.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            if row.get("row_index") != f["row_index"]:
+                continue
+            output = row.get("output")
+            if not isinstance(output, dict):
+                continue
+            type_key, type_name = f["field"].split(".", 1) if "." in f["field"] else (f["field"], "")
+            container = output.get(type_key)
+            if not isinstance(container, dict):
+                continue
+            items = container.get(type_name)
+            if not isinstance(items, list):
+                continue
+            container[type_name] = [
+                (f["trimmed"] if s == f["span"] else s) for s in items
+            ]
+    # Cross-type collisions: deterministically keep the first type, drop
+    # the span from the others. Operator can override later via Conventions.
+    for c in find_cross_type_collisions(payload):
+        for row in payload.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            if row.get("row_index") != c["row_index"]:
+                continue
+            entities = row.get("output", {}).get("entities")
+            if not isinstance(entities, dict):
+                continue
+            keeper = c["types"][0]
+            for typ in c["types"][1:]:
+                if typ in entities and isinstance(entities[typ], list):
+                    entities[typ] = [s for s in entities[typ] if s != c["span"]]
+                    if not entities[typ]:
+                        entities.pop(typ, None)
+    return payload
+
+
+def _swap_span_type_in_payload(
+    payload: dict, *, span: str, current_type: str, new_type: str | None,
+) -> dict:
+    """Return a deep copy of `payload` where every row's entities[current_type]
+    list has `span` removed; if `new_type` is provided AND it's not the
+    sentinel "not_an_entity", `span` is appended to entities[new_type] in
+    that row. JSON-structures and other fields are untouched.
+
+    Strips non-schema-friendly top-level fields like ``discussion_replies``
+    that the annotator/arbiter add for runtime communication — these are
+    not part of the project's annotation output schema and would fail
+    the submit_correction schema validation.
+    """
+    import copy
+    out = copy.deepcopy(payload)
+    if isinstance(out, dict):
+        out.pop("discussion_replies", None)
+    rows = out.get("rows") if isinstance(out, dict) else None
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        entities = output.get("entities")
+        if not isinstance(entities, dict):
+            continue
+        cur_list = entities.get(current_type)
+        if not isinstance(cur_list, list) or span not in cur_list:
+            continue
+        # Drop span from the old bucket.
+        entities[current_type] = [s for s in cur_list if s != span]
+        if not entities[current_type]:
+            entities.pop(current_type, None)
+        # Add to new bucket unless deleting.
+        if new_type and new_type != "not_an_entity":
+            target = entities.setdefault(new_type, [])
+            if span not in target:
+                target.append(span)
+    return out
+
+
+def _apply_operator_picks(payload: dict, picks: list[dict]) -> int:
+    """Mutate `payload` in place applying operator picks from Manual Review.
+
+    Each pick is a dict with keys:
+      - ``span``: str — the span text to relabel
+      - ``entity_type``: str | None — target type, or "not_an_entity" / None
+        to delete the span from all buckets
+
+    For each pick, walks every row's entities and removes ``span`` from any
+    bucket whose key differs from the target type; if the target type is a
+    real entity type, ensures the span is present in that bucket.
+
+    Matching is case-sensitive on the span string. Returns the number of
+    picks that actually mutated at least one row (useful for status notes).
+
+    Picks with an empty span or that don't appear in any row are silently
+    skipped — the operator may have clicked a span that the annotation
+    doesn't actually contain (e.g. arbiter dropped it between sessions).
+    """
+    if not isinstance(payload, dict) or not picks:
+        return 0
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return 0
+    applied = 0
+    for pick in picks:
+        span = pick.get("span")
+        if not isinstance(span, str) or not span:
+            continue
+        target = pick.get("entity_type")
+        delete = target is None or target == "not_an_entity"
+        mutated = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            output = row.get("output")
+            if not isinstance(output, dict):
+                continue
+            entities = output.get("entities")
+            if not isinstance(entities, dict):
+                continue
+            # Drop span from every bucket that isn't the target.
+            for typ in list(entities.keys()):
+                if not delete and typ == target:
+                    continue
+                bucket = entities.get(typ)
+                if not isinstance(bucket, list):
+                    continue
+                if span in bucket:
+                    entities[typ] = [s for s in bucket if s != span]
+                    if not entities[typ]:
+                        entities.pop(typ, None)
+                    mutated = True
+            # Ensure span is in the target bucket when not deleting.
+            if not delete:
+                tgt = entities.setdefault(target, [])
+                if span not in tgt:
+                    tgt.append(span)
+                    mutated = True
+        if mutated:
+            applied += 1
+    return applied
