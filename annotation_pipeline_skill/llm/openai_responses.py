@@ -32,7 +32,10 @@ class OpenAIResponsesClient:
         }
         if request.instructions:
             kwargs["instructions"] = request.instructions
-        if request.continuity_handle:
+        # Skip previous_response_id for stateless gateways (e.g. LiteLLM
+        # /v1/responses translation) — they mint per-call IDs but don't
+        # persist them, so forwarding the handle 404s.
+        if request.continuity_handle and not self.profile.disable_continuity:
             kwargs["previous_response_id"] = request.continuity_handle
         if request.reasoning:
             kwargs["reasoning"] = request.reasoning
@@ -58,7 +61,10 @@ class OpenAIResponsesClient:
             "input": request.messages,
             "text_format": request.text_format,
         }
-        if request.continuity_handle:
+        # Skip previous_response_id for stateless gateways (e.g. LiteLLM
+        # /v1/responses translation) — they mint per-call IDs but don't
+        # persist them, so forwarding the handle 404s.
+        if request.continuity_handle and not self.profile.disable_continuity:
             kwargs["previous_response_id"] = request.continuity_handle
         if request.reasoning:
             kwargs["reasoning"] = request.reasoning

@@ -60,6 +60,12 @@ class LLMProfile:
     concurrency_limit: int | None = None
     no_progress_timeout_seconds: int | None = None
     reasoning_capable: bool | None = None
+    # When True, the Responses API client will NOT forward
+    # ``previous_response_id`` even if the task has a stored handle from a
+    # prior turn. Required for stateless gateways (e.g. LiteLLM's
+    # /v1/responses translation) that mint response ids per call but
+    # don't persist them — passing the id back yields 404.
+    disable_continuity: bool | None = None
 
     def resolve_api_key(self, env: Mapping[str, str] = os.environ) -> str:
         if self.api_key:
@@ -152,6 +158,7 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
             f"profile {name} no_progress_timeout_seconds",
         ),
         reasoning_capable=_optional_bool(raw.get("reasoning_capable"), f"profile {name} reasoning_capable"),
+        disable_continuity=_optional_bool(raw.get("disable_continuity"), f"profile {name} disable_continuity"),
     )
     _validate_profile(profile)
     return profile
