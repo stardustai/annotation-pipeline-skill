@@ -97,6 +97,12 @@ export function PosteriorAuditPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [subtab, setSubtab] = useState<Subtab>("deviations");
+  const [filter, setFilter] = useState("");
+  // Default ON: Contested-spans Apply-to-all also writes a project
+  // convention. Operator can flip off (per-session) when they want a
+  // bulk task fix WITHOUT introducing a project rule (e.g. context-
+  // specific span where the type only applies in this corpus).
+  const [saveAsConvention, setSaveAsConvention] = useState(true);
 
   useEffect(() => {
     if (!projectId) {
@@ -217,32 +223,69 @@ export function PosteriorAuditPanel({
        deviations.length === 0 &&
        contested.length === 0 ? (
         <p className="runtime-muted">
-          All accepted tasks agree with current statistics; no contested spans.
+          All accepted tasks agree with current statistics; no divergent annotations.
         </p>
       ) : null}
 
       {cachedExists && (deviations.length > 0 || contested.length > 0) ? (
         <>
-          <nav
-            className="view-tabs"
-            aria-label="Audit sections"
-            style={{ marginTop: "0.5rem", marginBottom: 0 }}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.75rem",
+              marginTop: "0.5rem",
+              flexWrap: "wrap",
+            }}
           >
-            <button
-              className={subtab === "deviations" ? "view-tab selected" : "view-tab"}
-              type="button"
-              onClick={() => setSubtab("deviations")}
-            >
-              Task deviations ({deviations.length})
-            </button>
-            <button
-              className={subtab === "contested" ? "view-tab selected" : "view-tab"}
-              type="button"
-              onClick={() => setSubtab("contested")}
-            >
-              Contested spans ({contested.length})
-            </button>
-          </nav>
+            <nav className="view-tabs" aria-label="Audit sections" style={{ margin: 0 }}>
+              <button
+                className={subtab === "deviations" ? "view-tab selected" : "view-tab"}
+                type="button"
+                onClick={() => { setSubtab("deviations"); setFilter(""); }}
+              >
+                Task deviations ({deviations.length})
+              </button>
+              <button
+                className={subtab === "contested" ? "view-tab selected" : "view-tab"}
+                type="button"
+                onClick={() => { setSubtab("contested"); setFilter(""); }}
+              >
+                Divergent annotations ({contested.length})
+              </button>
+            </nav>
+            <input
+              type="search"
+              placeholder={
+                subtab === "deviations" ? "Filter task / span / type…" : "Filter span / type…"
+              }
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              style={{ width: "min(300px, 40%)", marginLeft: "auto" }}
+            />
+            {subtab === "contested" ? (
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "5px",
+                  fontSize: "0.8rem",
+                  color: "#4a5660",
+                  cursor: "pointer",
+                  userSelect: "none",
+                }}
+                title="When checked, Confirm / Apply-to-all also writes a project convention (future tasks see it as a rule). Uncheck for a one-off bulk task fix that doesn't pollute the convention table."
+              >
+                <input
+                  type="checkbox"
+                  checked={saveAsConvention}
+                  onChange={(e) => setSaveAsConvention(e.target.checked)}
+                  style={{ margin: 0, cursor: "pointer" }}
+                />
+                <span>Save as convention</span>
+              </label>
+            ) : null}
+          </div>
 
           {subtab === "deviations" ? (
             <>
@@ -263,9 +306,8 @@ export function PosteriorAuditPanel({
                   projectId={projectId!}
                   storeKey={storeKey ?? null}
                   onSendToHr={onSendToHr}
+                  externalFilter={filter}
                   onAfterFix={() => {
-                    // Re-fetch the (server-side surgically updated) cache
-                    // so the list reflects the just-applied fix.
                     if (!projectId) return;
                     fetch(urlWithStore("/api/posterior-audit", projectId, storeKey))
                       .then((r) => (r.ok ? r.json() : null))
@@ -282,7 +324,7 @@ export function PosteriorAuditPanel({
           {subtab === "contested" ? (
             <>
               <div style={FORMULA_BLOCK_STYLE}>
-                <strong>Contested span rule</strong> — the project itself is split on a span's
+                <strong>Divergent annotations rule</strong> — the project itself is split on a span's
                 type. Triggered when the span has at least <code>10</code> total observations
                 <em> and </em>no type reaches the <code>80%</code> dominance threshold
                 <em> and </em>the runner-up type holds <code>≥ 20%</code> share.
@@ -299,6 +341,8 @@ export function PosteriorAuditPanel({
                   storeKey={storeKey ?? null}
                   onDeclare={onDeclareCanonical}
                   onAfterRetroactiveFix={reloadCache}
+                  externalFilter={filter}
+                  saveAsConvention={saveAsConvention}
                 />
               ) : (
                 <p className="runtime-muted">No contested spans.</p>
@@ -319,14 +363,16 @@ function DeviationsTable({
   storeKey,
   onSendToHr,
   onAfterFix,
+  externalFilter,
 }: {
   items: TaskDeviation[];
   projectId: string;
   storeKey: string | null;
   onSendToHr: (taskId: string) => Promise<void> | void;
   onAfterFix: () => void;
+  externalFilter?: string;
 }): React.ReactElement {
-  const [filter, setFilter] = useState("");
+  const filter = externalFilter ?? "";
   const [page, setPage] = useState(0);
   // Per-row picked type (null = nothing picked yet)
   const [picked, setPicked] = useState<Record<string, string | null>>({});
@@ -643,20 +689,11 @@ function DeviationsTable({
           </div>
         </div>
       ) : null}
-      <div style={{ margin: "0.4rem 0" }}>
-        <input
-          type="search"
-          placeholder="Filter task / span / type…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          style={{ width: "min(360px, 60%)" }}
-        />
-        <span className="runtime-muted" style={{ marginLeft: "0.75rem", fontSize: "0.85rem" }}>
-          {filter ? `${filtered.length} of ${deduped.length}` : `${deduped.length} unique`}
-          {items.length !== deduped.length
-            ? ` (${items.length} raw rows deduped)`
-            : ""}
-        </span>
+      <div style={{ margin: "0.4rem 0", fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+        {filter ? `${filtered.length} of ${deduped.length}` : `${deduped.length} unique`}
+        {items.length !== deduped.length
+          ? ` (${items.length} raw rows deduped)`
+          : ""}
       </div>
       <Pagination
         total={filtered.length}
@@ -916,14 +953,19 @@ function ContestedTable({
   storeKey,
   onDeclare,
   onAfterRetroactiveFix,
+  externalFilter,
+  saveAsConvention,
 }: {
   items: ContestedSpan[];
   projectId: string;
   storeKey: string | null;
   onDeclare: (span: string, entityType: string) => Promise<void> | void;
   onAfterRetroactiveFix?: () => void;
+  externalFilter?: string;
+  saveAsConvention?: boolean;
 }): React.ReactElement {
-  const [filter, setFilter] = useState("");
+  const filter = externalFilter ?? "";
+  const saveConv = saveAsConvention ?? true;
   const [page, setPage] = useState(0);
   // Per-row picked (pending confirm); per-row committed (after confirm).
   const [picked, setPicked] = useState<Record<string, string | null>>({});
@@ -1010,6 +1052,10 @@ function ContestedTable({
         span,
         entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
         actor: "posterior_audit_retroactive_ui",
+        // Honor the per-session "Save as convention" toggle in the
+        // panel header — when false, skip the project convention write
+        // (still patches matching tasks).
+        set_convention: saveConv,
       };
       const BATCH = 10;
       const initialResp = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
@@ -1198,17 +1244,8 @@ function ContestedTable({
           </div>
         </div>
       ) : null}
-      <div style={{ margin: "0.4rem 0" }}>
-        <input
-          type="search"
-          placeholder="Filter span / type…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          style={{ width: "min(360px, 60%)" }}
-        />
-        <span className="runtime-muted" style={{ marginLeft: "0.75rem", fontSize: "0.85rem" }}>
-          {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
-        </span>
+      <div style={{ margin: "0.4rem 0", fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+        {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
       </div>
       {error ? <div className="notice compact">{error}</div> : null}
       <Pagination
@@ -1289,21 +1326,27 @@ function ContestedTable({
                           topN={3}
                           onSelect={(t) => setPicked((p) => ({ ...p, [c.span]: t }))}
                         />
-                        <button
-                          type="button"
-                          disabled={!pickedType || isSubmitting}
-                          onClick={() => pickedType && handleConfirm(c.span, pickedType)}
-                          title="Save as project convention only — future tasks; existing ACCEPTED tasks are NOT changed"
-                          style={{
-                            fontSize: "0.8rem",
-                            background: pickedType ? "var(--success, #047857)" : undefined,
-                            color: pickedType ? "white" : undefined,
-                            opacity: !pickedType || isSubmitting ? 0.6 : 1,
-                            alignSelf: "flex-start",
-                          }}
-                        >
-                          {isSubmitting ? "…" : "Confirm"}
-                        </button>
+                        {saveConv ? (
+                          <button
+                            type="button"
+                            disabled={!pickedType || isSubmitting}
+                            onClick={() => pickedType && handleConfirm(c.span, pickedType)}
+                            title="Save as project convention only — future tasks; existing ACCEPTED tasks are NOT changed"
+                            style={{
+                              fontSize: "0.8rem",
+                              background: pickedType ? "var(--success, #047857)" : undefined,
+                              color: pickedType ? "white" : undefined,
+                              opacity: !pickedType || isSubmitting ? 0.6 : 1,
+                              alignSelf: "flex-start",
+                            }}
+                          >
+                            {isSubmitting ? "…" : "Confirm"}
+                          </button>
+                        ) : (
+                          <span style={{ fontSize: "0.7rem", color: "var(--muted, #6b7280)", fontStyle: "italic" }}>
+                            (convention save off — use Apply to all to patch tasks)
+                          </span>
+                        )}
                       </div>
                     )}
                   </td>
