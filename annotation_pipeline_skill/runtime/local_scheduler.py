@@ -26,6 +26,14 @@ class LocalRuntimeScheduler:
     drain barriers — a slow task only ties up one worker slot.
     """
 
+    # After this many CONSECUTIVE permanent (4xx) bails — e.g. 400
+    # ContextWindowExceeded that retrying against the same model cannot fix —
+    # escalate to HUMAN_REVIEW. Transient (5xx / rate-limit / timeout) bails
+    # never escalate; they keep backing off indefinitely because the upstream
+    # is expected to self-heal. A single transient bail resets the permanent
+    # counter so an intermittent 4xx after gateway downtime doesn't escalate.
+    PERMANENT_BAIL_CAP: int = 5
+
     def __init__(
         self,
         store: SqliteStore,
@@ -291,48 +299,95 @@ class LocalRuntimeScheduler:
                                 transition_task,
                             )
                             # Per-task worker-bail counter + exponential
-                            # backoff via next_retry_at. Provider/infra
-                            # failures (5xx / 4xx / timeout) are NOT a
-                            # human-judgment problem — there's nothing an
-                            # HR operator can do about a broken gateway.
-                            # Instead, keep the task in PENDING and stamp
-                            # next_retry_at so the scheduler holds off
-                            # re-claiming it for a growing backoff window.
-                            # When the upstream recovers, normal claim
-                            # cycle picks the task up automatically.
+                            # backoff via next_retry_at. Transient (5xx /
+                            # rate-limit / timeout) failures stay in PENDING
+                            # with growing backoff — the upstream is
+                            # expected to self-heal. Permanent (4xx) failures
+                            # are capped: after PERMANENT_BAIL_CAP they
+                            # escalate to HR with the provider error message
+                            # so an operator can decide (fix config / swap
+                            # model / give up on the task). Without the cap,
+                            # ContextWindowExceeded and similar task-level
+                            # permanent errors loop forever at 10-min
+                            # intervals.
                             from datetime import timedelta
                             bails = int(latest.metadata.get("worker_bail_count", 0)) + 1
                             latest.metadata["worker_bail_count"] = bails
-                            # Permanent errors back off harder than transient
-                            # (config bug → upstream is misconfigured, won't
-                            # self-heal quickly). Both cap at 10 minutes.
-                            base = 60 if last_exception_was_permanent else 15
-                            backoff_seconds = min(base * bails, 600)
-                            next_retry_at = self._now_fn() + timedelta(seconds=backoff_seconds)
-                            latest.next_retry_at = next_retry_at
                             if last_exception_summary:
                                 latest.metadata["last_provider_error"] = last_exception_summary
-                            try:
-                                event = transition_task(
-                                    latest, TaskStatus.PENDING,
-                                    actor="scheduler",
-                                    reason=(
-                                        f"worker bailed mid-annotation "
-                                        f"({'permanent' if last_exception_was_permanent else 'transient'} "
-                                        f"provider error, bail #{bails}); "
-                                        f"holding {backoff_seconds}s before next claim"
-                                    ),
-                                    stage="recovery",
-                                    metadata={"recovery": "worker_bail",
-                                              "previous_status": "annotating",
-                                              "worker_bail_count": bails,
-                                              "permanent_error": last_exception_was_permanent,
-                                              "backoff_seconds": backoff_seconds},
-                                )
-                                self.store.save_task(latest)
-                                self.store.append_event(event)
-                            except InvalidTransition:
-                                pass
+
+                            # Escalate to HR when permanent-error budget is
+                            # exhausted. Transient errors never escalate —
+                            # they just keep backing off.
+                            permanent_bails = int(latest.metadata.get(
+                                "worker_permanent_bail_count", 0
+                            ))
+                            if last_exception_was_permanent:
+                                permanent_bails += 1
+                                latest.metadata["worker_permanent_bail_count"] = permanent_bails
+                            else:
+                                # Reset permanent counter on any transient bail —
+                                # an intermittent 4xx after gateway downtime
+                                # shouldn't escalate.
+                                latest.metadata["worker_permanent_bail_count"] = 0
+                                permanent_bails = 0
+
+                            if (
+                                last_exception_was_permanent
+                                and permanent_bails >= self.PERMANENT_BAIL_CAP
+                            ):
+                                latest.next_retry_at = None
+                                try:
+                                    event = transition_task(
+                                        latest, TaskStatus.HUMAN_REVIEW,
+                                        actor="scheduler",
+                                        reason=(
+                                            f"worker bailed with permanent provider error "
+                                            f"{permanent_bails} consecutive times "
+                                            f"(cap={self.PERMANENT_BAIL_CAP}); routing to "
+                                            f"human review "
+                                            f"(last: {(last_exception_summary or '')[:200]})"
+                                        ),
+                                        stage="recovery",
+                                        metadata={"recovery": "permanent_bail_cap",
+                                                  "previous_status": "annotating",
+                                                  "worker_bail_count": bails,
+                                                  "worker_permanent_bail_count": permanent_bails,
+                                                  "permanent_error": True},
+                                    )
+                                    self.store.save_task(latest)
+                                    self.store.append_event(event)
+                                except InvalidTransition:
+                                    pass
+                            else:
+                                base = 60 if last_exception_was_permanent else 15
+                                backoff_seconds = min(base * bails, 600)
+                                next_retry_at = self._now_fn() + timedelta(seconds=backoff_seconds)
+                                latest.next_retry_at = next_retry_at
+                                try:
+                                    event = transition_task(
+                                        latest, TaskStatus.PENDING,
+                                        actor="scheduler",
+                                        reason=(
+                                            f"worker bailed mid-annotation "
+                                            f"({'permanent' if last_exception_was_permanent else 'transient'} "
+                                            f"provider error, bail #{bails}"
+                                            + (f", permanent #{permanent_bails}/{self.PERMANENT_BAIL_CAP}"
+                                               if last_exception_was_permanent else "")
+                                            + f"); holding {backoff_seconds}s before next claim"
+                                        ),
+                                        stage="recovery",
+                                        metadata={"recovery": "worker_bail",
+                                                  "previous_status": "annotating",
+                                                  "worker_bail_count": bails,
+                                                  "worker_permanent_bail_count": permanent_bails,
+                                                  "permanent_error": last_exception_was_permanent,
+                                                  "backoff_seconds": backoff_seconds},
+                                    )
+                                    self.store.save_task(latest)
+                                    self.store.append_event(event)
+                                except InvalidTransition:
+                                    pass
                     except (FileNotFoundError, KeyError):
                         pass
                     busy_workers -= 1
