@@ -290,57 +290,45 @@ class LocalRuntimeScheduler:
                                 InvalidTransition,
                                 transition_task,
                             )
-                            # Per-task worker-bail counter. Without a cap, a
-                            # task that consistently hits the same provider
-                            # error (e.g., LLM returns 500 on a specific
-                            # input) re-enters PENDING and gets re-claimed
-                            # immediately → a tight worker_bail loop at
-                            # roughly 1 attempt/sec. Cap at 5 bails; after
-                            # that, route the task to HUMAN_REVIEW so an
-                            # operator can decide manually.
+                            # Per-task worker-bail counter + exponential
+                            # backoff via next_retry_at. Provider/infra
+                            # failures (5xx / 4xx / timeout) are NOT a
+                            # human-judgment problem — there's nothing an
+                            # HR operator can do about a broken gateway.
+                            # Instead, keep the task in PENDING and stamp
+                            # next_retry_at so the scheduler holds off
+                            # re-claiming it for a growing backoff window.
+                            # When the upstream recovers, normal claim
+                            # cycle picks the task up automatically.
+                            from datetime import timedelta
                             bails = int(latest.metadata.get("worker_bail_count", 0)) + 1
                             latest.metadata["worker_bail_count"] = bails
-                            # Default cap = 5 for transient errors. Permanent
-                            # errors (404 wrong endpoint, 401 bad key, 400
-                            # schema) skip the dance — retry can't fix config
-                            # bugs; cap=1 routes them straight to HR on the
-                            # first failure with the error message embedded.
-                            ANNOTATION_BAIL_CAP = 1 if last_exception_was_permanent else 5
+                            # Permanent errors back off harder than transient
+                            # (config bug → upstream is misconfigured, won't
+                            # self-heal quickly). Both cap at 10 minutes.
+                            base = 60 if last_exception_was_permanent else 15
+                            backoff_seconds = min(base * bails, 600)
+                            next_retry_at = self._now_fn() + timedelta(seconds=backoff_seconds)
+                            latest.next_retry_at = next_retry_at
+                            if last_exception_summary:
+                                latest.metadata["last_provider_error"] = last_exception_summary
                             try:
-                                if bails >= ANNOTATION_BAIL_CAP:
-                                    err_suffix = (
-                                        f" — {last_exception_summary}"
-                                        if last_exception_was_permanent and last_exception_summary
-                                        else ""
-                                    )
-                                    event = transition_task(
-                                        latest, TaskStatus.HUMAN_REVIEW,
-                                        actor="scheduler",
-                                        reason=(
-                                            (
-                                                f"worker hit permanent provider error "
-                                                f"(404/401/400 — config bug, not retried)"
-                                                if last_exception_was_permanent
-                                                else f"worker bailed {bails} consecutive times "
-                                                     "during annotation (provider error / timeout)"
-                                            )
-                                            + f"; routing to human review{err_suffix}"
-                                        ),
-                                        stage="recovery",
-                                        metadata={"recovery": "worker_bail_cap",
-                                                  "worker_bail_count": bails,
-                                                  "permanent_error": last_exception_was_permanent},
-                                    )
-                                else:
-                                    event = transition_task(
-                                        latest, TaskStatus.PENDING,
-                                        actor="scheduler",
-                                        reason="worker bailed mid-annotation; resetting to pending",
-                                        stage="recovery",
-                                        metadata={"recovery": "worker_bail",
-                                                  "previous_status": "annotating",
-                                                  "worker_bail_count": bails},
-                                    )
+                                event = transition_task(
+                                    latest, TaskStatus.PENDING,
+                                    actor="scheduler",
+                                    reason=(
+                                        f"worker bailed mid-annotation "
+                                        f"({'permanent' if last_exception_was_permanent else 'transient'} "
+                                        f"provider error, bail #{bails}); "
+                                        f"holding {backoff_seconds}s before next claim"
+                                    ),
+                                    stage="recovery",
+                                    metadata={"recovery": "worker_bail",
+                                              "previous_status": "annotating",
+                                              "worker_bail_count": bails,
+                                              "permanent_error": last_exception_was_permanent,
+                                              "backoff_seconds": backoff_seconds},
+                                )
                                 self.store.save_task(latest)
                                 self.store.append_event(event)
                             except InvalidTransition:
@@ -435,10 +423,16 @@ class LocalRuntimeScheduler:
         # already does for the same reason.
         leased = {l.task_id for l in self.store.list_runtime_leases()}
         active = {r.task_id for r in self.store.list_active_runs()}
+        now_ts = self._now_fn()
         for candidate in candidates:
             if candidate.task_id in leased or candidate.task_id in active:
                 continue
             if candidate.status is TaskStatus.QC and candidate.metadata.get("runtime_next_stage") != "qc":
+                continue
+            # Respect bail-backoff: tasks the worker bailed on get a
+            # next_retry_at stamped on them so they don't immediately get
+            # re-claimed and re-fail against the same broken upstream.
+            if candidate.next_retry_at is not None and candidate.next_retry_at > now_ts:
                 continue
             if candidate.status is TaskStatus.ANNOTATING:
                 # Genuine restart-orphan path: inspect artifacts to choose entry stage.
