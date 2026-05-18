@@ -668,18 +668,21 @@ function DeviationsTable({
         <table style={TABLE_STYLE}>
           <thead>
             <tr style={THEAD_ROW}>
-              <th style={TH_FIRST}>Task</th>
-              <th style={TH}>Span</th>
-              <th style={{ ...TH, width: "22%" }}>Original text</th>
-              <th style={TH}>Current</th>
-              <th style={{ ...TH, width: "12%" }}>Distribution</th>
-              <th style={{ ...TH, width: "22%" }}>Set type</th>
-              <th style={TH}></th>
+              <th style={{ ...TH_FIRST, width: "11%", fontSize: "0.8rem" }}>Task</th>
+              <th style={{ ...TH, width: "8%", fontSize: "0.8rem" }}>Span</th>
+              <th style={{ ...TH, width: "18%", fontSize: "0.8rem" }}>Original text</th>
               <th
-                style={{ ...TH, width: "16%" }}
-                title="Declare convention AND retroactively patch every ACCEPTED task that has this span tagged differently"
+                style={{ ...TH, width: "16%", fontSize: "0.8rem" }}
+                title="Current task type (red) + project-wide prior distribution"
               >
-                Apply to all
+                Current / Distribution
+              </th>
+              <th style={{ ...TH, width: "20%" }}>Set type</th>
+              <th
+                style={{ ...TH, width: "27%" }}
+                title="Save: patch THIS task only. Apply to all: patch every ACCEPTED task that has this span tagged differently."
+              >
+                Actions
               </th>
             </tr>
           </thead>
@@ -704,16 +707,16 @@ function DeviationsTable({
               ].filter(Boolean);
               return (
                 <tr key={rowKey} style={TR}>
-                  <td style={TD_MONO}>
+                  <td style={{ ...TD_MONO, fontSize: "0.75rem" }}>
                     {d.task_id}
                     {d.occurrences > 1 ? (
-                      <span className="runtime-muted" style={{ marginLeft: "0.3rem", fontSize: "0.75rem" }}>
+                      <span className="runtime-muted" style={{ marginLeft: "0.3rem", fontSize: "0.7rem" }}>
                         ×{d.occurrences}
                       </span>
                     ) : null}
                   </td>
-                  <td style={{ ...TD, fontFamily: "monospace" }}>{d.span}</td>
-                  <td style={TD}>
+                  <td style={{ ...TD, fontFamily: "monospace", fontSize: "0.78rem" }}>{d.span}</td>
+                  <td style={{ ...TD, fontSize: "0.78rem" }}>
                     <OriginalTextCell
                       projectId={projectId}
                       storeKey={storeKey}
@@ -722,22 +725,37 @@ function DeviationsTable({
                     />
                   </td>
                   <td style={TD}>
-                    <span style={{ color: "var(--danger, #b91c1c)" }}>{d.current_type}</span>
-                  </td>
-                  <td style={TD}>
-                    <DistributionBar distribution={d.prior_distribution} total={d.prior_total} />
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                      <span style={{ fontSize: "0.75rem", color: "var(--danger, #b91c1c)", fontWeight: 500 }}>
+                        {d.current_type}
+                      </span>
+                      <DistributionBar distribution={d.prior_distribution} total={d.prior_total} />
+                    </div>
                   </td>
                   <td style={TD}>
                     {isSubmitted ? (
-                      <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem", alignItems: "flex-start" }}>
-                        <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                          ✓ {status?.replace("submitted: ", "applied: ")}
-                        </span>
+                      <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
+                        ✓ {status?.replace("submitted: ", "applied: ")}
+                      </span>
+                    ) : (
+                      <TopNTypeSelector
+                        selected={sel}
+                        preferredOrder={preferred}
+                        topN={3}
+                        onSelect={(t) =>
+                          setPicked((p) => ({ ...p, [rowKey]: t }))
+                        }
+                      />
+                    )}
+                  </td>
+                  <td style={{ padding: "0.4rem 0.5rem", verticalAlign: "top" }}>
+                    {isSubmitted ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem", alignItems: "flex-start" }}>
                         {getSaveConv(rowKey) ? (
                           <button
                             type="button"
                             onClick={() => handleUnsetDeviationConvention(d.span, rowKey)}
-                            title="Remove the project convention written by this Submit. The task's annotation IS already patched and is NOT reverted."
+                            title="Remove the project convention. The task's annotation is already patched and is NOT reverted."
                             style={{
                               fontSize: "0.7rem",
                               color: "var(--danger, #b91c1c)",
@@ -751,85 +769,14 @@ function DeviationsTable({
                             Unset convention
                           </button>
                         ) : null}
+                        {retroResult[d.span] ? (
+                          <span style={{ fontSize: "0.7rem", color: "var(--muted, #4b5563)" }}>
+                            (last sweep) fixed {retroResult[d.span].fixed} task(s)
+                          </span>
+                        ) : null}
                       </div>
-                    ) : (
-                      <TopNTypeSelector
-                        selected={sel}
-                        preferredOrder={preferred}
-                        topN={3}
-                        onSelect={(t) =>
-                          setPicked((p) => ({ ...p, [rowKey]: t }))
-                        }
-                      />
-                    )}
-                  </td>
-                  <td style={{ padding: "0.4rem 0", whiteSpace: "nowrap" }}>
-                    {isSubmitted ? null : (
-                      <>
-                        <button
-                          type="button"
-                          disabled={!sel || isSubmitting}
-                          onClick={() =>
-                            submitFix(d, sel === NOT_ENTITY ? null : sel)
-                          }
-                          title={
-                            sel
-                              ? `Apply ${sel} as the corrected type for this task's span (operator-authored, HR weight 5×)${getSaveConv(rowKey) ? "; also saved as project convention" : "; one-off fix, NOT saved as convention"}`
-                              : "Pick a type first"
-                          }
-                          style={{
-                            fontSize: "0.8rem",
-                            marginRight: "0.4rem",
-                            background: sel ? "var(--success, #047857)" : undefined,
-                            color: sel ? "white" : undefined,
-                            opacity: !sel || isSubmitting ? 0.6 : 1,
-                          }}
-                        >
-                          {isSubmitting ? "…" : "Submit"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onSendToHr(d.task_id)}
-                          style={{ fontSize: "0.8rem" }}
-                          title="Route this task to HR queue without applying a fix"
-                        >
-                          Send to HR
-                        </button>
-                        <label
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: "4px",
-                            marginLeft: "0.6rem",
-                            fontSize: "0.75rem",
-                            color: "#4a5660",
-                            cursor: "pointer",
-                            userSelect: "none",
-                          }}
-                          title="When checked, the pick is saved as a project-wide convention. Uncheck for a one-off task fix."
-                        >
-                          <input
-                            type="checkbox"
-                            checked={getSaveConv(rowKey)}
-                            disabled={isSubmitting}
-                            onChange={(e) => {
-                              const checked = e.target.checked;
-                              setSaveConv((s) => ({ ...s, [rowKey]: checked }));
-                            }}
-                            style={{ margin: 0, cursor: "pointer" }}
-                          />
-                          <span>Save as convention</span>
-                        </label>
-                      </>
-                    )}
-                    {err ? (
-                      <p style={{ margin: "0.3rem 0 0", color: "var(--danger, #b91c1c)", fontSize: "0.75rem" }}>
-                        {err}
-                      </p>
-                    ) : null}
-                  </td>
-                  <td style={TD}>
-                    {retroProgress[d.span] ? (
+                    ) : retroProgress[d.span] ? (
+                      // Active sweep — render progress bar in the action cell.
                       (() => {
                         const { processed, total } = retroProgress[d.span];
                         const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
@@ -859,48 +806,93 @@ function DeviationsTable({
                           </div>
                         );
                       })()
-                    ) : retroResult[d.span] ? (
-                      <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
-                        fixed {retroResult[d.span].fixed} task(s)
-                        {retroResult[d.span].skipped > 0
-                          ? `, skipped ${retroResult[d.span].skipped}`
-                          : ""}
-                        {retroResult[d.span].errors > 0
-                          ? `, ${retroResult[d.span].errors} error(s)`
-                          : ""}
-                      </span>
-                    ) : (() => {
-                      const otherCount = sel
-                        ? (sel === NOT_ENTITY
-                            ? d.prior_total
-                            : d.prior_total - (d.prior_distribution[sel] || 0))
-                        : 0;
-                      const noun = otherCount === 1 ? "occurrence" : "occurrences";
-                      const label = sel
-                        ? `Apply to other ${otherCount} ${noun}`
-                        : "Apply to all";
-                      const disabled = !sel || otherCount === 0 || isSubmitting || applyingAllSpan !== null || isSubmitted;
-                      return (
-                        <button
-                          type="button"
-                          disabled={disabled}
-                          onClick={() => sel && requestApplyAll(d, sel)}
-                          title={
-                            sel
-                              ? `Declare '${d.span}' → ${sel === NOT_ENTITY ? "not_an_entity" : sel} as project convention AND retroactively patch ${otherCount} other ACCEPTED task annotation(s) tagged differently`
-                              : "Pick a type first"
-                          }
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+                        <div style={{ display: "flex", gap: "0.4rem", alignItems: "center", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            disabled={!sel || isSubmitting || applyingAllSpan !== null}
+                            onClick={() =>
+                              submitFix(d, sel === NOT_ENTITY ? null : sel)
+                            }
+                            title={
+                              sel
+                                ? `Patch THIS task's '${d.span}' → ${sel === NOT_ENTITY ? "delete" : sel}${getSaveConv(rowKey) ? "; also saves as project convention" : "; one-off task fix, no convention"}`
+                                : "Pick a type first"
+                            }
+                            style={{
+                              fontSize: "0.8rem",
+                              background: sel ? "var(--success, #047857)" : undefined,
+                              color: sel ? "white" : undefined,
+                              opacity: !sel || isSubmitting ? 0.6 : 1,
+                            }}
+                          >
+                            {isSubmitting ? "…" : "Save"}
+                          </button>
+                          {(() => {
+                            const otherCount = sel
+                              ? (sel === NOT_ENTITY
+                                  ? d.prior_total
+                                  : d.prior_total - (d.prior_distribution[sel] || 0))
+                              : 0;
+                            const noun = otherCount === 1 ? "occurrence" : "occurrences";
+                            const label = sel
+                              ? `Apply to other ${otherCount} ${noun}`
+                              : "Apply to all";
+                            const disabled = !sel || otherCount === 0 || isSubmitting || applyingAllSpan !== null;
+                            return (
+                              <button
+                                type="button"
+                                disabled={disabled}
+                                onClick={() => sel && requestApplyAll(d, sel)}
+                                title={
+                                  sel
+                                    ? `Declare '${d.span}' → ${sel === NOT_ENTITY ? "not_an_entity" : sel} as project convention AND retroactively patch ${otherCount} other ACCEPTED task annotation(s)`
+                                    : "Pick a type first"
+                                }
+                                style={{
+                                  fontSize: "0.8rem",
+                                  background: !disabled ? "var(--primary, #1e40af)" : undefined,
+                                  color: !disabled ? "white" : undefined,
+                                  opacity: disabled ? 0.6 : 1,
+                                }}
+                              >
+                                {label}
+                              </button>
+                            );
+                          })()}
+                        </div>
+                        <label
                           style={{
-                            fontSize: "0.8rem",
-                            background: !disabled ? "var(--primary, #1e40af)" : undefined,
-                            color: !disabled ? "white" : undefined,
-                            opacity: disabled ? 0.6 : 1,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            fontSize: "0.7rem",
+                            color: "#4a5660",
+                            cursor: "pointer",
+                            userSelect: "none",
                           }}
+                          title="When checked, the Save / Apply action also writes a project-wide convention. Uncheck to fix THIS task only without touching the convention table."
                         >
-                          {label}
-                        </button>
-                      );
-                    })()}
+                          <input
+                            type="checkbox"
+                            checked={getSaveConv(rowKey)}
+                            disabled={isSubmitting}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setSaveConv((s) => ({ ...s, [rowKey]: checked }));
+                            }}
+                            style={{ margin: 0, cursor: "pointer" }}
+                          />
+                          <span>Save as convention</span>
+                        </label>
+                      </div>
+                    )}
+                    {err ? (
+                      <p style={{ margin: "0.3rem 0 0", color: "var(--danger, #b91c1c)", fontSize: "0.7rem" }}>
+                        {err}
+                      </p>
+                    ) : null}
                   </td>
                 </tr>
               );
