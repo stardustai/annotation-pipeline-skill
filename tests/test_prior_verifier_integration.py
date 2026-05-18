@@ -663,3 +663,92 @@ def test_second_arbiter_writes_artifact_with_target_metadata(tmp_path):
     assert art_meta.get("disputed_span") == "Apple"
     assert art_meta.get("first_arbiter_type") == "technology"
     assert art_meta.get("prior_dominant_type") == "organization"
+
+
+def test_second_arbiter_verbatim_retry_exhausted_routes_to_hr_not_silent_drop(tmp_path):
+    """REGRESSION: when the second arbiter's corrected_annotation contains
+    a non-verbatim span and retries are exhausted, the old code silently
+    set corrected_annotation=None and then fell through to the verdict-only
+    path — accepting based on a high-confidence verdict even though the
+    arbiter's attempted fix was broken. New behavior: explicit HR routing,
+    failed correction preserved in event metadata so HR can see what the
+    arbiter tried."""
+    store = SqliteStore.open(tmp_path)
+    project = "p"
+    _seed_prior(store, project_id=project, span="Apple",
+                type_to_count={"organization": 12})
+
+    task = _make_task("t-verbatim", input_text="Apple is referenced here")
+    task.status = TaskStatus.ARBITRATING
+    task.metadata["prior_verifier_first_arbiter_divergent"] = True
+    task.metadata["prior_verifier_payload"] = {
+        "span": "Apple", "proposed_type": "technology",
+        "dominant_type": "organization", "dominant_count": 12,
+        "total": 12, "distribution": {"organization": 12},
+    }
+    store.save_task(task)
+
+    rel = "artifact_payloads/t-verbatim/final.json"
+    abs_path = store.root / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(
+        json.dumps({"text": json.dumps({
+            "rows": [{
+                "row_index": 0,
+                "output": {"entities": {"technology": ["Apple"]}},
+            }]
+        })}),
+        encoding="utf-8",
+    )
+    store.append_artifact(ArtifactRef.new(
+        task_id="t-verbatim", kind="annotation_result", path=rel,
+        content_type="application/json",
+    ))
+
+    # Stub second arbiter returns a corrected_annotation with a span that
+    # does NOT appear in the input text (verbatim violation), PLUS a
+    # high-confidence 'annotator' verdict. Old behavior would silently
+    # null out the bad correction and ACCEPT based on the verdict alone.
+    class _Client:
+        async def generate(self, request):
+            return LLMGenerateResult(
+                final_text=json.dumps({
+                    "verdicts": [{
+                        "feedback_id": "prior_verifier_synth",
+                        "verdict": "annotator",
+                        "confidence": "certain",
+                        "reasoning": "agree with first",
+                    }],
+                    "corrected_annotation": {
+                        "rows": [{
+                            "row_index": 0,
+                            # "Apricot" is not in input text — verbatim fails
+                            "output": {"entities": {"technology": ["Apricot"]}},
+                        }],
+                    },
+                }),
+                raw_response={}, usage={}, diagnostics={}, runtime="stub",
+                provider="arbiter_secondary", model="stub", continuity_handle=None,
+            )
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _Client())
+    runtime._resolve_first_arbiter_divergence(store.load_task("t-verbatim"))
+    after = store.load_task("t-verbatim")
+    assert after.status is TaskStatus.HUMAN_REVIEW, (
+        "task with verbatim-failing second-arbiter correction must NOT be "
+        "silently accepted via verdict fallthrough"
+    )
+    assert after.metadata.get("prior_verifier_action") == "second_arbiter_verbatim_failed"
+    # The bad correction should be preserved in the HR transition event so
+    # operators can see what the arbiter tried.
+    events = store.list_events("t-verbatim")
+    hr_events = [e for e in events if e.next_status is TaskStatus.HUMAN_REVIEW]
+    assert hr_events, "expected at least one HR transition event"
+    final_event_md = hr_events[-1].metadata
+    assert final_event_md.get("prior_verifier_action") == "second_arbiter_verbatim_failed"
+    assert final_event_md.get("failed_correction") is not None, (
+        "the failed corrected_annotation must be preserved for HR visibility"
+    )
+    assert "Apricot" in json.dumps(final_event_md["failed_correction"]), (
+        "the preserved correction should contain the verbatim-failing span"
+    )

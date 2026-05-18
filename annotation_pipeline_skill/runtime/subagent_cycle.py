@@ -355,6 +355,14 @@ class SubagentRuntime:
                 "arbiter_unresolved": arb["unresolved"],
                 "arbiter_mechanical_fail": arb["mechanical_fail"],
             }
+            # Surface the arbiter's failed verbatim correction so HR can
+            # see what it tried to fix and decide whether to apply it
+            # manually (after fixing the verbatim issue) or send back to
+            # annotation.
+            if arb.get("verbatim_retry_exhausted"):
+                metadata["arbiter_verbatim_retry_exhausted"] = True
+                metadata["arbiter_failed_correction"] = arb.get("failed_verbatim_correction")
+                metadata["arbiter_failed_verbatim_target"] = arb.get("failed_verbatim_target")
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
@@ -1691,6 +1699,44 @@ class SubagentRuntime:
             self.store.save_task(task)
             return
 
+        # Verbatim retries exhausted: the second arbiter tried to write a
+        # corrected_annotation but couldn't produce verbatim spans after
+        # `arbiter_verbatim_retries+1` attempts. Don't fall through to the
+        # verdict-based decision — a high-conf verdict alongside a broken
+        # correction is contradictory. Route to HR with the failed
+        # correction preserved so the operator can see what the arbiter
+        # wanted to do.
+        if second_payload.get("_verbatim_retry_exhausted"):
+            failed_correction = second_payload.get("corrected_annotation")
+            failed_target = second_payload.get("_verbatim_failed_target") or {}
+            task.metadata["prior_verifier_action"] = "second_arbiter_verbatim_failed"
+            self._clear_divergence_flag(task)
+            self._transition(
+                task,
+                TaskStatus.HUMAN_REVIEW,
+                reason=(
+                    f"Second arbiter tried to correct {span!r} but its "
+                    f"corrected_annotation contains a non-verbatim span "
+                    f"({failed_target.get('span')!r} at "
+                    f"{failed_target.get('field')!r}) after retries exhausted. "
+                    f"Bad correction preserved in event metadata; needs human "
+                    f"review (first arbiter said {first_type!r}, project prior "
+                    f"dominant {prior_type!r})"
+                ),
+                stage="prior_verifier",
+                attempt_id=attempt_id,
+                metadata={
+                    "prior_verifier_action": "second_arbiter_verbatim_failed",
+                    "first_arbiter_type": first_type,
+                    "prior_dominant_type": prior_type,
+                    "span": span,
+                    "failed_verbatim_target": failed_target,
+                    "failed_correction": failed_correction,
+                },
+            )
+            self.store.save_task(task)
+            return
+
         # Determine the second arbiter's effective vote on the disputed span.
         # Priority: explicit corrected_annotation > explicit verdict on the
         # synthetic feedback > "silent" (treat as no opinion → HR).
@@ -2056,10 +2102,25 @@ class SubagentRuntime:
             "unresolved": 0,
             "mechanical_fail": 0,
             "corrected_annotation": None,
+            "verbatim_retry_exhausted": False,
+            "failed_verbatim_correction": None,
+            "failed_verbatim_target": None,
         }
+        verbatim_exhausted = bool(payload.get("_verbatim_retry_exhausted"))
         corrected = payload.get("corrected_annotation") if isinstance(payload, dict) else None
         if isinstance(corrected, dict):
-            outcome["corrected_annotation"] = corrected
+            if verbatim_exhausted:
+                # Don't surface the bad correction as the applyable answer
+                # (it'd fail downstream verbatim validation, silently
+                # losing the arbiter's attempt). Preserve it separately so
+                # the HR escalation can show the operator what the arbiter
+                # tried, and let qc/neither verdicts route to mechanical_fail
+                # so the per-task retry counter triggers HR after the cap.
+                outcome["failed_verbatim_correction"] = corrected
+                outcome["failed_verbatim_target"] = payload.get("_verbatim_failed_target")
+                outcome["verbatim_retry_exhausted"] = True
+            else:
+                outcome["corrected_annotation"] = corrected
         arbiter_attempt_id = payload.get("_arbiter_attempt_id")
         arbiter_result_meta = payload.get("_arbiter_result_meta") or {}
         known_ids = {f.feedback_id for f in open_feedbacks}
@@ -2244,16 +2305,20 @@ class SubagentRuntime:
             sort_keys=True,
         )
         # Up to ``arbiter_verbatim_retries`` retry rounds if the arbiter's
-        # corrected_annotation contains a non-verbatim span (the model
-        # paraphrased / normalized something that isn't in input.text). Each
-        # retry tells the model exactly which span failed and asks for a
-        # fresh attempt. After retries exhausted, abandon the correction —
-        # the caller falls through to HR.
+        # corrected_annotation contains a non-verbatim span. After retries
+        # exhausted, we PRESERVE the (still non-verbatim) correction and
+        # flag it via `_verbatim_retry_exhausted` so callers can surface it
+        # to HR. Previously the field was silently nulled out — that erased
+        # the arbiter's intent (the operator couldn't see what it tried
+        # to do) and let `_resolve_first_arbiter_divergence_async` fall
+        # through to the verdict-only path, accepting based on the verdict
+        # even though the underlying span is malformed.
         max_retries = getattr(self.config, "arbiter_verbatim_retries", 2)
         retry_note = ""
         result = None
         payload = None
         verdicts = None
+        verbatim_exhausted_target: dict | None = None
         started_at = utc_now()
         for attempt_idx in range(max_retries + 1):
             attempt_instructions = instructions + retry_note
@@ -2288,7 +2353,10 @@ class SubagentRuntime:
                             f"input.text. Do not paraphrase, normalize, or invent spans."
                         )
                         continue
-                    payload["corrected_annotation"] = None
+                    # Retries exhausted. Keep the bad corrected_annotation
+                    # so callers can preserve it in HR metadata; the flag
+                    # tells them NOT to apply it as a real correction.
+                    verbatim_exhausted_target = verbatim_failure.get("target", {})
             else:
                 needs_correction = any(
                     isinstance(v, dict)
@@ -2348,6 +2416,15 @@ class SubagentRuntime:
             "target": target_name,
             "artifact_path": arbiter_artifact.path,
         }
+        if verbatim_exhausted_target is not None:
+            # The arbiter tried but couldn't produce a verbatim correction
+            # after `arbiter_verbatim_retries+1` attempts. The bad correction
+            # is preserved in payload["corrected_annotation"] so callers
+            # can surface it in HR metadata; this flag tells them NOT to
+            # apply it as a real correction (it'd fail downstream verbatim
+            # validation) and instead route the task to HR.
+            payload["_verbatim_retry_exhausted"] = True
+            payload["_verbatim_failed_target"] = verbatim_exhausted_target
         return payload
 
     def _record_confidence_sample(self, role: str, value: float) -> None:
