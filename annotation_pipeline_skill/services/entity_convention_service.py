@@ -111,13 +111,36 @@ class EntityConventionService:
             ).fetchone())
 
         proposals = json.loads(row["proposals_json"] or "[]")
+        # Idempotent re-clicks: if the most recent proposal came from the same
+        # source with the same type, treat the new call as a no-op. Without
+        # this, an operator double-clicking the same button (or refreshing
+        # the page and re-clicking) inflates evidence_count and the
+        # button-tally shown in the UI. Genuine independent corroborations
+        # (annotator + qc + arbiter or a fresh operator session) still
+        # increment because their source strings differ or there's an
+        # intervening proposal.
+        last = proposals[-1] if proposals else None
+        if (
+            isinstance(last, dict)
+            and last.get("type") == entity_type
+            and last.get("source") == source
+        ):
+            return self._load_row(row)
         proposals.append(proposal)
         new_status = row["status"]
         new_type = row["entity_type"]
         new_count = row["evidence_count"]
-        if row["status"] == "disputed":
-            # Stay disputed — don't reactivate on new contributions; operator
-            # needs to clear status explicitly.
+        # An explicit operator declaration ("declared:operator") is the
+        # final authority: it always wins, resets any prior dispute, and
+        # locks in the chosen type. Automated annotator/QC/arbiter proposals
+        # follow the old dispute-on-conflict rules below.
+        if source.startswith("declared:"):
+            new_status = "active"
+            new_type = entity_type
+            new_count = row["evidence_count"] + 1
+        elif row["status"] == "disputed":
+            # Stay disputed — don't reactivate on automated contributions;
+            # only an explicit operator declaration can clear it.
             pass
         elif row["entity_type"] == entity_type:
             new_count = row["evidence_count"] + 1
@@ -138,6 +161,18 @@ class EntityConventionService:
             "SELECT * FROM entity_conventions WHERE convention_id=?",
             (row["convention_id"],),
         ).fetchone())
+
+    def delete_for_span(self, *, project_id: str, span: str) -> bool:
+        """Hard-delete a convention by (project_id, span). Used by the Manual
+        Review UI when the operator clicks the already-selected button to
+        cancel their choice. Returns True if a row was removed.
+        """
+        span_lower = span.strip().lower()
+        cur = self.store._conn.execute(
+            "DELETE FROM entity_conventions WHERE project_id=? AND span_lower=?",
+            (project_id, span_lower),
+        )
+        return cur.rowcount > 0
 
     def clear_dispute(
         self,
