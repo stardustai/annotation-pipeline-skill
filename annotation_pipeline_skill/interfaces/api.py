@@ -1219,6 +1219,11 @@ class DashboardApi:
             explicit_task_ids = [str(t) for t in task_ids_raw if isinstance(t, str)]
         else:
             explicit_task_ids = None
+        # Dry-run mode: scan + return candidate_task_ids without applying
+        # any fix and without writing the convention. Used by the
+        # confirmation modal to surface the real (task-count) impact
+        # before the operator commits.
+        dry_run = bool(payload.get("dry_run"))
         if not project_id or not span:
             return self._json_response(400, {"error": "project_and_span_required"})
         if entity_type_raw is None:
@@ -1232,25 +1237,27 @@ class DashboardApi:
         fix_new_type = None if entity_type_str == "not_an_entity" else entity_type_str
 
         conv_svc = EntityConventionService(store)
-        try:
-            conv = conv_svc.record_decision(
-                project_id=project_id,
-                span=span,
-                entity_type=entity_type_str,
-                source=f"declared:{actor}",
-                task_id=None,
-            )
-            if conv.status == "disputed":
-                conv = conv_svc.clear_dispute(
-                    convention_id=conv.convention_id,
-                    resolved_type=entity_type_str,
-                    actor=actor,
-                    notes="resolved via posterior audit retroactive fix",
+        conv = None
+        if not dry_run:
+            try:
+                conv = conv_svc.record_decision(
+                    project_id=project_id,
+                    span=span,
+                    entity_type=entity_type_str,
+                    source=f"declared:{actor}",
+                    task_id=None,
                 )
-        except (ValueError, TypeError) as exc:
-            return self._json_response(
-                400, {"error": "convention_failed", "detail": str(exc)},
-            )
+                if conv.status == "disputed":
+                    conv = conv_svc.clear_dispute(
+                        convention_id=conv.convention_id,
+                        resolved_type=entity_type_str,
+                        actor=actor,
+                        notes="resolved via posterior audit retroactive fix",
+                    )
+            except (ValueError, TypeError) as exc:
+                return self._json_response(
+                    400, {"error": "convention_failed", "detail": str(exc)},
+                )
 
         hr = HumanReviewService(store)
         span_lower = span.lower()
@@ -1318,6 +1325,18 @@ class DashboardApi:
             candidate_task_ids = [c[0] for c in candidates]
 
         # Process the requested batch.
+        if dry_run:
+            # Preview only — return the candidate list without applying.
+            return self._json_response(200, {
+                "convention": None,
+                "fixed": 0,
+                "skipped": skipped,
+                "errors": [],
+                "remaining": len(candidates),
+                "done": False,
+                "candidate_task_ids": candidate_task_ids,
+                "dry_run": True,
+            })
         if batch_size is not None:
             to_process = candidates[:batch_size]
         else:

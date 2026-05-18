@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -238,6 +239,7 @@ class HumanReviewService:
         note: str | None,
         force: bool = False,
         record_conventions: bool = True,
+        stat_bumps: list[tuple[str, str | None, str | None]] | None = None,
     ) -> HumanCorrectionResult:
         task = self.store.load_task(task_id)
         if task.status is not TaskStatus.HUMAN_REVIEW:
@@ -341,9 +343,20 @@ class HumanReviewService:
         # project rule pass record_conventions=False.
         if record_conventions:
             self._record_conventions_from_correction(task, answer, actor)
-        # Update stats with HR weight (5x) — done for all submissions,
-        # including force-overridden ones.
-        self._increment_stats_from_hr(task, answer)
+        # Update stats with HR weight (5x).
+        # - Default (stat_bumps=None): full-correction path. Bump EVERY
+        #   (span, type) in the corrected answer — the operator authored
+        #   the whole annotation, so every span carries their endorsement.
+        # - Scoped (stat_bumps provided): targeted fix path. Only touch
+        #   the explicit (span, old_type, new_type) tuples — used by
+        #   apply_posterior_fix so a bulk-retroactive sweep doesn't
+        #   blanket-bump unrelated spans across hundreds of tasks (which
+        #   would inflate their HR-weighted counts and flip previously-
+        #   settled spans back into "contested").
+        if stat_bumps is None:
+            self._increment_stats_from_hr(task, answer)
+        else:
+            self._apply_scoped_stat_bumps(task, stat_bumps)
         return HumanCorrectionResult(task=task, artifact=artifact, answer=answer)
 
     def _increment_stats_from_hr(self, task: Task, answer: dict) -> None:
@@ -361,6 +374,57 @@ class HumanReviewService:
                 )
             except Exception:  # noqa: BLE001
                 continue
+
+    def _apply_scoped_stat_bumps(
+        self,
+        task: Task,
+        bumps: list[tuple[str, str | None, str | None]],
+    ) -> None:
+        """Apply only the explicit (span, old_type, new_type) stat changes.
+
+        For each entry:
+          - Increment (span, new_type) by HR_WEIGHT when new_type is set
+            and != "not_an_entity".
+          - Decrement (span, old_type) by 1 (approximate: assumes the
+            prior contribution from THIS task came from an annotator/QC
+            vote of weight 1, which is the common case). Caps the
+            resulting count at 0 to avoid negative aggregates.
+        """
+        from annotation_pipeline_skill.services.entity_statistics_service import (
+            HR_WEIGHT,
+            EntityStatisticsService,
+        )
+        svc = EntityStatisticsService(self.store)
+        for span, old_type, new_type in bumps:
+            if new_type and new_type != "not_an_entity":
+                try:
+                    svc.increment(
+                        project_id=task.pipeline_id, span=span,
+                        entity_type=new_type, weight=HR_WEIGHT,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            if old_type and old_type != "not_an_entity":
+                # Approximate-decrement: subtract 1 (typical annotator/QC
+                # vote weight) for the now-superseded type. We can't tell
+                # the exact historical contribution from THIS task without
+                # walking history, so this is an estimate that prevents
+                # stale-type counts from drifting upward unboundedly.
+                span_lower = span.strip().lower()
+                if not span_lower:
+                    continue
+                try:
+                    svc.store._conn.execute(
+                        "UPDATE entity_statistics SET "
+                        "count = max(0, count - 1), updated_at = ? "
+                        "WHERE project_id=? AND span_lower=? AND entity_type=?",
+                        (
+                            datetime.now(timezone.utc).isoformat(),
+                            task.pipeline_id, span_lower, old_type,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _record_conventions_from_correction(self, task: Task, answer: dict, actor: str) -> None:
         from annotation_pipeline_skill.services.entity_convention_service import (
@@ -555,6 +619,12 @@ class HumanReviewService:
                 note=f"posterior audit fix: '{span}' / {current_type} → {new_type or 'delete'}",
                 force=True,
                 record_conventions=save_as_convention,
+                # Scope stat changes to the one (span, type) pair this
+                # fix actually touches — bumping the entire annotation
+                # would inflate every other span's HR-weighted count
+                # across hundreds of tasks during Apply-to-all and flip
+                # previously-settled spans back into contested.
+                stat_bumps=[(span, current_type, new_type)],
             )
         except Exception:
             # Submit failed (schema / verbatim / etc). Roll the task back
