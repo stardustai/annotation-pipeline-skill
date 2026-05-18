@@ -674,9 +674,12 @@ function ContestedTable({
             <tr style={THEAD_ROW}>
               <th style={TH_FIRST}>Span</th>
               <th style={TH}>Total</th>
-              <th style={{ ...TH, width: "24%" }}>Sample text</th>
-              <th style={{ ...TH, width: "14%" }}>Distribution</th>
-              <th style={{ ...TH, width: "32%" }}>Set Convention</th>
+              <th style={{ ...TH, width: "22%" }}>Sample text</th>
+              <th style={{ ...TH, width: "12%" }}>Distribution</th>
+              <th style={{ ...TH, width: "22%" }}>Set Convention</th>
+              <th style={{ ...TH, width: "18%" }} title="Declare convention AND retroactively patch every existing ACCEPTED task that tagged this span differently">
+                Apply to all
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -703,25 +706,12 @@ function ContestedTable({
                   </td>
                   <td style={TD}>
                     {committedType ? (
-                      <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
-                        <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                          ✓ set convention:{" "}
-                          <strong>
-                            {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
-                          </strong>
-                        </span>
-                        {retroResult[c.span] ? (
-                          <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
-                            retroactively fixed {retroResult[c.span].fixed} task(s)
-                            {retroResult[c.span].skipped > 0
-                              ? `, skipped ${retroResult[c.span].skipped}`
-                              : ""}
-                            {retroResult[c.span].errors > 0
-                              ? `, ${retroResult[c.span].errors} error(s)`
-                              : ""}
-                          </span>
-                        ) : null}
-                      </div>
+                      <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
+                        ✓ set:{" "}
+                        <strong>
+                          {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
+                        </strong>
+                      </span>
                     ) : (
                       <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
                         <TopNTypeSelector
@@ -730,47 +720,60 @@ function ContestedTable({
                           topN={3}
                           onSelect={(t) => setPicked((p) => ({ ...p, [c.span]: t }))}
                         />
-                        <div style={{ display: "flex", gap: "0.4rem", alignItems: "center", flexWrap: "wrap" }}>
-                          <button
-                            type="button"
-                            disabled={!pickedType || isSubmitting}
-                            onClick={() => pickedType && handleConfirm(c.span, pickedType)}
-                            title="Save as project convention only — future tasks; existing ACCEPTED tasks are NOT changed"
-                            style={{
-                              fontSize: "0.8rem",
-                              background: pickedType ? "var(--success, #047857)" : undefined,
-                              color: pickedType ? "white" : undefined,
-                              opacity: !pickedType || isSubmitting ? 0.6 : 1,
-                            }}
-                          >
-                            {isSubmitting ? "…" : "Confirm"}
-                          </button>
-                          <button
-                            type="button"
-                            disabled={!pickedType || isSubmitting}
-                            onClick={() => pickedType && handleConfirmAndApplyAll(c.span, pickedType)}
-                            title={
-                              pickedType
-                                ? `Declare convention AND retroactively patch every existing ACCEPTED task in the project that has '${c.span}' tagged differently`
-                                : "Pick a type first"
-                            }
-                            style={{
-                              fontSize: "0.8rem",
-                              background: pickedType ? "var(--primary, #1e40af)" : undefined,
-                              color: pickedType ? "white" : undefined,
-                              opacity: !pickedType || isSubmitting ? 0.6 : 1,
-                            }}
-                          >
-                            {isSubmitting ? "…" : "Confirm & apply to all"}
-                          </button>
-                          {pickedType ? (
-                            <span className="runtime-muted" style={{ fontSize: "0.75rem" }}>
-                              will set <strong>{c.span}</strong> →{" "}
-                              <strong>{pickedType === NOT_ENTITY ? "not entity" : pickedType}</strong>
-                            </span>
-                          ) : null}
-                        </div>
+                        <button
+                          type="button"
+                          disabled={!pickedType || isSubmitting}
+                          onClick={() => pickedType && handleConfirm(c.span, pickedType)}
+                          title="Save as project convention only — future tasks; existing ACCEPTED tasks are NOT changed"
+                          style={{
+                            fontSize: "0.8rem",
+                            background: pickedType ? "var(--success, #047857)" : undefined,
+                            color: pickedType ? "white" : undefined,
+                            opacity: !pickedType || isSubmitting ? 0.6 : 1,
+                            alignSelf: "flex-start",
+                          }}
+                        >
+                          {isSubmitting ? "…" : "Confirm"}
+                        </button>
                       </div>
+                    )}
+                  </td>
+                  <td style={TD}>
+                    {committedType ? (
+                      retroResult[c.span] ? (
+                        <span style={{ fontSize: "0.75rem", color: "var(--muted, #4b5563)" }}>
+                          fixed {retroResult[c.span].fixed} task(s)
+                          {retroResult[c.span].skipped > 0
+                            ? `, skipped ${retroResult[c.span].skipped}`
+                            : ""}
+                          {retroResult[c.span].errors > 0
+                            ? `, ${retroResult[c.span].errors} error(s)`
+                            : ""}
+                        </span>
+                      ) : (
+                        <span className="runtime-muted" style={{ fontSize: "0.75rem" }}>
+                          —
+                        </span>
+                      )
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!pickedType || isSubmitting}
+                        onClick={() => pickedType && handleConfirmAndApplyAll(c.span, pickedType)}
+                        title={
+                          pickedType
+                            ? `Declare convention AND retroactively patch every existing ACCEPTED task in the project that has '${c.span}' tagged differently`
+                            : "Pick a type in the Set Convention column first"
+                        }
+                        style={{
+                          fontSize: "0.8rem",
+                          background: pickedType ? "var(--primary, #1e40af)" : undefined,
+                          color: pickedType ? "white" : undefined,
+                          opacity: !pickedType || isSubmitting ? 0.6 : 1,
+                        }}
+                      >
+                        {isSubmitting ? "…" : "Confirm & apply to all"}
+                      </button>
                     )}
                   </td>
                 </tr>
