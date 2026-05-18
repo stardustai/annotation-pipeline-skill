@@ -461,3 +461,205 @@ def test_scheduler_routes_divergent_task_to_resolver(tmp_path):
     asyncio.run(run_one())
     after = store.load_task("t-sched")
     assert after.status is TaskStatus.ACCEPTED
+
+
+# -------------------------------------------------------------------------
+# Regression tests for the "silent agreement" / "second arbiter rubber-stamp"
+# bugs found in production (e.g. COVID-19 → technology accepted despite an
+# 83/55 event prior, because the second arbiter returned corrected_annotation
+# null and the code inferred "implicit agreement with first arbiter").
+# -------------------------------------------------------------------------
+
+
+def _setup_post_first_arbiter_with_response(tmp_path, response_payload, *, raise_exc=None):
+    """Same skeleton as `_setup_post_first_arbiter` but lets the test
+    supply the raw second-arbiter response payload (or raise an exception
+    instead of generating). Used to drive the silent/uncertain/unavailable
+    branches the old code path papered over."""
+    store = SqliteStore.open(tmp_path)
+    project = "p"
+    _seed_prior(store, project_id=project, span="Apple",
+                type_to_count={"organization": 12})
+
+    task = _make_task("t", input_text="Apple is referenced here")
+    task.status = TaskStatus.ARBITRATING
+    task.metadata["prior_verifier_first_arbiter_divergent"] = True
+    task.metadata["prior_verifier_payload"] = {
+        "span": "Apple", "proposed_type": "technology",
+        "dominant_type": "organization", "dominant_count": 12,
+        "total": 12, "distribution": {"organization": 12},
+    }
+    store.save_task(task)
+
+    rel = "artifact_payloads/t/final.json"
+    abs_path = store.root / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(
+        json.dumps({"text": json.dumps({
+            "rows": [{
+                "row_index": 0,
+                "output": {"entities": {"technology": ["Apple"]}},
+            }]
+        })}),
+        encoding="utf-8",
+    )
+    store.append_artifact(ArtifactRef.new(
+        task_id="t", kind="annotation_result", path=rel,
+        content_type="application/json",
+    ))
+
+    class _Client:
+        async def generate(self, request):
+            if raise_exc is not None:
+                raise raise_exc
+            return LLMGenerateResult(
+                final_text=json.dumps(response_payload),
+                raw_response={}, usage={}, diagnostics={}, runtime="stub",
+                provider="arbiter_secondary", model="stub", continuity_handle=None,
+            )
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _Client())
+    return store, runtime
+
+
+def test_second_arbiter_silent_null_routes_to_hr(tmp_path):
+    """REGRESSION: second arbiter returns corrected_annotation=null with
+    empty verdicts. Old code inferred 'implicit agreement with first' →
+    override prior → ACCEPTED. Production bug: COVID-19 → technology
+    accepted despite 83/55 event-dominant project prior.
+
+    New behavior: silence is not affirmation → HUMAN_REVIEW."""
+    store, runtime = _setup_post_first_arbiter_with_response(
+        tmp_path,
+        response_payload={"verdicts": [], "corrected_annotation": None},
+    )
+    runtime._resolve_first_arbiter_divergence(store.load_task("t"))
+    after = store.load_task("t")
+    assert after.status is TaskStatus.HUMAN_REVIEW
+    assert after.metadata.get("prior_verifier_action") == "second_arbiter_silent"
+
+
+def test_second_arbiter_tentative_verdict_routes_to_hr(tmp_path):
+    """Verdict on the synthetic prior-disagreement feedback is 'annotator'
+    but confidence is 'tentative' — explicit but low confidence. Old code
+    treated null corrected_annotation as agreement regardless. New behavior:
+    only certain/confident verdicts count → HUMAN_REVIEW."""
+    store, runtime = _setup_post_first_arbiter_with_response(
+        tmp_path,
+        response_payload={
+            "verdicts": [{
+                "feedback_id": "prior_verifier_synth",
+                "verdict": "annotator",
+                "confidence": "tentative",
+                "reasoning": "judgment call",
+            }],
+            "corrected_annotation": None,
+        },
+    )
+    runtime._resolve_first_arbiter_divergence(store.load_task("t"))
+    after = store.load_task("t")
+    assert after.status is TaskStatus.HUMAN_REVIEW
+    assert after.metadata.get("prior_verifier_action") == "second_arbiter_silent"
+
+
+def test_second_arbiter_explicit_verdict_annotator_accepts_with_first(tmp_path):
+    """Verdict 'annotator' with high confidence on the synthetic feedback
+    is real affirmation even without a corrected_annotation — accept with
+    first arbiter, override prior. Distinguishes 'I read the dispute and
+    agree' from 'I returned null because I didn't notice'."""
+    store, runtime = _setup_post_first_arbiter_with_response(
+        tmp_path,
+        response_payload={
+            "verdicts": [{
+                "feedback_id": "prior_verifier_synth",
+                "verdict": "annotator",
+                "confidence": "certain",
+                "reasoning": "context clearly supports first arbiter's call",
+            }],
+            "corrected_annotation": None,
+        },
+    )
+    runtime._resolve_first_arbiter_divergence(store.load_task("t"))
+    after = store.load_task("t")
+    assert after.status is TaskStatus.ACCEPTED
+    assert after.metadata.get("prior_verifier_action") == "resolved_to_first"
+
+
+def test_second_arbiter_explicit_verdict_qc_flips_to_prior(tmp_path):
+    """Verdict 'qc' with high confidence: second arbiter sides with the
+    prior. Should flip first arbiter's call to prior_type."""
+    store, runtime = _setup_post_first_arbiter_with_response(
+        tmp_path,
+        response_payload={
+            "verdicts": [{
+                "feedback_id": "prior_verifier_synth",
+                "verdict": "qc",
+                "confidence": "certain",
+                "reasoning": "prior dominance is decisive in this context",
+            }],
+            "corrected_annotation": None,
+        },
+    )
+    runtime._resolve_first_arbiter_divergence(store.load_task("t"))
+    after = store.load_task("t")
+    assert after.status is TaskStatus.ACCEPTED
+    assert after.metadata.get("prior_verifier_action") == "resolved_to_prior"
+    # Annotation file should have Apple = organization (the prior).
+    arts = [a for a in store.list_artifacts("t") if a.kind == "annotation_result"]
+    outer = json.loads((store.root / arts[-1].path).read_text())
+    text = outer.get("text")
+    inner = json.loads(text) if isinstance(text, str) else outer
+    assert inner["rows"][0]["output"]["entities"] == {"organization": ["Apple"]}
+
+
+def test_second_arbiter_unavailable_routes_to_hr_not_stuck(tmp_path):
+    """REGRESSION: when the second arbiter client raises (target missing,
+    network error, etc.), old code set prior_verifier_action=
+    'second_arbiter_unavailable' but never called _transition — leaving the
+    task stuck in ARBITRATING. New behavior: route to HUMAN_REVIEW so the
+    operator can adjudicate (and the task doesn't accumulate as a zombie)."""
+    store, runtime = _setup_post_first_arbiter_with_response(
+        tmp_path,
+        response_payload=None,
+        raise_exc=RuntimeError("provider 500"),
+    )
+    runtime._resolve_first_arbiter_divergence(store.load_task("t"))
+    after = store.load_task("t")
+    assert after.status is TaskStatus.HUMAN_REVIEW, (
+        "task must not stay stuck in ARBITRATING when second arbiter fails"
+    )
+    assert after.metadata.get("prior_verifier_action") == "second_arbiter_unavailable"
+
+
+def test_second_arbiter_writes_artifact_with_target_metadata(tmp_path):
+    """Second arbiter response must be persisted as an artifact tagged with
+    metadata.target='arbiter_secondary' so post-hoc audits can tell first
+    and second arbiter responses apart. Old code didn't persist anything,
+    making it impossible to reconstruct what the second arbiter actually
+    said for tasks like COVID-19 → technology."""
+    store, runtime = _setup_post_first_arbiter_with_response(
+        tmp_path,
+        response_payload={
+            "verdicts": [{
+                "feedback_id": "prior_verifier_synth",
+                "verdict": "annotator",
+                "confidence": "certain",
+                "reasoning": "agree",
+            }],
+            "corrected_annotation": None,
+        },
+    )
+    runtime._resolve_first_arbiter_divergence(store.load_task("t"))
+    arbiter_artifacts = [a for a in store.list_artifacts("t") if a.kind == "arbiter_result"]
+    secondaries = [
+        a for a in arbiter_artifacts
+        if (a.metadata or {}).get("target") == "arbiter_secondary"
+    ]
+    assert len(secondaries) == 1, (
+        f"expected exactly one arbiter_secondary artifact, "
+        f"got {[a.metadata for a in arbiter_artifacts]}"
+    )
+    art_meta = secondaries[0].metadata or {}
+    assert art_meta.get("disputed_span") == "Apple"
+    assert art_meta.get("first_arbiter_type") == "technology"
+    assert art_meta.get("prior_dominant_type") == "organization"

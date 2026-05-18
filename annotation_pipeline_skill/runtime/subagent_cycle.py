@@ -30,6 +30,16 @@ class SubagentRuntimeResult:
     failed: int
 
 
+class _ArbiterClientUnavailable(Exception):
+    """Raised by `_run_arbiter_llm` when the target client can't be built
+    (target missing from llm_profiles.yaml, factory raised, etc.)."""
+
+
+class _ArbiterCallFailed(Exception):
+    """Raised by `_run_arbiter_llm` when the LLM call or its response
+    parsing failed (network error, malformed JSON, no verdicts list)."""
+
+
 class QCParseError(ValueError):
     def __init__(self, message: str, *, raw_text: str):
         super().__init__(message)
@@ -236,7 +246,7 @@ class SubagentRuntime:
                     conventions_block=conventions_block,
                 ),
                 prompt=self._annotation_prompt(task),
-                continuity_handle=task.metadata.get("continuity_handle"),
+                continuity_handle=self._read_pinned_handle(task, "continuity_handle", stage_target),
             ),
         )
         annotation_finished_at = utc_now()
@@ -307,7 +317,10 @@ class SubagentRuntime:
                 )
                 return
 
-        task.metadata["continuity_handle"] = annotation_result.continuity_handle
+        self._write_pinned_handle(
+            task, "continuity_handle",
+            annotation_result.continuity_handle, annotation_result.provider,
+        )
         await self._run_validation_and_qc(
             task,
             annotation_artifact,
@@ -506,7 +519,7 @@ class SubagentRuntime:
             LLMGenerateRequest(
                 instructions=self._qc_instructions(task, guideline=guideline),
                 prompt=self._qc_prompt(task, annotation_artifact),
-                continuity_handle=task.metadata.get("qc_continuity_handle"),
+                continuity_handle=self._read_pinned_handle(task, "qc_continuity_handle", "qc"),
             ),
         )
         qc_finished_at = utc_now()
@@ -542,7 +555,10 @@ class SubagentRuntime:
             qc_artifact,
         )
 
-        task.metadata["qc_continuity_handle"] = qc_result.continuity_handle
+        self._write_pinned_handle(
+            task, "qc_continuity_handle",
+            qc_result.continuity_handle, qc_result.provider,
+        )
         task.metadata.pop("runtime_next_stage", None)
         # Honor explicit consensus from QC (e.g. accepted annotator rebuttal)
         # even when overall QC verdict is fail — those specific feedbacks are
@@ -979,7 +995,10 @@ class SubagentRuntime:
             ),
             artifact,
         )
-        task.metadata["qc_continuity_handle"] = result.continuity_handle
+        self._write_pinned_handle(
+            task, "qc_continuity_handle",
+            result.continuity_handle, result.provider,
+        )
         task.metadata["runtime_next_stage"] = "qc"
         self.store.save_task(task)
 
@@ -994,6 +1013,51 @@ class SubagentRuntime:
             if target == "fallback" or not _is_provider_transient_error(exc):
                 raise
             return await self._call_client("fallback", request)
+
+    def _profile_name_for_target(self, target: str) -> str | None:
+        """Return the LLM profile name the factory currently resolves for
+        ``target``. Used to invalidate cross-provider continuity handles —
+        a ``previous_response_id`` minted by codex (e.g.) is meaningless to
+        a Qwen-backed gateway and causes the gateway to 404. Compares
+        cheaply via a transient client construction; profile lookup itself
+        does not open any network connections.
+        """
+        try:
+            client = self.client_factory(target)
+        except Exception:  # noqa: BLE001
+            return None
+        prof = getattr(client, "profile", None)
+        return getattr(prof, "name", None)
+
+    def _read_pinned_handle(self, task: Task, key: str, target: str) -> str | None:
+        """Return ``task.metadata[key]`` only if it was minted by the SAME
+        profile currently configured for ``target``. Otherwise return None
+        (the upstream won't know the handle, so passing it would cause a
+        404 / invalid_request_error and crash the worker).
+        """
+        handle = task.metadata.get(key)
+        if not handle:
+            return None
+        minted_by = task.metadata.get(f"{key}_profile")
+        current = self._profile_name_for_target(target)
+        if minted_by is None or current is None or minted_by == current:
+            return handle
+        return None
+
+    def _write_pinned_handle(
+        self, task: Task, key: str, handle: str | None, profile_name: str | None,
+    ) -> None:
+        """Record the handle alongside the profile name that minted it so the
+        next ``_read_pinned_handle`` can detect stale cross-provider IDs."""
+        if handle:
+            task.metadata[key] = handle
+            if profile_name:
+                task.metadata[f"{key}_profile"] = profile_name
+            else:
+                task.metadata.pop(f"{key}_profile", None)
+        else:
+            task.metadata.pop(key, None)
+            task.metadata.pop(f"{key}_profile", None)
 
     async def _call_client(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         client = self.client_factory(target)
@@ -1474,77 +1538,91 @@ class SubagentRuntime:
         )
         return TaskStatus.ACCEPTED
 
-    def _build_arbiter_request(
-        self,
-        task: Task,
-        annotation_artifact: ArtifactRef,
-    ) -> LLMGenerateRequest:
-        """Build a minimal second-opinion arbiter request.
-
-        The second arbiter is a sanity check, not a dispute resolver: it sees
-        only the input text and the proposed annotation, with no first-arbiter
-        output and no prior distribution. Independence is the whole point —
-        this is a cross-LLM check that the (span, type) call holds up.
-        """
-        current_annotation = self._slim_annotation_payload(annotation_artifact)
-        framing = (
-            "You are a second-opinion arbiter. Given the input text and the "
-            "proposed annotation, return your independent JSON corrected_annotation "
-            "(or echo the proposal if you agree).\n\n"
-            "Response shape:\n"
-            "{\n"
-            '  "verdicts": [],\n'
-            '  "corrected_annotation": <full annotation object> | null\n'
-            "}\n"
-            "Return raw JSON only, no markdown fences."
-        )
-        instructions = framing + "\n\n" + _SHARED_SPAN_RULES
-        prompt = json.dumps(
-            {
-                "task_id": task.task_id,
-                "task_payload": task.source_ref.get("payload", {}),
-                "current_annotation": current_annotation,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        return LLMGenerateRequest(
-            instructions=instructions,
-            prompt=prompt,
-            continuity_handle=None,
-        )
-
     async def _invoke_second_arbiter(
         self,
         task: Task,
         annotation_artifact: ArtifactRef,
     ) -> dict | None:
-        """Run a second arbiter (different family) on the same task. Returns
-        its parsed JSON payload, or None if the call fails. The second
-        arbiter is given the SAME prompt as the first but does not see
-        the first arbiter's output or the prior distribution — independence
-        is critical for the cross-LLM check.
+        """Run the SECOND arbiter against the prior-divergence dispute.
+
+        Architectural note: the second arbiter is the same `_run_arbiter_llm`
+        machinery as the first arbiter — same prompt shape (input + current
+        annotation + output_schema + disputed_items + conventions), same
+        verbatim retries, same artifact persistence — only the provider
+        target differs. The "dispute" the second arbiter sees is a
+        synthetic feedback item built from the prior_verifier_payload so
+        the LLM knows exactly which (span, type) pair is contested. This
+        replaces the old slimmed-down `_build_arbiter_request` whose
+        prompt didn't tell the second arbiter what was actually in dispute.
+
+        Returns the parsed arbiter response payload (verdicts +
+        corrected_annotation), or None if the call failed / response was
+        unparseable. The caller (`_resolve_first_arbiter_divergence_async`)
+        interprets the payload and decides the terminal transition.
         """
+        payload_meta = task.metadata.get("prior_verifier_payload") or {}
+        span = payload_meta.get("span") or ""
+        first_type = payload_meta.get("proposed_type") or ""
+        prior_type = payload_meta.get("dominant_type") or ""
+        prior_count = payload_meta.get("dominant_count") or 0
+        prior_total = payload_meta.get("total") or 0
+        distribution = payload_meta.get("distribution") or {}
+        # Synthesize a single `disputed_items` entry that frames the prior
+        # disagreement in the same shape `_arbitrate_and_apply` uses for
+        # real QC↔annotator disputes. The second arbiter prompt then sees
+        # the span + first arbiter's type + prior dominant type in the
+        # standard format and can rule with full context.
+        synth_feedback_id = "prior_verifier_synth"
+        synth_items = [{
+            "feedback_id": synth_feedback_id,
+            "category": "prior_disagreement",
+            "qc": {
+                "message": (
+                    f"Project history: span {span!r} has been labeled "
+                    f"{prior_type!r} on {prior_count}/{prior_total} prior "
+                    f"accepted tasks. Distribution: {distribution!r}. The "
+                    f"current annotation labels it {first_type!r}, which "
+                    f"diverges from the dominant prior. Should the current "
+                    f"context-specific labeling stand, or should the prior win?"
+                ),
+                "confidence": "informational",
+                "target": {
+                    "span": span,
+                    "proposed_type": first_type,
+                    "prior_dominant_type": prior_type,
+                    "distribution": distribution,
+                    "dominant_count": prior_count,
+                    "total": prior_total,
+                },
+            },
+            "annotator": {
+                "message": (
+                    f"First arbiter (different LLM) reviewed this row's "
+                    f"context and judged {span!r} → {first_type!r}. The full "
+                    f"annotation is provided as current_annotation; the row "
+                    f"in question is in input.text."
+                ),
+                "confidence": None,
+                "disputed_points": [],
+                "agreed_points": [],
+            },
+        }]
         try:
-            client = self.client_factory("arbiter_secondary")
-        except Exception:  # noqa: BLE001
+            return await self._run_arbiter_llm(
+                task=task,
+                items=synth_items,
+                target_name="arbiter_secondary",
+                attempt_metadata={
+                    "target": "arbiter_secondary",
+                    "synthetic_feedback_id": synth_feedback_id,
+                    "disputed_span": span,
+                    "first_arbiter_type": first_type,
+                    "prior_dominant_type": prior_type,
+                },
+            )
+        except _ArbiterClientUnavailable:
             return None
-        # Build a fresh arbiter request from the existing prompt machinery.
-        request = self._build_arbiter_request(task, annotation_artifact)
-        try:
-            result = await client.generate(request)
-        except Exception:  # noqa: BLE001
-            return None
-        finally:
-            close = getattr(client, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except Exception:  # noqa: BLE001
-                    pass
-        try:
-            return _parse_llm_json(result.final_text)
-        except (json.JSONDecodeError, ValueError):
+        except _ArbiterCallFailed:
             return None
 
     def _resolve_first_arbiter_divergence(self, task: Task) -> None:
@@ -1555,52 +1633,124 @@ class SubagentRuntime:
         asyncio.run(self._resolve_first_arbiter_divergence_async(task))
 
     async def _resolve_first_arbiter_divergence_async(self, task: Task) -> None:
-        """Three-way resolution per spec §6:
+        """Three-way resolution per spec §6, with EXPLICIT AFFIRMATION
+        required to override the project prior:
 
-        - second_arbiter == first_arbiter  -> ACCEPTED (override prior;
-          two LLMs from different families outvote the historical prior)
-        - second_arbiter == prior_dominant -> flip annotation to the
-          prior type and ACCEPT (first arbiter was the outlier)
-        - second_arbiter is a third type   -> HUMAN_REVIEW (genuine
-          three-way disagreement)
-        - second arbiter unavailable       -> fall back to first arbiter's
-          decision; surface in audit via ``prior_verifier_action``
+        - second arbiter explicitly affirms first arbiter's type (corrected
+          annotation contains span→first_type, OR verdict='annotator' with
+          certain/confident on the synthetic feedback) → ACCEPTED, override
+          prior (two LLMs from different families outvote the historical
+          prior on a context-specific exception)
+        - second arbiter affirms the prior (verdict='qc' high-conf or
+          corrected_annotation contains span→prior_type) → flip first
+          arbiter's call to prior, ACCEPTED
+        - second arbiter picks a third type (corrected_annotation has
+          span→other) → HUMAN_REVIEW (genuine three-way disagreement)
+        - second arbiter is silent/uncertain (corrected_annotation=null
+          AND no high-conf verdict, or tentative/unsure verdict) →
+          HUMAN_REVIEW (don't infer agreement from silence — that's the
+          bug that let COVID-19 → technology through despite an 83/55
+          event-prior majority)
+        - second arbiter unavailable (target missing, network error,
+          unparseable response) → HUMAN_REVIEW (safer than leaving the
+          task stranded in ARBITRATING or rubber-stamping first arbiter)
         """
         annotation_artifact = self._latest_annotation_artifact(task.task_id)
         if annotation_artifact is None:
             self._clear_divergence_flag(task)
             self.store.save_task(task)
             return
-        payload = task.metadata.get("prior_verifier_payload") or {}
-        span = payload.get("span")
-        first_type = payload.get("proposed_type")
-        prior_type = payload.get("dominant_type")
+        payload_meta = task.metadata.get("prior_verifier_payload") or {}
+        span = payload_meta.get("span")
+        first_type = payload_meta.get("proposed_type")
+        prior_type = payload_meta.get("dominant_type")
         if not span or not first_type or not prior_type:
             self._clear_divergence_flag(task)
             self.store.save_task(task)
             return
 
         second_payload = await self._invoke_second_arbiter(task, annotation_artifact)
+        attempt_id = self._next_attempt_id(task)
         if not isinstance(second_payload, dict):
-            # Second arbiter unavailable -- accept first arbiter's call to
-            # avoid blocking the pipeline (spec §12 verifier_partial). Surface
-            # in audit via metadata.
+            # Second arbiter unavailable / failed. Don't fall back to first —
+            # that's the rubber-stamp bug. Route to HR so a human can adjudicate.
             task.metadata["prior_verifier_action"] = "second_arbiter_unavailable"
             self._clear_divergence_flag(task)
+            self._transition(
+                task,
+                TaskStatus.HUMAN_REVIEW,
+                reason=(
+                    "Prior-divergence detected (first arbiter "
+                    f"picked {first_type!r}, project history dominant {prior_type!r}); "
+                    "second arbiter unavailable or returned unparseable response — needs human review"
+                ),
+                stage="prior_verifier",
+                attempt_id=attempt_id,
+                metadata={"prior_verifier_action": "second_arbiter_unavailable"},
+            )
             self.store.save_task(task)
             return
 
-        second_corrected = second_payload.get("corrected_annotation") if isinstance(
-            second_payload.get("corrected_annotation"), dict
-        ) else None
-        second_type = self._extract_type_for_span(second_corrected, span) if second_corrected else None
-        if second_type is None:
-            # Second arbiter chose "annotator-wins" implicitly -- use the
-            # annotation that's currently on disk.
-            current = self._load_annotation_payload(annotation_artifact)
-            second_type = self._extract_type_for_span(current, span)
+        # Determine the second arbiter's effective vote on the disputed span.
+        # Priority: explicit corrected_annotation > explicit verdict on the
+        # synthetic feedback > "silent" (treat as no opinion → HR).
+        second_corrected = second_payload.get("corrected_annotation")
+        if not isinstance(second_corrected, dict):
+            second_corrected = None
+        second_type: str | None = None
+        affirmation_path: str = "none"
+        if second_corrected is not None:
+            second_type = self._extract_type_for_span(second_corrected, span)
+            if second_type is not None:
+                affirmation_path = "corrected_annotation"
 
-        attempt_id = self._next_attempt_id(task)
+        if second_type is None:
+            # No explicit type from corrected_annotation. Look for an
+            # explicit verdict on our synthetic feedback.
+            for v in second_payload.get("verdicts") or []:
+                if not isinstance(v, dict):
+                    continue
+                if v.get("feedback_id") != "prior_verifier_synth":
+                    continue
+                verdict = str(v.get("verdict") or "").lower()
+                conf = _resolve_confidence_label(v.get("confidence"))
+                if conf not in ("certain", "confident"):
+                    continue
+                if verdict == "annotator":
+                    second_type = first_type
+                    affirmation_path = "verdict_annotator"
+                elif verdict == "qc":
+                    second_type = prior_type
+                    affirmation_path = "verdict_qc"
+                # 'neither' without corrected_annotation: caller can't tell
+                # what type → treat as silent.
+                break
+
+        if second_type is None:
+            # Truly silent / uncertain. Route to HR rather than rubber-stamp.
+            task.metadata["prior_verifier_action"] = "second_arbiter_silent"
+            self._clear_divergence_flag(task)
+            self._transition(
+                task,
+                TaskStatus.HUMAN_REVIEW,
+                reason=(
+                    f"Second arbiter returned no explicit verdict on {span!r}: "
+                    f"corrected_annotation is null and no certain/confident "
+                    f"verdict on the synthetic prior-disagreement feedback. "
+                    f"Silence is not affirmation — needs human review (first "
+                    f"arbiter said {first_type!r}, project prior dominant {prior_type!r})"
+                ),
+                stage="prior_verifier",
+                attempt_id=attempt_id,
+                metadata={
+                    "prior_verifier_action": "second_arbiter_silent",
+                    "first_arbiter_type": first_type,
+                    "prior_dominant_type": prior_type,
+                    "span": span,
+                },
+            )
+            self.store.save_task(task)
+            return
 
         if second_type == first_type:
             task.metadata["prior_verifier_action"] = "resolved_to_first"
@@ -1609,13 +1759,15 @@ class SubagentRuntime:
             self._transition(
                 task,
                 TaskStatus.ACCEPTED,
-                reason="second arbiter agrees with first; override prior",
+                reason=f"second arbiter explicitly affirms first ({affirmation_path}); override prior",
                 stage="prior_verifier",
                 attempt_id=attempt_id,
-                metadata={"prior_verifier_action": "resolved_to_first"},
+                metadata={
+                    "prior_verifier_action": "resolved_to_first",
+                    "affirmation_path": affirmation_path,
+                },
             )
         elif second_type == prior_type:
-            # Override the annotation file: change span's type to prior_type.
             corrected_payload = self._load_annotation_payload(annotation_artifact)
             self._rewrite_span_type(corrected_payload, span, first_type, prior_type)
             new_artifact = self._write_corrected_annotation_artifact(
@@ -1627,10 +1779,13 @@ class SubagentRuntime:
             self._transition(
                 task,
                 TaskStatus.ACCEPTED,
-                reason="second arbiter agrees with prior; flip first arbiter's call",
+                reason=f"second arbiter agrees with prior ({affirmation_path}); flip first arbiter's call",
                 stage="prior_verifier",
                 attempt_id=attempt_id,
-                metadata={"prior_verifier_action": "resolved_to_prior"},
+                metadata={
+                    "prior_verifier_action": "resolved_to_prior",
+                    "affirmation_path": affirmation_path,
+                },
             )
         else:
             task.metadata["prior_verifier_action"] = "escalated_to_hr"
@@ -1842,10 +1997,6 @@ class SubagentRuntime:
         ]
         if not open_feedbacks:
             return empty
-        try:
-            arbiter_client = self.client_factory("arbiter")
-        except Exception:
-            return empty
         # Promote the task into ARBITRATING — visible in the kanban while the
         # arbiter LLM is running. Idempotent: if a human (or a prior step) has
         # already moved the task into ARBITRATING, skip the transition.
@@ -1857,7 +2008,7 @@ class SubagentRuntime:
                 stage="arbitration",
                 attempt_id=attempt_id,
             )
-        items = []
+        items: list[dict[str, Any]] = []
         for f in open_feedbacks:
             reply = replies_by_feedback.get(f.feedback_id)
             if reply is not None:
@@ -1887,9 +2038,141 @@ class SubagentRuntime:
                 },
                 "annotator": annotator_view,
             })
-        # Build the full task context for arbiter-as-fixer: the input text and
-        # the annotator's latest annotation. Arbiter can both judge AND produce
-        # a corrected annotation that we'll apply on its behalf.
+        try:
+            payload = await self._run_arbiter_llm(
+                task=task,
+                items=items,
+                target_name="arbiter",
+            )
+        except (_ArbiterClientUnavailable, _ArbiterCallFailed):
+            return empty
+        verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
+        if not isinstance(verdicts, list):
+            return empty
+        outcome = {
+            "ran": True,
+            "closed": 0,
+            "fixed": 0,
+            "unresolved": 0,
+            "mechanical_fail": 0,
+            "corrected_annotation": None,
+        }
+        corrected = payload.get("corrected_annotation") if isinstance(payload, dict) else None
+        if isinstance(corrected, dict):
+            outcome["corrected_annotation"] = corrected
+        arbiter_attempt_id = payload.get("_arbiter_attempt_id")
+        arbiter_result_meta = payload.get("_arbiter_result_meta") or {}
+        known_ids = {f.feedback_id for f in open_feedbacks}
+        for verdict_entry in verdicts:
+            if not isinstance(verdict_entry, dict):
+                continue
+            fid = verdict_entry.get("feedback_id")
+            if not isinstance(fid, str) or fid not in known_ids:
+                continue
+            verdict = str(verdict_entry.get("verdict") or "").lower()
+            conf_label = _resolve_confidence_label(verdict_entry.get("confidence"))
+            reasoning = str(verdict_entry.get("reasoning") or "")
+            provider = arbiter_result_meta.get("provider", "arbiter")
+            model = arbiter_result_meta.get("model", "")
+            base_metadata = {
+                "attempt_id": arbiter_attempt_id,
+                "resolution_source": "arbiter",
+                "arbiter_confidence": conf_label,
+                "arbiter_verdict": verdict,
+                "arbiter_reasoning": reasoning,
+            }
+            if conf_label in (None, "tentative", "unsure"):
+                outcome["unresolved"] += 1
+                self.store.append_feedback_discussion(
+                    FeedbackDiscussionEntry.new(
+                        task_id=task.task_id,
+                        feedback_id=fid,
+                        role="qc",
+                        stance="comment",
+                        message=f"Arbiter ({provider}/{model}) uncertain: {reasoning}",
+                        consensus=False,
+                        created_by="arbiter",
+                        metadata=base_metadata,
+                    )
+                )
+                continue
+            if verdict == "annotator":
+                outcome["closed"] += 1
+                self.store.append_feedback_discussion(
+                    FeedbackDiscussionEntry.new(
+                        task_id=task.task_id,
+                        feedback_id=fid,
+                        role="qc",
+                        stance="agree",
+                        message=f"Arbiter ({provider}/{model}) ruled in annotator's favor: {reasoning}",
+                        consensus=True,
+                        created_by="arbiter",
+                        metadata=base_metadata,
+                    )
+                )
+            elif verdict in {"qc", "neither"}:
+                if outcome["corrected_annotation"] is not None:
+                    outcome["fixed"] += 1
+                    self.store.append_feedback_discussion(
+                        FeedbackDiscussionEntry.new(
+                            task_id=task.task_id,
+                            feedback_id=fid,
+                            role="qc",
+                            stance="agree",
+                            message=(
+                                f"Arbiter ({provider}/{model}) ruled {verdict!r} "
+                                f"and produced a fix: {reasoning}"
+                            ),
+                            consensus=True,
+                            created_by="arbiter",
+                            metadata=base_metadata,
+                        )
+                    )
+                else:
+                    outcome["mechanical_fail"] += 1
+                    self.store.append_feedback_discussion(
+                        FeedbackDiscussionEntry.new(
+                            task_id=task.task_id,
+                            feedback_id=fid,
+                            role="qc",
+                            stance="comment",
+                            message=(
+                                f"Arbiter ({provider}/{model}) ruled {verdict!r} but "
+                                f"did not produce a fix: {reasoning}"
+                            ),
+                            consensus=False,
+                            created_by="arbiter",
+                            metadata=base_metadata,
+                        )
+                    )
+            else:
+                outcome["mechanical_fail"] += 1
+        return outcome
+
+    async def _run_arbiter_llm(
+        self,
+        *,
+        task: Task,
+        items: list[dict[str, Any]],
+        target_name: str,
+        attempt_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Shared arbiter LLM machinery used by both the first arbiter
+        (`_arbitrate_and_apply`) and the second arbiter (prior-divergence
+        resolver). Builds the same prompt shape, runs verbatim-retry loop,
+        persists an arbiter_result artifact, and returns the parsed
+        response with `_arbiter_attempt_id` / `_arbiter_result_meta` keys
+        spliced in for the caller's discussion-posting bookkeeping.
+
+        Raises `_ArbiterClientUnavailable` when client_factory can't build
+        the target, and `_ArbiterCallFailed` for any other failure
+        (network, unparseable JSON, missing verdicts). Callers convert
+        these to outcome=empty / second_arbiter_unavailable as needed.
+        """
+        try:
+            arbiter_client = self.client_factory(target_name)
+        except Exception as exc:  # noqa: BLE001
+            raise _ArbiterClientUnavailable(str(exc))
         latest_annotation_artifact = self._latest_annotation_artifact(task.task_id)
         current_annotation = self._slim_annotation_payload(latest_annotation_artifact)
         instructions = (
@@ -1980,20 +2263,15 @@ class SubagentRuntime:
                     prompt=prompt,
                     continuity_handle=None,
                 ))
-            except Exception:
-                return empty
+            except Exception as exc:  # noqa: BLE001
+                raise _ArbiterCallFailed(str(exc))
             try:
                 payload = _parse_llm_json(result.final_text)
-            except (json.JSONDecodeError, ValueError):
-                return empty
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise _ArbiterCallFailed(str(exc))
             verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
             if not isinstance(verdicts, list):
-                return empty
-            # If arbiter produced a corrected_annotation, pre-validate verbatim
-            # before accepting the response. Schema check is repeated later in
-            # _apply_arbiter_correction; here we only gate on verbatim because
-            # that's the empirical failure mode (~18% of accepted tasks
-            # contained hallucinated spans from this path before the guard).
+                raise _ArbiterCallFailed("arbiter response missing 'verdicts' list")
             corrected_check = payload.get("corrected_annotation") if isinstance(payload, dict) else None
             if isinstance(corrected_check, dict):
                 verbatim_failure = self._check_verbatim_spans(task, corrected_check)
@@ -2010,18 +2288,8 @@ class SubagentRuntime:
                             f"input.text. Do not paraphrase, normalize, or invent spans."
                         )
                         continue
-                    # Retries exhausted — drop the bad corrected_annotation so
-                    # the outcome falls through to HR instead of silently
-                    # accepting a hallucinated span.
                     payload["corrected_annotation"] = None
             else:
-                # Detect "high-conf qc/neither verdict but corrected_annotation
-                # is null/missing" — the arbiter described a fix in reasoning
-                # but forgot to emit the JSON object. Without retrying, every
-                # such verdict falls into ``unresolved`` → HR. Observed in
-                # production: gpt-5.5 sometimes writes "the corrected
-                # annotation uses the verbatim sentence" in reasoning while
-                # leaving the field null.
                 needs_correction = any(
                     isinstance(v, dict)
                     and str(v.get("verdict") or "").lower() in {"qc", "neither"}
@@ -2040,15 +2308,18 @@ class SubagentRuntime:
                     continue
             break
         finished_at = utc_now()
-        # Record an Attempt for audit traceability.
         arbiter_attempt_id = self._next_attempt_id(task)
         task.current_attempt += 1
+        artifact_metadata = {"target": target_name}
+        if attempt_metadata:
+            artifact_metadata.update(attempt_metadata)
         arbiter_artifact = self._write_stage_artifact(
             task,
             result,
             kind="arbiter_result",
             attempt_id=arbiter_attempt_id,
-            payload={"decision": payload, "items": items},
+            payload={"decision": payload, "items": items, "target": target_name},
+            extra_metadata=artifact_metadata,
         )
         self._append_attempt(
             Attempt(
@@ -2062,122 +2333,22 @@ class SubagentRuntime:
                 provider_id=result.provider,
                 model=result.model,
                 effort=None,
-                route_role="arbiter",
+                route_role=target_name,
                 summary=result.final_text[:500],
                 artifacts=[arbiter_artifact],
             ),
             arbiter_artifact,
         )
-        outcome = {
-            "ran": True,
-            "closed": 0,
-            "fixed": 0,
-            "unresolved": 0,
-            "mechanical_fail": 0,
-            "corrected_annotation": None,
+        # Splice bookkeeping for the caller; underscored to mark as
+        # caller-only and not part of the LLM's response.
+        payload["_arbiter_attempt_id"] = arbiter_attempt_id
+        payload["_arbiter_result_meta"] = {
+            "provider": result.provider,
+            "model": result.model,
+            "target": target_name,
+            "artifact_path": arbiter_artifact.path,
         }
-        corrected = payload.get("corrected_annotation") if isinstance(payload, dict) else None
-        if isinstance(corrected, dict):
-            outcome["corrected_annotation"] = corrected
-        known_ids = {f.feedback_id for f in open_feedbacks}
-        for verdict_entry in verdicts:
-            if not isinstance(verdict_entry, dict):
-                continue
-            fid = verdict_entry.get("feedback_id")
-            if not isinstance(fid, str) or fid not in known_ids:
-                continue
-            verdict = str(verdict_entry.get("verdict") or "").lower()
-            conf_label = _resolve_confidence_label(verdict_entry.get("confidence"))
-            reasoning = str(verdict_entry.get("reasoning") or "")
-            base_metadata = {
-                "attempt_id": arbiter_attempt_id,
-                "resolution_source": "arbiter",
-                "arbiter_confidence": conf_label,
-                "arbiter_verdict": verdict,
-                "arbiter_reasoning": reasoning,
-            }
-            # Arbiter labels {tentative, unsure, None} → can't trust the
-            # verdict; punt to HR. Only {certain, confident} produce a
-            # terminal decision.
-            if conf_label in (None, "tentative", "unsure"):
-                outcome["unresolved"] += 1
-                self.store.append_feedback_discussion(
-                    FeedbackDiscussionEntry.new(
-                        task_id=task.task_id,
-                        feedback_id=fid,
-                        role="qc",
-                        stance="comment",
-                        message=f"Arbiter ({result.provider}/{result.model}) uncertain: {reasoning}",
-                        consensus=False,
-                        created_by="arbiter",
-                        metadata=base_metadata,
-                    )
-                )
-                continue
-            if verdict == "annotator":
-                # Confident annotator-wins: close the feedback by consensus.
-                outcome["closed"] += 1
-                self.store.append_feedback_discussion(
-                    FeedbackDiscussionEntry.new(
-                        task_id=task.task_id,
-                        feedback_id=fid,
-                        role="qc",
-                        stance="agree",
-                        message=f"Arbiter ({result.provider}/{result.model}) ruled in annotator's favor: {reasoning}",
-                        consensus=True,
-                        created_by="arbiter",
-                        metadata=base_metadata,
-                    )
-                )
-            elif verdict in {"qc", "neither"}:
-                # Confident the current annotation is wrong. The arbiter must have
-                # provided corrected_annotation — runtime will apply it and accept
-                # the task. If the correction is missing, fall back to HR.
-                if outcome["corrected_annotation"] is not None:
-                    outcome["fixed"] += 1
-                    self.store.append_feedback_discussion(
-                        FeedbackDiscussionEntry.new(
-                            task_id=task.task_id,
-                            feedback_id=fid,
-                            role="qc",
-                            stance="agree",
-                            message=(
-                                f"Arbiter ({result.provider}/{result.model}) ruled {verdict!r} "
-                                f"and produced a fix: {reasoning}"
-                            ),
-                            consensus=True,
-                            created_by="arbiter",
-                            metadata=base_metadata,
-                        )
-                    )
-                else:
-                    # Arbiter ruled qc/neither at high confidence but didn't
-                    # emit corrected_annotation. This is a mechanical failure
-                    # (LLM forgot the JSON, internal retry exhausted) — not
-                    # genuine uncertainty. Caller routes to PENDING retry,
-                    # not HR. unresolved is reserved for tentative/unsure
-                    # verdicts only.
-                    outcome["mechanical_fail"] += 1
-                    self.store.append_feedback_discussion(
-                        FeedbackDiscussionEntry.new(
-                            task_id=task.task_id,
-                            feedback_id=fid,
-                            role="qc",
-                            stance="comment",
-                            message=(
-                                f"Arbiter ({result.provider}/{result.model}) ruled {verdict!r} but "
-                                f"did not produce a fix: {reasoning}"
-                            ),
-                            consensus=False,
-                            created_by="arbiter",
-                            metadata=base_metadata,
-                        )
-                    )
-            else:
-                # Unknown verdict value at high confidence — also mechanical
-                # (model emitted garbage in the verdict field). Retry.
-                outcome["mechanical_fail"] += 1
-        return outcome
+        return payload
 
     def _record_confidence_sample(self, role: str, value: float) -> None:
         history = self._confidence_history.setdefault(role, [])
@@ -2413,6 +2584,7 @@ class SubagentRuntime:
         kind: str,
         attempt_id: str,
         payload: dict[str, Any],
+        extra_metadata: dict[str, Any] | None = None,
     ) -> ArtifactRef:
         relative_path = f"artifact_payloads/{task.task_id}/{attempt_id}_{kind}.json"
         path = self.store.root / relative_path
@@ -2432,18 +2604,21 @@ class SubagentRuntime:
             + "\n",
             encoding="utf-8",
         )
+        metadata = {
+            "runtime": result.runtime,
+            "provider": result.provider,
+            "model": result.model,
+            "continuity_handle": result.continuity_handle,
+            "diagnostics": result.diagnostics or {},
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
         return ArtifactRef.new(
             task_id=task.task_id,
             kind=kind,
             path=relative_path,
             content_type="application/json",
-            metadata={
-                "runtime": result.runtime,
-                "provider": result.provider,
-                "model": result.model,
-                "continuity_handle": result.continuity_handle,
-                "diagnostics": result.diagnostics or {},
-            },
+            metadata=metadata,
         )
 
 
