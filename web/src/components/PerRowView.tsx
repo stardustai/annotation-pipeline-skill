@@ -81,37 +81,43 @@ function stripThinkBlocks(value: unknown): unknown {
 }
 
 /**
- * Find the latest `annotation_result` artifact and pull its
- * `rows[].output` keyed by row_index. Strings that wrap JSON are unwrapped.
+ * Find the most recent NON-EMPTY `annotation_result` artifact and pull
+ * its `rows[].output` keyed by row_index. Strings that wrap JSON are
+ * unwrapped.
+ *
+ * Walks artifacts in reverse order, skipping any with an empty/missing
+ * `text` field or whose unwrapped payload contains no rows. The runtime
+ * sometimes writes an empty annotation_result on certain failure modes
+ * (post-rate-limit retry, arbiter mechanical fail) — without this
+ * fallback the AnnotationView shows "No annotation rows to render"
+ * even though earlier artifacts have perfectly good data.
  */
 export function extractOutputsByIndex(
   artifacts: TaskDetailArtifact[],
 ): Map<number, AnnotationOutput> {
   const annotation = artifacts.filter((a) => a.kind === "annotation_result");
-  if (annotation.length === 0) return new Map();
-  const latest = annotation[annotation.length - 1];
-  // Strip <think>...</think> reasoning blocks before unwrapping. Older
-  // artifacts (pre-fix) embed the model's chain-of-thought ahead of the JSON
-  // payload, which trips the leading-brace check inside unwrapJson.
-  const cleaned = stripThinkBlocks(latest.payload);
-  const unwrapped = unwrapJson(cleaned);
-  // Locate a `rows` array nested under common envelope keys.
-  const rows = locateRowsArray(unwrapped);
-  const out = new Map<number, AnnotationOutput>();
-  if (!rows) return out;
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    if (r === null || typeof r !== "object") continue;
-    const rec = r as Record<string, unknown>;
-    const idxRaw = rec.row_index;
-    const row_index =
-      typeof idxRaw === "number" && Number.isFinite(idxRaw) ? idxRaw : i;
-    const output = rec.output;
-    if (output !== null && typeof output === "object") {
-      out.set(row_index, output as AnnotationOutput);
+  for (let i = annotation.length - 1; i >= 0; i--) {
+    const candidate = annotation[i];
+    const cleaned = stripThinkBlocks(candidate.payload);
+    const unwrapped = unwrapJson(cleaned);
+    const rows = locateRowsArray(unwrapped);
+    if (!rows || rows.length === 0) continue;  // empty / unparseable → keep walking back
+    const out = new Map<number, AnnotationOutput>();
+    for (let j = 0; j < rows.length; j++) {
+      const r = rows[j];
+      if (r === null || typeof r !== "object") continue;
+      const rec = r as Record<string, unknown>;
+      const idxRaw = rec.row_index;
+      const row_index =
+        typeof idxRaw === "number" && Number.isFinite(idxRaw) ? idxRaw : j;
+      const output = rec.output;
+      if (output !== null && typeof output === "object") {
+        out.set(row_index, output as AnnotationOutput);
+      }
     }
+    if (out.size > 0) return out;  // found a populated artifact — done
   }
-  return out;
+  return new Map();
 }
 
 /**
