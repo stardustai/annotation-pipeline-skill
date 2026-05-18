@@ -415,45 +415,69 @@ function DeviationsTable({
     let totalFixed = 0;
     let totalSkipped = 0;
     let totalErrors = 0;
-    let serverTotal = expectedTotal;
     try {
       const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
-      const body = {
+      const baseBody = {
         project_id: projectId,
         span,
         entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
         actor: "posterior_audit_retroactive_ui",
-        batch_size: 25,
       };
-      for (let safety = 0; safety < 1000; safety++) {
+      // Step 1: scan + first batch. Server returns full candidate list
+      // so subsequent polls can skip the O(N_accepted_tasks) scan.
+      const BATCH = 10;
+      const initialResp = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...baseBody, batch_size: BATCH }),
+      });
+      if (!initialResp.ok) {
+        const txt = await initialResp.text();
+        throw new Error(`HTTP ${initialResp.status}: ${txt.slice(0, 200)}`);
+      }
+      const initialData = (await initialResp.json()) as {
+        fixed: number;
+        skipped: number;
+        errors: { task_id: string; reason: string }[];
+        remaining: number;
+        done: boolean;
+        candidate_task_ids: string[] | null;
+      };
+      totalFixed += initialData.fixed;
+      totalSkipped += initialData.skipped;
+      totalErrors += initialData.errors?.length ?? 0;
+      const allCandidates = initialData.candidate_task_ids ?? [];
+      const serverTotal = allCandidates.length;
+      setRetroProgress((prev) => ({
+        ...prev,
+        [span]: { processed: initialData.fixed + initialData.errors.length, total: serverTotal },
+      }));
+      // Server already processed the first BATCH of the candidate list,
+      // so we skip those when iterating.
+      let cursor = initialData.fixed + initialData.errors.length;
+      while (cursor < allCandidates.length) {
+        const slice = allCandidates.slice(cursor, cursor + BATCH);
         const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ ...baseBody, task_ids: slice, batch_size: BATCH }),
         });
         if (!r.ok) {
           const txt = await r.text();
           throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
         }
         const data = (await r.json()) as {
-          fixed: number;
-          skipped: number;
+          fixed: number; skipped: number;
           errors: { task_id: string; reason: string }[];
-          remaining: number;
-          done: boolean;
         };
         totalFixed += data.fixed;
         totalSkipped += data.skipped;
         totalErrors += data.errors?.length ?? 0;
-        if (safety === 0) {
-          serverTotal = data.fixed + data.errors.length + data.remaining;
-        }
-        const processed = serverTotal - data.remaining;
+        cursor += slice.length;
         setRetroProgress((prev) => ({
           ...prev,
-          [span]: { processed, total: serverTotal },
+          [span]: { processed: cursor, total: serverTotal },
         }));
-        if (data.done) break;
       }
       setRetroResult((prev) => ({
         ...prev,
@@ -461,8 +485,6 @@ function DeviationsTable({
       }));
       onAfterFix();
     } catch (e) {
-      // Surface via per-span pseudo-status; map onto every row sharing
-      // this span via the rowStatus map.
       const msg = e instanceof Error ? e.message : String(e);
       setRowStatus((s) => {
         const next = { ...s };
@@ -893,8 +915,12 @@ function ContestedTable({
     });
   }
 
-  // Poll the retroactive-fix endpoint with batch_size=25 until done.
-  // Updates retroProgress per poll so the UI can render a progress bar.
+  // Two-phase sweep: first call scans + processes one batch and returns
+  // the full candidate list; subsequent calls pass slices of that list
+  // back so the server skips the O(N_accepted_tasks) scan. Otherwise
+  // every poll re-reads every ACCEPTED task's latest annotation, which
+  // adds 30-60s of overhead per poll on a project with thousands of
+  // accepted tasks.
   async function runRetroactiveSweep(span: string, type: string, expectedTotal: number) {
     setSubmitting(span);
     setError(null);
@@ -902,46 +928,65 @@ function ContestedTable({
     let totalFixed = 0;
     let totalSkipped = 0;
     let totalErrors = 0;
-    let serverTotal = expectedTotal;  // updated on first response
     try {
       const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
-      const body = {
+      const baseBody = {
         project_id: projectId,
         span,
         entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
         actor: "posterior_audit_retroactive_ui",
-        batch_size: 25,
       };
-      for (let safety = 0; safety < 1000; safety++) {
+      const BATCH = 10;
+      const initialResp = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...baseBody, batch_size: BATCH }),
+      });
+      if (!initialResp.ok) {
+        const txt = await initialResp.text();
+        throw new Error(`HTTP ${initialResp.status}: ${txt.slice(0, 200)}`);
+      }
+      const initialData = (await initialResp.json()) as {
+        fixed: number;
+        skipped: number;
+        errors: { task_id: string; reason: string }[];
+        remaining: number;
+        done: boolean;
+        candidate_task_ids: string[] | null;
+      };
+      totalFixed += initialData.fixed;
+      totalSkipped += initialData.skipped;
+      totalErrors += initialData.errors?.length ?? 0;
+      const allCandidates = initialData.candidate_task_ids ?? [];
+      const serverTotal = allCandidates.length;
+      setRetroProgress((prev) => ({
+        ...prev,
+        [span]: { processed: initialData.fixed + initialData.errors.length, total: serverTotal },
+      }));
+      let cursor = initialData.fixed + initialData.errors.length;
+      while (cursor < allCandidates.length) {
+        const slice = allCandidates.slice(cursor, cursor + BATCH);
         const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ ...baseBody, task_ids: slice, batch_size: BATCH }),
         });
         if (!r.ok) {
           const txt = await r.text();
           throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
         }
         const data = (await r.json()) as {
-          fixed: number;
-          skipped: number;
+          fixed: number; skipped: number;
           errors: { task_id: string; reason: string }[];
-          remaining: number;
-          done: boolean;
         };
         totalFixed += data.fixed;
         totalSkipped += data.skipped;
         totalErrors += data.errors?.length ?? 0;
-        // First poll reveals the actual total = processed_in_batch + remaining.
-        if (safety === 0) {
-          serverTotal = data.fixed + data.errors.length + data.remaining;
-        }
-        const processed = serverTotal - data.remaining;
+        cursor += slice.length;
         setRetroProgress((prev) => ({
           ...prev,
-          [span]: { processed, total: serverTotal },
+          [span]: { processed: cursor, total: serverTotal },
         }));
-        if (data.done) break;
       }
       setCommitted((prev) => ({ ...prev, [span]: type }));
       setPicked((prev) => ({ ...prev, [span]: null }));
@@ -954,7 +999,6 @@ function ContestedTable({
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(null);
-      // Clear progress so the cell renders the final summary on next render.
       setRetroProgress((prev) => {
         const next = { ...prev };
         delete next[span];

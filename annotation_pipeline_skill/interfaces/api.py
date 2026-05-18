@@ -1155,23 +1155,33 @@ class DashboardApi:
 
         Body: {
           "project_id", "span", "entity_type", "actor",
-          "batch_size": int | null  # optional, when set, processes at most
-                                    # this many matching tasks per call.
-                                    # The caller polls with the same body
-                                    # until "remaining" reaches 0.
+          "batch_size": int | null,
+          "task_ids": list[str] | null  # optional. When set, skip the
+                                        # candidate scan and process ONLY
+                                        # these specific task_ids (each
+                                        # still checked for whether the
+                                        # span is currently tagged as a
+                                        # different type — idempotent).
+                                        # When null, scan the whole project.
         }
+
+        First call (no task_ids): server scans the project, returns the
+        full candidate list in `candidate_task_ids`. Caller stores that
+        and on subsequent polls passes a slice of N (matching
+        `batch_size`) so the server skips the O(N_accepted_tasks) scan.
 
         `entity_type` may be the sentinel "not_an_entity" (or null), in
         which case matching tasks have the span removed entirely.
 
         Returns: {
           convention,
-          fixed: int,       # tasks fixed in THIS call
-          skipped: int,     # tasks skipped in THIS call
+          fixed: int,
+          skipped: int,
           errors: [{task_id, reason}],
-          remaining: int,   # tasks still tagged with non-target type AFTER
-                            # this call — caller polls again if > 0
-          done: bool,       # remaining == 0 (terminal call)
+          remaining: int,                  # only meaningful in scan mode
+          candidate_task_ids: list[str]    # full candidate list, scan-mode only
+              | null,
+          done: bool,
         }
         record_decision is idempotent on identical (source, type), so
         multiple polls don't inflate the convention's evidence_count.
@@ -1203,6 +1213,12 @@ class DashboardApi:
             batch_size = None
         if batch_size is not None and batch_size < 1:
             batch_size = None
+        task_ids_raw = payload.get("task_ids")
+        explicit_task_ids: list[str] | None
+        if isinstance(task_ids_raw, list) and task_ids_raw:
+            explicit_task_ids = [str(t) for t in task_ids_raw if isinstance(t, str)]
+        else:
+            explicit_task_ids = None
         if not project_id or not span:
             return self._json_response(400, {"error": "project_and_span_required"})
         if entity_type_raw is None:
@@ -1236,40 +1252,72 @@ class DashboardApi:
                 400, {"error": "convention_failed", "detail": str(exc)},
             )
 
-        # Walk ACCEPTED tasks; find ones where the span is tagged with a
-        # type different from the target. iter_span_decisions reads the
-        # latest annotation (preferring human_review_answer over
-        # annotation_result, same as build_posterior_audit's _load_annotation).
         hr = HumanReviewService(store)
         span_lower = span.lower()
-        # Pre-scan: collect all matching candidates first so we can split
-        # the work across multiple polls and report `remaining` to the
-        # caller. The scan itself is cheap (file reads of latest
-        # annotation per task); the expensive part is apply_posterior_fix.
-        candidates: list[tuple[str, str, str]] = []  # (task_id, current_span_form, current_type)
+        # Two modes:
+        # 1. Scan mode (no task_ids in body): walk the project, return
+        #    candidate_task_ids so the caller can iterate.
+        # 2. Process mode (task_ids in body): trust the caller's list,
+        #    skip the O(N_accepted) scan. Each task is still validated
+        #    individually (idempotent — already-fixed tasks are skipped).
+        candidate_task_ids: list[str] | None = None
+        candidates: list[tuple[str, str, str]] = []  # (task_id, span_form, current_type)
         skipped = 0
-        for task in store.list_tasks_by_pipeline(project_id):
-            if task.status is not TaskStatus.ACCEPTED:
-                continue
-            ann = hr._latest_annotation_payload(task.task_id)
-            if not isinstance(ann, dict):
-                skipped += 1
-                continue
-            current_type: str | None = None
-            current_span_form: str | None = None
-            for s, t in iter_span_decisions(ann):
-                if s.lower() == span_lower:
-                    current_type = t
-                    current_span_form = s
-                    break
-            if current_type is None or current_type == entity_type_str:
-                # Span absent or already matches target — nothing to fix.
-                skipped += 1
-                continue
-            candidates.append((task.task_id, current_span_form or span, current_type))
+        if explicit_task_ids is not None:
+            for tid in explicit_task_ids:
+                try:
+                    task = store.load_task(tid)
+                except (FileNotFoundError, KeyError):
+                    skipped += 1
+                    continue
+                if task.status is not TaskStatus.ACCEPTED:
+                    skipped += 1
+                    continue
+                ann = hr._latest_annotation_payload(tid)
+                if not isinstance(ann, dict):
+                    skipped += 1
+                    continue
+                current_type: str | None = None
+                current_span_form: str | None = None
+                for s, t in iter_span_decisions(ann):
+                    if s.lower() == span_lower:
+                        current_type = t
+                        current_span_form = s
+                        break
+                if current_type is None or current_type == entity_type_str:
+                    skipped += 1
+                    continue
+                candidates.append((tid, current_span_form or span, current_type))
+        else:
+            # Full scan. Pre-filter via SQL LIKE on source_ref_json so we
+            # only read annotations for tasks whose input could possibly
+            # contain the span. Match both raw + JSON-Unicode-escaped
+            # form (Chinese / Japanese / Korean spans are stored escaped).
+            span_lower_json = json.dumps(span_lower, ensure_ascii=True)[1:-1]
+            prefilter_rows = store._conn.execute(
+                "SELECT task_id FROM tasks "
+                "WHERE pipeline_id=? AND status='accepted' "
+                "AND (lower(source_ref_json) LIKE ? OR lower(source_ref_json) LIKE ?)",
+                (project_id, f"%{span_lower}%", f"%{span_lower_json}%"),
+            ).fetchall()
+            prefiltered_ids = [r["task_id"] for r in prefilter_rows]
+            for tid in prefiltered_ids:
+                ann = hr._latest_annotation_payload(tid)
+                if not isinstance(ann, dict):
+                    continue
+                current_type = None
+                current_span_form = None
+                for s, t in iter_span_decisions(ann):
+                    if s.lower() == span_lower:
+                        current_type = t
+                        current_span_form = s
+                        break
+                if current_type is None or current_type == entity_type_str:
+                    continue
+                candidates.append((tid, current_span_form or span, current_type))
+            candidate_task_ids = [c[0] for c in candidates]
 
-        # When batch_size is set, only process that many this call; the
-        # rest is reported back as `remaining` so the caller can poll.
+        # Process the requested batch.
         if batch_size is not None:
             to_process = candidates[:batch_size]
         else:
@@ -1289,6 +1337,10 @@ class DashboardApi:
                 fixed += 1
             except Exception as exc:  # noqa: BLE001
                 errors.append({"task_id": task_id, "reason": str(exc)})
+        # In scan mode, `remaining` reflects the global remainder. In
+        # explicit-task_ids mode the caller knows the global picture
+        # already, so `remaining` is just "what we couldn't process in
+        # this call" — typically 0 since batch_size = len(task_ids).
         remaining = max(0, len(candidates) - len(to_process))
 
         # Cache surgery: drop deviations / contested entries this fix
@@ -1333,6 +1385,7 @@ class DashboardApi:
             "errors": errors,
             "remaining": remaining,
             "done": remaining == 0,
+            "candidate_task_ids": candidate_task_ids,
         })
 
     def _post_human_review_response(self, store: SqliteStore, task_id: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
