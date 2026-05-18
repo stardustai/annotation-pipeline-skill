@@ -314,6 +314,7 @@ export type ContestedSpan = {
   prior_distribution: Record<string, number>;
   top_share: number;
   runner_up_share: number;
+  resolved_convention_type?: string;
 };
 
 export type PosteriorAudit = {

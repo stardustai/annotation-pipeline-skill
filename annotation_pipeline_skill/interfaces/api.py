@@ -123,14 +123,17 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
                 "prior_total": r.total,
             })
 
-    # Filter contested spans the same way: skip any with an explicit
-    # operator-declared convention (any type, including not_an_entity).
-    # The operator has already made the policy call.
+    # Annotate (don't filter) contested spans with an explicit
+    # operator-declared convention. The operator wants to keep them
+    # visible after Set Convention so the change is observable; the UI
+    # renders a "✓ set convention: <type>" badge when this field is set.
     contested_all = svc.contested_spans(project_id=project_id)
-    contested = [
-        c for c in contested_all
-        if c.get("span", "").lower() not in convention_index
-    ]
+    contested = []
+    for c in contested_all:
+        conv_type = convention_index.get(c.get("span", "").lower())
+        if conv_type is not None:
+            c = {**c, "resolved_convention_type": conv_type}
+        contested.append(c)
     return {
         "task_deviations": deviations,
         "contested_spans": contested,
@@ -146,18 +149,26 @@ def find_typical_text_for_span(
     exclude_keys: list[str] | None = None,
     task_id_filter: str | None = None,
 ) -> dict | None:
-    """Return one random ACCEPTED task whose source-ref input rows contain
-    the span. Cheap LIKE prefilter on ``source_ref_json`` then JSON parse +
-    case-insensitive contains check on each row. Returns ``None`` if no
-    match. Result shape:
-        {"task_id": str, "row_index": int, "text": str}
+    """Return one random ACCEPTED task whose *annotation* tags this exact span
+    as an entity or json_structures phrase. Returns the row's input.text so
+    the UI can render context with the span highlighted.
 
-    ``task_id_filter`` constrains the scan to a single ACCEPTED task — used
-    by Task deviations to show context from THE task in question rather
-    than any task containing the span. ``exclude_keys`` is for cycling
-    through matches within a single task; each key is ``"task_id:row_index"``.
+    The earlier substring-in-input search was wrong for short spans — `"app"`
+    would surface text containing "applications" / "applies" / "happen",
+    none of which were annotated as the entity. By matching on the
+    annotation output instead, we only show samples where the span was
+    actually tagged.
+
+    Strategy: cheap source_ref LIKE prefilter (the span must appear
+    somewhere in the input text for it to ever be tagged) → load that
+    task's annotation_result → look for the EXACT span string in any
+    row's entities/json_structures lists → return the corresponding
+    row's input.text.
+
+    Result shape: ``{"task_id": str, "row_index": int, "text": str}`` or None.
     """
     import random
+    import re as _re
     span_lower = span.lower()
     if task_id_filter:
         rows = store._conn.execute(
@@ -176,6 +187,53 @@ def find_typical_text_for_span(
     excluded = set(exclude_task_ids or [])
     excluded_keys = set(exclude_keys or [])
     candidates: list[dict] = []
+
+    # Local import to keep module import cycle small.
+    from annotation_pipeline_skill.runtime.subagent_cycle import _parse_llm_json
+
+    def _load_annotation(task_id: str) -> dict | None:
+        arts = store.list_artifacts(task_id)
+        hr = [a for a in arts if a.kind == "human_review_answer"]
+        if hr:
+            try:
+                outer = json.loads((store.root / hr[-1].path).read_text(encoding="utf-8"))
+                return outer.get("answer") if isinstance(outer, dict) else None
+            except (json.JSONDecodeError, OSError):
+                return None
+        anns = [a for a in arts if a.kind == "annotation_result"]
+        if not anns:
+            return None
+        try:
+            outer = json.loads((store.root / anns[-1].path).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        text = outer.get("text") if isinstance(outer, dict) else None
+        if not isinstance(text, str):
+            return None
+        text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL | _re.IGNORECASE).strip()
+        try:
+            return _parse_llm_json(text)
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    def _row_has_span_in_annotation(ann_row: dict, span_lc: str) -> bool:
+        """True if ann_row.output.entities[*] OR json_structures[*] contains
+        the span (case-insensitive exact match)."""
+        output = ann_row.get("output") if isinstance(ann_row, dict) else None
+        if not isinstance(output, dict):
+            return False
+        for key in ("entities", "json_structures"):
+            container = output.get(key)
+            if not isinstance(container, dict):
+                continue
+            for _type, items in container.items():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, str) and item.lower() == span_lc:
+                        return True
+        return False
+
     for r in rows:
         if r["task_id"] in excluded:
             continue
@@ -189,6 +247,19 @@ def find_typical_text_for_span(
         input_rows = payload.get("rows")
         if not isinstance(input_rows, list):
             continue
+        ann = _load_annotation(r["task_id"])
+        if not isinstance(ann, dict):
+            continue
+        ann_rows = ann.get("rows")
+        if not isinstance(ann_rows, list):
+            continue
+        # Index annotation rows by row_index for join with input rows.
+        ann_by_idx: dict[int, dict] = {}
+        for i, ar in enumerate(ann_rows):
+            if not isinstance(ar, dict):
+                continue
+            idx = ar.get("row_index") if isinstance(ar.get("row_index"), int) else i
+            ann_by_idx[idx] = ar
         for ir in input_rows:
             if not isinstance(ir, dict):
                 continue
@@ -197,21 +268,20 @@ def find_typical_text_for_span(
                 text = text.get("text")
             if not isinstance(text, str):
                 continue
-            if span_lower in text.lower():
-                row_index = ir.get("row_index", 0)
-                key = f"{r['task_id']}:{row_index}"
-                if key in excluded_keys:
-                    continue
-                candidates.append({
-                    "task_id": r["task_id"],
-                    "row_index": row_index,
-                    "text": text,
-                })
-                # We want diversity, so don't stop at the first match per
-                # task — but cap total candidates so a popular span like
-                # "google" doesn't materialize 1000s of rows.
-                if len(candidates) >= 200:
-                    break
+            row_index = ir.get("row_index", 0) if isinstance(ir.get("row_index"), int) else 0
+            ann_row = ann_by_idx.get(row_index)
+            if not ann_row or not _row_has_span_in_annotation(ann_row, span_lower):
+                continue
+            key = f"{r['task_id']}:{row_index}"
+            if key in excluded_keys:
+                continue
+            candidates.append({
+                "task_id": r["task_id"],
+                "row_index": row_index,
+                "text": text,
+            })
+            if len(candidates) >= 200:
+                break
         if len(candidates) >= 200:
             break
     if not candidates:
@@ -685,6 +755,28 @@ class DashboardApi:
             )
         except (ValueError, TypeError) as exc:
             return self._json_response(400, {"error": str(exc)})
+        # Stamp this span's `resolved_convention_type` on the cached
+        # Posterior Audit `contested_spans` so a refresh after Set
+        # Convention shows the badge inline (UI annotates the row instead
+        # of hiding it — operator wants to observe the change).
+        cached = read_posterior_audit_cache(store, project_id=pid)
+        if cached is not None:
+            payload_in_cache = cached["payload"]
+            span_lower = span.strip().lower()
+            contested = payload_in_cache.get("contested_spans", [])
+            mutated = False
+            for c in contested:
+                if c.get("span", "").lower() == span_lower:
+                    c["resolved_convention_type"] = entity_type
+                    mutated = True
+            if mutated:
+                write_posterior_audit_cache(
+                    store,
+                    project_id=pid,
+                    payload=payload_in_cache,
+                    accepted_hash=cached["accepted_hash"],
+                    created_at=cached["created_at"],
+                )
         return self._json_response(200, conv.to_dict())
 
     def _post_convention_resolve_response(self, store: SqliteStore, convention_id: str, body: dict) -> tuple:

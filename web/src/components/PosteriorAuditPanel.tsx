@@ -626,7 +626,7 @@ function ContestedTable({
           <tbody>
             {visible.map((c) => {
               const pickedType = picked[c.span] ?? null;
-              const committedType = committed[c.span];
+              const committedType = committed[c.span] ?? c.resolved_convention_type;
               const isSubmitting = submitting === c.span;
               // Top-3 from observed distribution + canonical fallbacks.
               const distEntries = Object.entries(c.prior_distribution).sort((a, b) => b[1] - a[1]);
