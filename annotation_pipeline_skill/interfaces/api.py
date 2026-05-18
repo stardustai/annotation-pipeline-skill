@@ -571,12 +571,18 @@ class DashboardApi:
             current_type = payload.get("current_type")
             new_type = payload.get("new_type")  # may be None or "not_an_entity" for delete
             actor = payload.get("actor") or "posterior_audit_operator"
+            # Default True (back-compat); the UI checkbox sends an explicit
+            # bool. When False, the fix patches this task only and is NOT
+            # promoted to a project-wide convention.
+            save_flag = payload.get("save_as_convention", True)
+            save_as_convention = bool(save_flag)
             if not span or not current_type:
                 return self._json_response(400, {"error": "span_and_current_type_required"})
             try:
                 result = HumanReviewService(store).apply_posterior_fix(
                     task_id=task_id, span=span, current_type=current_type,
                     new_type=new_type, actor=actor,
+                    save_as_convention=save_as_convention,
                 )
                 # Surgically update the Posterior Audit cache: remove the
                 # (task_id, span, current_type) deviations that this fix

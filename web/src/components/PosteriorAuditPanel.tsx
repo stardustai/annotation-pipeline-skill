@@ -300,6 +300,10 @@ function DeviationsTable({
   const [picked, setPicked] = useState<Record<string, string | null>>({});
   // Per-row status: "submitting" | "submitted" | "error: ..." | undefined
   const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
+  // Per-row "Save as project convention" checkbox — default ON; when off
+  // the fix patches this task only and doesn't promote to a project rule.
+  const [saveConv, setSaveConv] = useState<Record<string, boolean>>({});
+  const getSaveConv = (key: string) => saveConv[key] ?? true;
 
   // Dedupe: backend may emit multiple rows for the same (task, span) when
   // the span occurs in multiple input rows of one task. The operator's
@@ -338,6 +342,7 @@ function DeviationsTable({
         current_type: d.current_type,
         new_type: newType, // null or "not_an_entity" = delete from entities
         actor: "posterior_audit_submit",
+        save_as_convention: getSaveConv(rowKey),
       });
       const r = await fetch(`/api/tasks/${encodeURIComponent(d.task_id)}/posterior-fix${storeQ}`, {
         method: "POST",
@@ -471,7 +476,7 @@ function DeviationsTable({
                           }
                           title={
                             sel
-                              ? `Apply ${sel} as the corrected type for this task's span (operator-authored, HR weight 5×)`
+                              ? `Apply ${sel} as the corrected type for this task's span (operator-authored, HR weight 5×)${getSaveConv(rowKey) ? "; also saved as project convention" : "; one-off fix, NOT saved as convention"}`
                               : "Pick a type first"
                           }
                           style={{
@@ -492,6 +497,31 @@ function DeviationsTable({
                         >
                           Send to HR
                         </button>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            marginLeft: "0.6rem",
+                            fontSize: "0.75rem",
+                            color: "#4a5660",
+                            cursor: "pointer",
+                            userSelect: "none",
+                          }}
+                          title="When checked, the pick is saved as a project-wide convention. Uncheck for a one-off task fix."
+                        >
+                          <input
+                            type="checkbox"
+                            checked={getSaveConv(rowKey)}
+                            disabled={isSubmitting}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setSaveConv((s) => ({ ...s, [rowKey]: checked }));
+                            }}
+                            style={{ margin: 0, cursor: "pointer" }}
+                          />
+                          <span>Save as convention</span>
+                        </label>
                       </>
                     )}
                     {err ? (

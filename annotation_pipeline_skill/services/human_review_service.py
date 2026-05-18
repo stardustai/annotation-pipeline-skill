@@ -237,6 +237,7 @@ class HumanReviewService:
         actor: str,
         note: str | None,
         force: bool = False,
+        record_conventions: bool = True,
     ) -> HumanCorrectionResult:
         task = self.store.load_task(task_id)
         if task.status is not TaskStatus.HUMAN_REVIEW:
@@ -336,7 +337,10 @@ class HumanReviewService:
         # Auto-record entity conventions for any entity-type changes the
         # operator made vs the latest annotation. Captured per-project so
         # future tasks in the same project benefit from the human's call.
-        self._record_conventions_from_correction(task, answer, actor)
+        # Callers that want a one-off task fix without promoting it to a
+        # project rule pass record_conventions=False.
+        if record_conventions:
+            self._record_conventions_from_correction(task, answer, actor)
         # Update stats with HR weight (5x) — done for all submissions,
         # including force-overridden ones.
         self._increment_stats_from_hr(task, answer)
@@ -444,6 +448,7 @@ class HumanReviewService:
         current_type: str,
         new_type: str | None,
         actor: str,
+        save_as_convention: bool = True,
     ) -> dict:
         """Operator-level in-place correction triggered from Posterior Audit.
 
@@ -499,7 +504,11 @@ class HumanReviewService:
         self.store.save_task(task)
         self.store.append_event(event)
 
-        # Record the explicit convention BEFORE submit_correction.
+        # Record the explicit convention BEFORE submit_correction —
+        # but only when the operator opted in (save_as_convention=True).
+        # When False, this is a one-off task fix: patch the annotation
+        # without promoting the operator's call to a project-wide rule.
+        #
         # submit_correction has its own convention-recording pass but it
         # only fires on diffs between prior and answer — when the operator
         # confirms the current type (new_type == current_type), the answer
@@ -513,29 +522,30 @@ class HumanReviewService:
         # — it doesn't reactivate. The operator's explicit posterior-audit
         # declaration should be the tiebreaker, so we force-clear any
         # existing dispute to the operator's pick.
-        decided_type = new_type or "not_an_entity"
-        try:
-            from annotation_pipeline_skill.services.entity_convention_service import (
-                EntityConventionService,
-            )
-            conv_svc = EntityConventionService(self.store)
-            conv = conv_svc.record_decision(
-                project_id=task.pipeline_id,
-                span=span,
-                entity_type=decided_type,
-                source="posterior_audit_operator",
-                task_id=task_id,
-            )
-            if conv.status == "disputed":
-                # Operator's explicit declaration overrides prior dispute.
-                conv_svc.clear_dispute(
-                    convention_id=conv.convention_id,
-                    resolved_type=decided_type,
-                    actor=actor,
-                    notes="resolved by posterior audit operator declaration",
+        if save_as_convention:
+            decided_type = new_type or "not_an_entity"
+            try:
+                from annotation_pipeline_skill.services.entity_convention_service import (
+                    EntityConventionService,
                 )
-        except Exception:  # noqa: BLE001 — never let convention recording fail the fix
-            pass
+                conv_svc = EntityConventionService(self.store)
+                conv = conv_svc.record_decision(
+                    project_id=task.pipeline_id,
+                    span=span,
+                    entity_type=decided_type,
+                    source="posterior_audit_operator",
+                    task_id=task_id,
+                )
+                if conv.status == "disputed":
+                    # Operator's explicit declaration overrides prior dispute.
+                    conv_svc.clear_dispute(
+                        convention_id=conv.convention_id,
+                        resolved_type=decided_type,
+                        actor=actor,
+                        notes="resolved by posterior audit operator declaration",
+                    )
+            except Exception:  # noqa: BLE001 — never let convention recording fail the fix
+                pass
 
         try:
             self.submit_correction(
@@ -544,6 +554,7 @@ class HumanReviewService:
                 actor=actor,
                 note=f"posterior audit fix: '{span}' / {current_type} → {new_type or 'delete'}",
                 force=True,
+                record_conventions=save_as_convention,
             )
         except Exception:
             # Submit failed (schema / verbatim / etc). Roll the task back
