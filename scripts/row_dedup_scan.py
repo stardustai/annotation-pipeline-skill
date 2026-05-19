@@ -143,7 +143,7 @@ def main(argv: list[str]) -> int:
             project_id=project_id,
             members=c["members"],
             cluster_id=c["cluster_id"],
-            cluster_similarity=c["similarity"],
+            similarity=c["similarity"],
             profile_name=args.profile,
             model=profile.model,
         )
