@@ -255,29 +255,56 @@ export function DistributionPanel({
 
   return (
     <section className="runtime-panel distribution-panel" aria-label="Distribution">
-      {/* ── Header ─────────────────────────────────────────────────────── */}
-      <div
-        className="runtime-header"
-        style={{
-          borderLeft: cachedExists
-            ? stale
-              ? "3px solid var(--warning, #d97706)"
-              : "3px solid var(--success, #047857)"
-            : "3px solid var(--border, #d1d5db)",
-          paddingLeft: "0.75rem",
-          background: stale ? "#fff4e0" : undefined,
-        }}
-      >
-        <div>
-          <h2 style={{ marginBottom: "0.25rem" }}>Distribution</h2>
-        </div>
-        {/* Scatter-specific scan controls live in the panel header only when
-            the Scatter plot sub-tab is active. The Duplicates sub-tab has
-            its own independent control bar inside RowDuplicatesSubTab —
-            putting both at this level was the source of the duplicate
-            Profile/Scan UI that the operator complained about. */}
-        {subtab === "scatter" ? (
-          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
+      {error ? <div className="notice compact">{error}</div> : null}
+
+      {/* ── Sub-tab nav ──────────────────────────────────────────────── */}
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+        <nav className="view-tabs" aria-label="Distribution sections" style={{ margin: 0 }}>
+          <button
+            className={subtab === "duplicates" ? "view-tab selected" : "view-tab"}
+            type="button"
+            onClick={() => setSubtab("duplicates")}
+          >
+            Duplicates ({rowDedupClusterCount})
+          </button>
+          <button
+            className={subtab === "scatter" ? "view-tab selected" : "view-tab"}
+            type="button"
+            onClick={() => setSubtab("scatter")}
+          >
+            Scatter plot
+          </button>
+        </nav>
+      </div>
+
+      {/* ── Duplicates sub-tab (row-level) ──────────────────────────── */}
+      {subtab === "duplicates" ? (
+        <RowDuplicatesSubTab
+          projectId={projectId}
+          storeKey={storeKey}
+          onSelectTask={onSelectTask}
+          onClusterCountChange={setRowDedupClusterCount}
+        />
+      ) : null}
+
+      {/* ── Scatter plot sub-tab (controls + lazy plotly) ───────────── */}
+      {subtab === "scatter" ? (
+        <div style={{ marginTop: "0.75rem" }}>
+          {/* Scan controls live next to the plot for parallelism with the
+              Duplicates sub-tab, which manages its own control bar. */}
+          <div
+            style={{
+              display: "flex",
+              gap: "1rem",
+              alignItems: "center",
+              flexWrap: "wrap",
+              marginBottom: "0.75rem",
+              padding: "0.6rem 0.75rem",
+              background: "var(--surface2, #f8fafc)",
+              borderRadius: "6px",
+              border: "1px solid var(--border, #e5e7eb)",
+            }}
+          >
             <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
               Profile
               <select
@@ -303,11 +330,6 @@ export function DistributionPanel({
                 disabled={loading}
               />
             </label>
-            <span className="runtime-muted" style={{ fontSize: "0.78rem" }}>
-              {cachedExists
-                ? <>Last scan: {fmtTime(generatedAt)}{stale ? " (stale)" : ""}</>
-                : "no cached scan yet"}
-            </span>
             <button
               className="primary-button"
               type="button"
@@ -321,64 +343,49 @@ export function DistributionPanel({
             >
               {loading ? "Scanning…" : stale ? "Re-Scan (stale)" : cachedExists ? "Re-Scan" : "Scan"}
             </button>
+            {cachedExists ? (
+              <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
+                Last scan: {fmtTime(generatedAt)}
+                {stale ? (
+                  <span
+                    style={{
+                      marginLeft: "0.4rem",
+                      background: "var(--warning, #d97706)",
+                      color: "#fff",
+                      borderRadius: "3px",
+                      padding: "1px 5px",
+                      fontSize: "0.75rem",
+                      fontWeight: 600,
+                    }}
+                  >
+                    stale
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
           </div>
-        ) : null}
-      </div>
 
-      {error ? <div className="notice compact">{error}</div> : null}
-
-      {/* ── Sub-tab nav (always visible — each sub-tab owns its own cache) ── */}
-      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.5rem" }}>
-        <nav className="view-tabs" aria-label="Distribution sections" style={{ margin: 0 }}>
-          <button
-            className={subtab === "duplicates" ? "view-tab selected" : "view-tab"}
-            type="button"
-            onClick={() => setSubtab("duplicates")}
-          >
-            Duplicates ({rowDedupClusterCount})
-          </button>
-          <button
-            className={subtab === "scatter" ? "view-tab selected" : "view-tab"}
-            type="button"
-            onClick={() => setSubtab("scatter")}
-          >
-            Scatter plot
-          </button>
-        </nav>
-      </div>
-
-      {/* ── Duplicates sub-tab (row-level — task-level was retired) ─── */}
-      {subtab === "duplicates" ? (
-        <RowDuplicatesSubTab
-          projectId={projectId}
-          storeKey={storeKey}
-          onSelectTask={onSelectTask}
-          onClusterCountChange={setRowDedupClusterCount}
-        />
-      ) : null}
-
-      {/* ── Scatter plot sub-tab (lazy: plotly only loads on demand) ─── */}
-      {subtab === "scatter" ? (
-        cachedExists ? (
-          <Suspense
-            fallback={
-              <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
-                Loading scatter plot…
-              </div>
-            }
-          >
-            <ScatterSubTab
-              coords={payload?.coords ?? []}
-              onSelectTask={onSelectTask}
-            />
-          </Suspense>
-        ) : (
-          <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
-            {loading
-              ? "Loading…"
-              : <>No scan yet. Click <strong>Scan</strong> above to embed all tasks (UMAP + HDBSCAN, may take minutes the first time).</>}
-          </div>
-        )
+          {cachedExists ? (
+            <Suspense
+              fallback={
+                <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
+                  Loading scatter plot…
+                </div>
+              }
+            >
+              <ScatterSubTab
+                coords={payload?.coords ?? []}
+                onSelectTask={onSelectTask}
+              />
+            </Suspense>
+          ) : (
+            <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
+              {loading
+                ? "Loading…"
+                : <>No scan yet. Click <strong>Scan</strong> above to embed all tasks (UMAP + HDBSCAN, may take minutes the first time).</>}
+            </div>
+          )}
+        </div>
       ) : null}
     </section>
   );
@@ -678,8 +685,56 @@ function RowDuplicatesSubTab({
           {loading ? "Scanning…" : rowStale ? "Re-scan (stale)" : rowCached ? "Re-scan" : "Scan rows"}
         </button>
 
+        {/* ── Bulk actions: live next to Re-scan so the operator's scan +
+            select + mask flow stays on one row. Buttons are inert (disabled
+            + muted) when there's nothing to act on, so they're harmless
+            even before a scan exists. ─────────────────────────────────── */}
+        {clusters.length > 0 ? (
+          <>
+            <button
+              type="button"
+              onClick={handleSelectAll}
+              disabled={allSelectableRowKeys.length === 0}
+              style={{ fontSize: "0.8rem" }}
+              title="Select all non-representative rows in all clusters"
+            >
+              Select all ({allSelectableRowKeys.length})
+            </button>
+            <button
+              type="button"
+              onClick={handleClearAll}
+              disabled={selectedRowCount === 0}
+              style={{ fontSize: "0.8rem" }}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              disabled={selectedRowCount === 0 || applying}
+              onClick={handleMask}
+              style={{
+                fontSize: "0.85rem",
+                background:
+                  selectedRowCount > 0 && !applying
+                    ? "var(--danger, #b91c1c)"
+                    : undefined,
+                color: selectedRowCount > 0 && !applying ? "white" : undefined,
+                borderColor:
+                  selectedRowCount > 0 && !applying ? "var(--danger, #b91c1c)" : undefined,
+                opacity: selectedRowCount === 0 || applying ? 0.6 : 1,
+              }}
+            >
+              {applying
+                ? "Masking…"
+                : selectedRowCount > 0
+                  ? `Mask ${selectedRowCount} row${selectedRowCount !== 1 ? "s" : ""}`
+                  : "Mask"}
+            </button>
+          </>
+        ) : null}
+
         {rowCached ? (
-          <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
+          <span className="runtime-muted" style={{ fontSize: "0.8rem", marginLeft: "auto" }}>
             Last checked: {fmtTime(rowGeneratedAt)}
             {" · "}
             {rowCache?.payload?.row_count ?? 0} rows
@@ -724,67 +779,15 @@ function RowDuplicatesSubTab({
 
       {clusters.length > 0 ? (
         <>
-          {/* ── Selection summary + bulk actions ──────────────────────── */}
-          <div
-            style={{
-              display: "flex",
-              gap: "1rem",
-              alignItems: "center",
-              flexWrap: "wrap",
-              marginBottom: "0.75rem",
-              padding: "0.6rem 0.75rem",
-              background: "var(--surface2, #f8fafc)",
-              borderRadius: "6px",
-              border: "1px solid var(--border, #e5e7eb)",
-            }}
-          >
-            <span style={{ fontSize: "0.85rem" }}>
-              {selectedRowCount > 0 ? (
-                <>
-                  <strong>{selectedRowCount}</strong> row{selectedRowCount !== 1 ? "s" : ""} across{" "}
-                  <strong>{selectedClusterCount}</strong> cluster{selectedClusterCount !== 1 ? "s" : ""} selected
-                </>
-              ) : (
-                <span className="runtime-muted">No rows selected — check boxes below to select duplicates to mask</span>
-              )}
-            </span>
-            <div style={{ display: "flex", gap: "0.4rem", marginLeft: "auto" }}>
-              <button
-                type="button"
-                onClick={handleSelectAll}
-                disabled={allSelectableRowKeys.length === 0}
-                style={{ fontSize: "0.8rem" }}
-                title="Select all non-representative rows in all clusters"
-              >
-                Select all ({allSelectableRowKeys.length})
-              </button>
-              <button
-                type="button"
-                onClick={handleClearAll}
-                disabled={selectedRowCount === 0}
-                style={{ fontSize: "0.8rem" }}
-              >
-                Clear
-              </button>
+          {/* Selection summary line (only shown when there's something selected;
+              empty state is silent now). Bulk action buttons live in the scan
+              bar above so the whole control row is on one line. */}
+          {selectedRowCount > 0 ? (
+            <div style={{ fontSize: "0.85rem", marginBottom: "0.5rem" }}>
+              <strong>{selectedRowCount}</strong> row{selectedRowCount !== 1 ? "s" : ""} across{" "}
+              <strong>{selectedClusterCount}</strong> cluster{selectedClusterCount !== 1 ? "s" : ""} selected
             </div>
-            <button
-              type="button"
-              disabled={selectedRowCount === 0 || applying}
-              onClick={handleMask}
-              style={{
-                fontSize: "0.85rem",
-                background:
-                  selectedRowCount > 0 && !applying
-                    ? "var(--danger, #b91c1c)"
-                    : undefined,
-                color: selectedRowCount > 0 && !applying ? "white" : undefined,
-                borderColor: selectedRowCount > 0 && !applying ? "var(--danger, #b91c1c)" : undefined,
-                opacity: selectedRowCount === 0 || applying ? 0.6 : 1,
-              }}
-            >
-              {applying ? "Masking…" : `Mask ${selectedRowCount > 0 ? selectedRowCount + " row" + (selectedRowCount !== 1 ? "s" : "") : ""}`}
-            </button>
-          </div>
+          ) : null}
 
           {/* ── Cluster cards ─────────────────────────────────────────── */}
           <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
