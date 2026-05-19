@@ -221,12 +221,11 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
             entry = {**entry, "resolved_convention_type": conv_type}
         divergent_entries.append(entry)
 
-    # low_info_entries: divergent spans with no active convention and high wordfreq
+    # low_info_entries: ALL divergent spans with high wordfreq, regardless of
+    # whether they have an active convention.
     LOW_INFO_THRESHOLD = 4.0
     low_info_entries = []
     for entry in divergent_entries:
-        if entry.get("resolved_convention_type"):
-            continue
         wf = _wordfreq_score(entry["span"])
         if wf >= LOW_INFO_THRESHOLD:
             low_info_entries.append({
