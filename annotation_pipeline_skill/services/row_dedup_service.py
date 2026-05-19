@@ -314,7 +314,7 @@ class RowDedupService:
                         preview = ""
                         for t2, i2, txt2 in triplets:
                             if t2 == m_tid and i2 == m_idx:
-                                preview = txt2[:120]
+                                preview = txt2[:240]
                                 break
                         members.append({
                             "task_id": m_tid,
@@ -361,7 +361,7 @@ class RowDedupService:
                             members.append({
                                 "task_id": tid,
                                 "row_index": idx,
-                                "text_preview": text[:120],
+                                "text_preview": text[:240],
                             })
                             component_vecs.append(all_vecs[pos])
 

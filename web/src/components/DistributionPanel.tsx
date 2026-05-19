@@ -900,9 +900,16 @@ function RowDuplicatesSubTab({
                               {member.task_id}:{member.row_index}
                             </code>
                             {member.text_preview ? (
-                              <span className="runtime-muted" style={{ marginLeft: "0.4rem" }}>
-                                — {member.text_preview.slice(0, 80)}
-                                {member.text_preview.length > 80 ? "…" : ""}
+                              <span
+                                className="runtime-muted"
+                                style={{
+                                  marginLeft: "0.4rem",
+                                  whiteSpace: "normal",
+                                  lineHeight: 1.45,
+                                }}
+                              >
+                                — {member.text_preview.slice(0, 200)}
+                                {member.text_preview.length > 200 ? "…" : ""}
                               </span>
                             ) : null}
                           </button>

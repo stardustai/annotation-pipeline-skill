@@ -285,7 +285,7 @@ class DistributionService:
                 "y": coords_xy[i][1] if coords_xy else 0.0,
                 "status": task_statuses[i],
                 "cluster_id": f"emb-{lbl}" if lbl != -1 else None,
-                "text_preview": texts[i][:120],
+                "text_preview": texts[i][:240],
             })
 
         payload: dict[str, Any] = {
