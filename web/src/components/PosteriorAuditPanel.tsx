@@ -1683,30 +1683,31 @@ function LowInfoTable({
 
   return (
     <>
-      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.4rem 0", fontSize: "0.8rem" }}>
-        <span style={{ color: "var(--muted, #6b7280)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.4rem 0" }}>
+        <button
+          type="button"
+          disabled={selected.size === 0 || bulkRunning}
+          onClick={applyBulk}
+          style={{
+            fontSize: "0.85rem",
+            background: selected.size > 0 ? "var(--danger, #b91c1c)" : undefined,
+            color: selected.size > 0 ? "white" : undefined,
+            padding: "3px 12px",
+            borderRadius: "4px",
+            cursor: selected.size === 0 || bulkRunning ? "default" : "pointer",
+            opacity: selected.size === 0 || bulkRunning ? 0.5 : 1,
+          }}
+        >
+          {bulkRunning
+            ? "Applying…"
+            : selected.size > 0
+              ? `Batch set "Not an entity" (${selected.size})`
+              : `Batch set "Not an entity"`}
+        </button>
+        <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
           {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
           {selected.size > 0 ? ` · ${selected.size} selected` : ""}
         </span>
-        {selected.size > 0 ? (
-          <button
-            type="button"
-            disabled={bulkRunning}
-            onClick={applyBulk}
-            style={{
-              fontSize: "0.8rem",
-              background: "var(--danger, #b91c1c)",
-              color: "white",
-              border: "none",
-              padding: "2px 10px",
-              borderRadius: "4px",
-              cursor: bulkRunning ? "wait" : "pointer",
-              opacity: bulkRunning ? 0.7 : 1,
-            }}
-          >
-            {bulkRunning ? "Applying…" : `Set not_an_entity for selected (${selected.size})`}
-          </button>
-        ) : null}
       </div>
       {error ? <div className="notice compact">{error}</div> : null}
       <Pagination
