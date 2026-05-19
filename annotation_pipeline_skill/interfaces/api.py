@@ -1316,9 +1316,6 @@ class DashboardApi:
                         for c in payload_in_cache.get("divergent_entries", []):
                             if c.get("span", "").lower() == span_lower:
                                 c["resolved_convention_type"] = decided_type
-                        low_info = payload_in_cache.get("low_info_entries", [])
-                        kept_low_info = [c for c in low_info if (c.get("span") or "").lower() != span_lower]
-                        payload_in_cache["low_info_entries"] = kept_low_info
                     new_hash = compute_accepted_hash(store, project_id=project_for_cache)
                     from annotation_pipeline_skill.core.models import utc_now as _utc_now
                     write_posterior_audit_cache(
@@ -1389,15 +1386,8 @@ class DashboardApi:
                                "resolved_convention_type" in c:
                                 c.pop("resolved_convention_type", None)
                                 changed = True
-                        low_info = cache_payload.get("low_info_entries", [])
-                        for c in low_info:
-                            if (c.get("span") or "").lower() == span_lower and \
-                               "resolved_convention_type" in c:
-                                c.pop("resolved_convention_type", None)
-                                changed = True
                         if changed:
                             cache_payload["divergent_entries"] = divergent
-                            cache_payload["low_info_entries"] = low_info
                             write_posterior_audit_cache(
                                 store, project_id=pid, payload=cache_payload,
                                 accepted_hash=cached["accepted_hash"],
@@ -1447,11 +1437,6 @@ class DashboardApi:
                 if c.get("span", "").lower() == span_lower:
                     c["resolved_convention_type"] = entity_type
                     mutated = True
-            low_info = payload_in_cache.get("low_info_entries", [])
-            kept_low_info = [c for c in low_info if (c.get("span") or "").lower() != span_lower]
-            if len(kept_low_info) != len(low_info):
-                payload_in_cache["low_info_entries"] = kept_low_info
-                mutated = True
             if mutated:
                 write_posterior_audit_cache(
                     store,
