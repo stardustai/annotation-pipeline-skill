@@ -26,6 +26,7 @@ from annotation_pipeline_skill.services.entity_statistics_service import (
     EntityStatisticsService,
     iter_span_decisions,
 )
+from annotation_pipeline_skill.services.row_mask_service import RowMaskService
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 
@@ -71,8 +72,13 @@ def main(argv: list[str]) -> int:
 
     store = SqliteStore.open(args.workspace_root)
     svc = EntityStatisticsService(store)
+    mask_svc = RowMaskService(store)
     tasks = list(store.list_tasks_by_status({TaskStatus.ACCEPTED}))
     print(f"scanning {len(tasks)} ACCEPTED tasks...", file=sys.stderr)
+
+    # Bulk-load all row masks upfront to avoid N+1 queries.
+    task_ids = [t.task_id for t in tasks]
+    masked_by_task = mask_svc.masked_indices_by_task(task_ids)
 
     incremented = 0
     skipped_no_artifact = 0
@@ -87,7 +93,8 @@ def main(argv: list[str]) -> int:
             skipped_parse_fail += 1
             continue
         weight = HR_WEIGHT if is_hr else 1
-        for span, entity_type in iter_span_decisions(payload):
+        masked_indices = masked_by_task.get(task.task_id) or set()
+        for span, entity_type in iter_span_decisions(payload, masked_indices=masked_indices):
             svc.increment(
                 project_id=task.pipeline_id,
                 span=span,

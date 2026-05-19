@@ -273,7 +273,11 @@ class EntityStatisticsService:
         return out
 
 
-def iter_span_decisions(payload: Any) -> "list[tuple[str, str]]":
+def iter_span_decisions(
+    payload: Any,
+    *,
+    masked_indices: "set[int] | None" = None,
+) -> "list[tuple[str, str]]":
     """Yield (span, type) pairs from an annotation payload.
 
     Walks BOTH ``rows[*].output.entities[type] = [span, ...]`` AND
@@ -291,7 +295,19 @@ def iter_span_decisions(payload: Any) -> "list[tuple[str, str]]":
     cross-field violation.
 
     Skips non-string spans, empty spans, and non-conforming structures.
+
+    Parameters
+    ----------
+    masked_indices:
+        Optional set of ``row_index`` values to skip. Rows whose
+        ``row_index`` is in this set are excluded before walking
+        (span, type) pairs. Callers that don't pass this kwarg get the
+        original behaviour unchanged (default ``None`` → no filtering).
     """
+    from annotation_pipeline_skill.services.row_mask_service import filter_masked_rows
+    if masked_indices:
+        payload = filter_masked_rows(payload, masked_indices)
+
     out: list[tuple[str, str]] = []
     if not isinstance(payload, dict):
         return out

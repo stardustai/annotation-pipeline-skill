@@ -8,6 +8,7 @@ from typing import Any
 
 from annotation_pipeline_skill.core.models import ArtifactRef, ExportManifest, OutboxRecord, Task
 from annotation_pipeline_skill.core.states import OutboxKind, TaskStatus
+from annotation_pipeline_skill.services.row_mask_service import RowMaskService, filter_masked_rows
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 
@@ -44,6 +45,15 @@ class TrainingDataExportService:
             for task in self.store.list_tasks_by_pipeline(project_id)
             if task.status is TaskStatus.ACCEPTED
         ]
+
+        # Bulk-fetch all row masks for accepted tasks so the export
+        # silently omits masked (row_index, input/output) entries from
+        # both source_ref payloads and annotation payloads.
+        mask_svc = RowMaskService(self.store)
+        masked_by_task = mask_svc.masked_indices_by_task(
+            [t.task_id for t in accepted_tasks]
+        )
+
         rows: list[dict[str, Any]] = []
         included: list[str] = []
         excluded: list[dict[str, Any]] = []
@@ -67,7 +77,12 @@ class TrainingDataExportService:
             if annotation_payload is None:
                 excluded.append({"task_id": task.task_id, "reason": "missing_annotation_payload"})
                 continue
-            row = self._training_row(task, artifact, annotation_payload, human_authored=human_authored)
+            masked_indices = masked_by_task.get(task.task_id) or set()
+            row = self._training_row(
+                task, artifact, annotation_payload,
+                human_authored=human_authored,
+                masked_indices=masked_indices,
+            )
             validation_errors = self._validate_training_row(row)
             if validation_errors:
                 row_errors.append({"task_id": task.task_id, "errors": validation_errors})
@@ -138,15 +153,43 @@ class TrainingDataExportService:
         artifact_payload: Any,
         *,
         human_authored: bool,
+        masked_indices: "set[int] | None" = None,
     ) -> dict[str, Any]:
+        masked = masked_indices or set()
+
         if human_authored:
             annotation = artifact_payload.get("answer") if isinstance(artifact_payload, dict) else artifact_payload
         else:
             annotation = artifact_payload.get("text", artifact_payload) if isinstance(artifact_payload, dict) else artifact_payload
+
+        # Filter masked rows from the annotation payload when it's a dict
+        # with a ``rows`` list (e.g. structured annotation_result payloads).
+        if masked and isinstance(annotation, dict):
+            annotation = filter_masked_rows(annotation, masked)
+        elif masked and isinstance(annotation, str):
+            # annotation_result stores the annotation as a JSON string.
+            try:
+                parsed = json.loads(annotation)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("rows"), list):
+                filtered = filter_masked_rows(parsed, masked)
+                if filtered is not parsed:
+                    annotation = json.dumps(filtered, ensure_ascii=False)
+
+        # Filter masked rows from source_ref.payload when it has rows.
+        source_ref = task.source_ref
+        if masked and isinstance(source_ref, dict):
+            payload = source_ref.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+                filtered_payload = filter_masked_rows(payload, masked)
+                if filtered_payload is not payload:
+                    source_ref = {**source_ref, "payload": filtered_payload}
+
         return {
             "task_id": task.task_id,
             "pipeline_id": task.pipeline_id,
-            "source_ref": task.source_ref,
+            "source_ref": source_ref,
             "modality": task.modality,
             "annotation_requirements": task.annotation_requirements,
             "annotation": annotation,

@@ -30,6 +30,7 @@ from annotation_pipeline_skill.similarity.embedding_cache import (
     text_content_hash,
 )
 from annotation_pipeline_skill.similarity.embeddings import build_embedding_client
+from annotation_pipeline_skill.services.row_mask_service import RowMaskService
 from annotation_pipeline_skill.similarity.extractors import canonical_task_text
 from annotation_pipeline_skill.similarity.profiles import SimilarityProfile
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
@@ -117,14 +118,23 @@ class DistributionService:
         else:
             hash_salt = f"{profile.provider}:{profile.model}"
 
+        # Load all tasks first so we can bulk-fetch row masks in one query.
+        all_tasks = [
+            t for t in self._store.list_tasks_by_pipeline(project_id)
+            if status_enums is None or t.status in status_enums
+        ]
+
+        # Bulk-fetch masked row indices for every candidate task upfront.
+        mask_svc = RowMaskService(self._store)
+        masked_by_task = mask_svc.masked_indices_by_task([t.task_id for t in all_tasks])
+        total_masked_row_count = sum(len(v) for v in masked_by_task.values())
+
         task_ids: list[str] = []
         task_statuses: list[str] = []
         texts: list[str] = []
         text_hashes: list[str] = []
-        for task in self._store.list_tasks_by_pipeline(project_id):
-            if status_enums is not None and task.status not in status_enums:
-                continue
-            text = canonical_task_text(task)
+        for task in all_tasks:
+            text = canonical_task_text(task, store=self._store)
             task_ids.append(task.task_id)
             task_statuses.append(task.status.value)
             texts.append(text)
@@ -289,6 +299,7 @@ class DistributionService:
                 "statuses": statuses,
                 "generated_at": generated_at,
                 "embedding_cache": cache_stats,
+                "masked_row_count": total_masked_row_count,
             },
             "clusters": [asdict(c) for c in clusters],
             "coords": coords_out,
