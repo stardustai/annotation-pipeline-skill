@@ -270,11 +270,6 @@ export function DistributionPanel({
       >
         <div>
           <h2 style={{ marginBottom: "0.25rem" }}>Distribution</h2>
-          <p style={{ marginTop: 0, fontSize: "0.85rem" }}>
-            Find duplicate rows (Duplicates) and visualize the project's task
-            distribution in 2-D (Scatter plot). Each sub-tab manages its own
-            profile / threshold / scan.
-          </p>
         </div>
         {/* Scatter-specific scan controls live in the panel header only when
             the Scatter plot sub-tab is active. The Duplicates sub-tab has
