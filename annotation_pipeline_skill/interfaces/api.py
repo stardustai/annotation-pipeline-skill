@@ -212,17 +212,53 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
     # `resolved_convention_type` field for the UI's "✓ set" badge when
     # the row IS still present for some other reason (stats not yet
     # recounted, or partial Apply).
-    contested_all = svc.contested_spans(project_id=project_id)
-    contested = []
-    for c in contested_all:
+    divergent_all = svc.divergent_entries(project_id=project_id)
+    divergent_entries = []
+    for c in divergent_all:
         conv_type = convention_index.get(c.get("span", "").lower())
+        entry = {**c, "type_entropy": _type_entropy(c.get("prior_distribution", {}))}
         if conv_type is not None:
-            c = {**c, "resolved_convention_type": conv_type}
-        contested.append(c)
+            entry = {**entry, "resolved_convention_type": conv_type}
+        divergent_entries.append(entry)
+
+    # low_info_entries: divergent spans with no active convention and high wordfreq
+    LOW_INFO_THRESHOLD = 4.0
+    low_info_entries = []
+    for entry in divergent_entries:
+        if entry.get("resolved_convention_type"):
+            continue
+        wf = _wordfreq_score(entry["span"])
+        if wf >= LOW_INFO_THRESHOLD:
+            low_info_entries.append({
+                "span": entry["span"],
+                "prior_total": entry["prior_total"],
+                "prior_distribution": entry["prior_distribution"],
+                "wordfreq": round(wf, 3),
+            })
+    low_info_entries.sort(key=lambda r: r["wordfreq"], reverse=True)
+
     return {
         "task_deviations": deviations,
-        "contested_spans": contested,
+        "divergent_entries": divergent_entries,
+        "low_info_entries": low_info_entries,
     }
+
+
+def _type_entropy(dist: dict[str, int]) -> float:
+    import math as _math
+    total = sum(dist.values())
+    if not total:
+        return 0.0
+    return -sum((c / total) * _math.log2(c / total) for c in dist.values() if c > 0)
+
+
+def _wordfreq_score(span: str) -> float:
+    from wordfreq import zipf_frequency, tokenize
+    lang = "zh" if any("一" <= ch <= "鿿" for ch in span) else "en"
+    tokens = tokenize(span, lang)
+    if not tokens:
+        return 0.0
+    return sum(zipf_frequency(t, lang) for t in tokens) / len(tokens)
 
 
 def find_typical_text_for_span(
@@ -2069,13 +2105,19 @@ class DashboardApi:
                         (d.get("span") or "").lower() == span_lower
                     )
                 ]
-                contested = cache_payload.get("contested_spans", [])
-                kept_contested = [
-                    c for c in contested
+                divergent = cache_payload.get("divergent_entries", [])
+                kept_divergent = [
+                    c for c in divergent
+                    if (c.get("span") or "").lower() != span_lower
+                ]
+                low_info = cache_payload.get("low_info_entries", [])
+                kept_low_info = [
+                    c for c in low_info
                     if (c.get("span") or "").lower() != span_lower
                 ]
                 cache_payload["task_deviations"] = kept_devs
-                cache_payload["contested_spans"] = kept_contested
+                cache_payload["divergent_entries"] = kept_divergent
+                cache_payload["low_info_entries"] = kept_low_info
                 # PRESERVE the old accepted_hash so the dashboard's stale-
                 # cache indicator fires: we've patched N task annotations
                 # (changing their updated_at), so the cache is no longer

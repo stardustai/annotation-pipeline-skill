@@ -8,14 +8,14 @@ from annotation_pipeline_skill.services.entity_statistics_service import (
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 
-def test_posterior_audit_returns_task_deviations_and_contested_spans(tmp_path):
+def test_posterior_audit_returns_task_deviations_and_divergent_entries(tmp_path):
     store = SqliteStore.open(tmp_path)
     svc = EntityStatisticsService(store)
 
     # Build prior: 12 Apple → organization (dominant, eligible)
     for _ in range(12):
         svc.increment(project_id="p", span="Apple", entity_type="organization")
-    # Contested: Microsoft has 13/12/5
+    # Divergent: Microsoft has 13/12/5
     for _ in range(13):
         svc.increment(project_id="p", span="Microsoft", entity_type="organization")
     for _ in range(12):
@@ -23,8 +23,7 @@ def test_posterior_audit_returns_task_deviations_and_contested_spans(tmp_path):
     for _ in range(5):
         svc.increment(project_id="p", span="Microsoft", entity_type="technology")
 
-    # Create an accepted task whose annotation tags Apple as technology
-    # (diverges from prior).
+    # Create an accepted task whose annotation tags Apple as technology (diverges from prior).
     task = Task.new(
         task_id="t-dev", pipeline_id="p",
         source_ref={"kind": "jsonl", "payload": {
@@ -45,14 +44,18 @@ def test_posterior_audit_returns_task_deviations_and_contested_spans(tmp_path):
         content_type="application/json",
     ))
 
-    # Direct call into the helper that the route delegates to (avoids
-    # spinning up an HTTP server in tests).
     from annotation_pipeline_skill.interfaces.api import build_posterior_audit
     payload = build_posterior_audit(store, project_id="p")
 
     assert any(d["span"] == "Apple" and d["current_type"] == "technology"
                for d in payload["task_deviations"])
-    # contested_spans entries come from entity_statistics, where span values
-    # are stored as span_lower — accept either "microsoft" or "Microsoft".
+    # divergent_entries come from entity_statistics (span stored as lower-case).
     assert any(c["span"].lower() == "microsoft"
-               for c in payload["contested_spans"])
+               for c in payload["divergent_entries"])
+    # Each divergent entry must have type_entropy >= 0.
+    for entry in payload["divergent_entries"]:
+        assert "type_entropy" in entry
+        assert entry["type_entropy"] >= 0.0
+    # low_info_entries must be present (may be empty for these spans).
+    assert "low_info_entries" in payload
+    assert isinstance(payload["low_info_entries"], list)
