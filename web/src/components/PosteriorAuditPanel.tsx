@@ -10,6 +10,12 @@ import {
 import { clearConvention } from "../api";
 
 const PAGE_SIZE = 100;
+// Each Contested-spans row fires an OriginalTextCell fetch for its
+// sample text. With PAGE_SIZE=100 that's 100 backend hits per page —
+// noticeably slow. Contested gets its own smaller page size; the
+// Deviations table is per-task (less work per row, fewer rows in
+// typical projects) and keeps the default.
+const CONTESTED_PAGE_SIZE = 20;
 
 export type PosteriorAuditPanelProps = {
   projectId: string | null;
@@ -1008,11 +1014,11 @@ function ContestedTable({
   // or Apply-to-all) clamp to stay on the same page when possible.
   useEffect(() => { setPage(0); }, [filter]);
   useEffect(() => {
-    const maxPage = Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1);
+    const maxPage = Math.max(0, Math.ceil(filtered.length / CONTESTED_PAGE_SIZE) - 1);
     if (page > maxPage) setPage(maxPage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filtered.length]);
-  const visible = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const visible = filtered.slice(page * CONTESTED_PAGE_SIZE, (page + 1) * CONTESTED_PAGE_SIZE);
 
   async function handleConfirm(span: string, type: string) {
     setSubmitting(span);
@@ -1267,7 +1273,7 @@ function ContestedTable({
       <Pagination
         total={filtered.length}
         page={page}
-        pageSize={PAGE_SIZE}
+        pageSize={CONTESTED_PAGE_SIZE}
         onPageChange={setPage}
       />
       <div className="runtime-card">
@@ -1458,7 +1464,7 @@ function ContestedTable({
       <Pagination
         total={filtered.length}
         page={page}
-        pageSize={PAGE_SIZE}
+        pageSize={CONTESTED_PAGE_SIZE}
         onPageChange={setPage}
       />
     </>
