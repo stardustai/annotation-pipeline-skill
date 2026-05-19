@@ -72,9 +72,16 @@ class MinHashLSHFinder:
         # Build an undirected graph: edge between task A and task B if
         # they collide in LSH (likely Jaccard >= threshold).
         edges: dict[str, set[str]] = {tid: set() for tid in self._minhashes}
+        # LSH is a CANDIDATE generator — false positives are part of the
+        # design. Verify each candidate pair's actual MinHash Jaccard
+        # before accepting the edge, otherwise clusters can include pairs
+        # well below the documented threshold (observed: 0.27 in a
+        # threshold=0.7 run).
         for tid, m in self._minhashes.items():
             for neighbour in self._lsh.query(m):
-                if neighbour == tid:
+                if neighbour == tid or neighbour in edges[tid]:
+                    continue
+                if m.jaccard(self._minhashes[neighbour]) < self.jaccard_threshold:
                     continue
                 edges[tid].add(neighbour)
                 edges[neighbour].add(tid)
