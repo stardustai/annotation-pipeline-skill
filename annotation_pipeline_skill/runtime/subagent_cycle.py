@@ -1278,6 +1278,28 @@ class SubagentRuntime:
                 "target": {"row_index": first["row_index"], "field": first["field"],
                            "span": first["span"], "trimmed": first["trimmed"]},
             }
+        # Shared-type cross-field consistency: ``technology`` is the only
+        # type defined in BOTH entityType and jsonStructureType. Single-word
+        # tech goes in entities.technology; multi-word in
+        # json_structures.technology. Auto-fix relocates these in place; if
+        # any survive past auto-fix, surface a feedback.
+        from annotation_pipeline_skill.core.schema_validation import (
+            find_shared_type_field_violations,
+        )
+        shared_violations = find_shared_type_field_violations(payload)
+        if shared_violations:
+            first = shared_violations[0]
+            return {
+                "category": "shared_type_wrong_field",
+                "message": (
+                    f"Row {first['row_index']} span {first['span']!r} (type "
+                    f"{first['shared_type']!r}) is in {first['current_field']} but the "
+                    f"word-count rule requires {first['correct_field']} (single-word "
+                    f"goes to entities, multi-word goes to json_structures)."
+                ),
+                "reason": "shared-type field placement",
+                "target": first,
+            }
         return None
 
     def _check_verbatim_spans(self, task: Task, payload: Any) -> dict | None:

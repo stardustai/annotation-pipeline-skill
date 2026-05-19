@@ -147,13 +147,88 @@ def try_align_to_verbatim(span: str, input_text: str) -> str | None:
     return None
 
 
+def auto_fix_shared_type_field_in_place(payload: Any) -> int:
+    """Move spans of a SHARED type to the correct field based on the
+    word-count rule. Returns the number of (row, span) relocations.
+
+    - multi-word span in ``entities.<shared>``  → move to ``json_structures.<shared>``
+    - single-word span in ``json_structures.<shared>`` → move to ``entities.<shared>``
+    - same span in both fields → keep only the correct one
+
+    Letter content untouched; the span string is identical, only the
+    containing field changes. Safe to run before other validators.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return 0
+    moves = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        output = r.get("output")
+        if not isinstance(output, dict):
+            continue
+        entities = output.setdefault("entities", {}) if isinstance(output.get("entities"), dict) or output.get("entities") is None else None
+        phrases = output.setdefault("json_structures", {}) if isinstance(output.get("json_structures"), dict) or output.get("json_structures") is None else None
+        if not isinstance(entities, dict) or not isinstance(phrases, dict):
+            continue
+        for typ in _SHARED_TYPES:
+            e_list = entities.get(typ)
+            p_list = phrases.get(typ)
+            if not isinstance(e_list, list):
+                e_list = None
+            if not isinstance(p_list, list):
+                p_list = None
+            if e_list is None and p_list is None:
+                continue
+            # Collect what we have, then re-partition by word count.
+            e_set = list(e_list or [])
+            p_set = list(p_list or [])
+            union = []
+            seen_union: set[str] = set()
+            for s in e_set + p_set:
+                if isinstance(s, str) and s.strip() and s not in seen_union:
+                    seen_union.add(s)
+                    union.append(s)
+            new_entities: list[str] = []
+            new_phrases: list[str] = []
+            for s in union:
+                if _word_count(s) == 1:
+                    new_entities.append(s)
+                else:
+                    new_phrases.append(s)
+            # Compute whether anything actually moved (compared to original
+            # exact lists).
+            before = (tuple(e_list or ()), tuple(p_list or ()))
+            after = (tuple(new_entities), tuple(new_phrases))
+            if before != after:
+                # Count items that switched fields (set-symmetric-diff over
+                # field membership).
+                e_before, p_before = set(e_set), set(p_set)
+                e_after, p_after = set(new_entities), set(new_phrases)
+                moves += len((e_after - e_before) | (p_after - p_before))
+                if new_entities:
+                    entities[typ] = new_entities
+                elif typ in entities:
+                    del entities[typ]
+                if new_phrases:
+                    phrases[typ] = new_phrases
+                elif typ in phrases:
+                    del phrases[typ]
+    return moves
+
+
 def auto_fix_safe_spans_in_place(task: "Task", payload: Any) -> int:
     """Mutate ``payload`` in place: rewrite spans whose only defect is
     surrounding whitespace / sentence punctuation / quote characters into
     the form that's both verbatim in input.text AND not trailing-punct
-    flagged. Returns the count of rewrites.
+    flagged, AND relocate shared-type spans (``technology``) to the
+    correct field by word count. Returns the total count of rewrites +
+    relocations.
 
-    Two safe rules, in priority order:
+    Boundary rules (preserve letters, only move start/end):
 
     1. If the span is non-verbatim but ``try_align_to_verbatim`` yields a
        verbatim form that differs only by trim-safe chars, use that. Catches
@@ -162,14 +237,18 @@ def auto_fix_safe_spans_in_place(task: "Task", payload: Any) -> int:
     2. If the span IS already verbatim but its punct-trimmed form is ALSO
        verbatim, prefer the trimmed form. Mirrors
        ``find_trailing_punctuation_spans`` semantics: the entity is the name,
-       not the sentence boundary. Without this, spans like ``"Va."`` pass
-       verbatim but fail trailing-punct validation downstream.
+       not the sentence boundary.
 
-    Letter-level edits are NEVER performed — alignment only strips trim-safe
-    characters from either end. The semantic content of the entity is
-    preserved; only its start/end boundary moves. Spans that can't be safely
-    aligned are left untouched and will surface to the normal validation
-    failure path.
+    Field-routing rule (preserve content + type, only move which field):
+
+    3. Spans of a SHARED type (only ``technology`` today) get routed to the
+       field implied by word count: single-word → ``entities.<type>``;
+       multi-word → ``json_structures.<type>``. Same span appearing in both
+       fields gets collapsed to the correct one.
+
+    Letter-level edits are NEVER performed; type changes are never inferred.
+    Spans that can't be safely fixed are left untouched and will surface to
+    the normal validation failure path.
     """
     if not isinstance(payload, dict):
         return 0
@@ -223,6 +302,9 @@ def auto_fix_safe_spans_in_place(task: "Task", payload: Any) -> int:
                     if aligned is not None:
                         items[i] = aligned
                         rewrites += 1
+    # Shared-type field routing runs AFTER span-boundary alignment so
+    # trim-safe rewrites are settled before we count words.
+    rewrites += auto_fix_shared_type_field_in_place(payload)
     return rewrites
 
 
@@ -269,6 +351,143 @@ def find_duplicate_spans(payload: Any) -> "list[dict[str, Any]]":
 
 
 _TRAILING_SENTENCE_PUNCT = ".,;:!?。，；：！？"
+
+
+# Types that exist in BOTH `entityType` and `jsonStructureType` enums.
+# These are the only types where a span could legitimately be placed in
+# either field — and therefore the only types that need the word-count
+# routing rule. Adding more shared types here should be safe (the validator
+# just considers more types) but in practice the schema designer makes
+# this list very short on purpose.
+_SHARED_TYPES = ("technology",)
+
+
+def _word_count(span: str) -> int:
+    """Cheap whitespace-delimited word count. Works for English-style spans;
+    CJK runs are typically one 'word' under this measure, which is the
+    behavior we want for the entity-vs-phrase routing rule (a single
+    Chinese name = entity, a multi-character sentence = phrase)."""
+    return len([w for w in span.strip().split() if w])
+
+
+def _schema_type_enums(schema: Any) -> tuple[set[str], set[str]]:
+    """Extract (entityType_enum, jsonStructureType_enum) from a resolved
+    output_schema. Returns empty sets if the schema is missing or not
+    structured as expected. Used by apply-path routing to decide which
+    field a (span, type) decision should land in.
+    """
+    if not isinstance(schema, dict):
+        return set(), set()
+    defs = schema.get("$defs") or schema.get("definitions") or {}
+    entity_def = defs.get("entityType") if isinstance(defs, dict) else None
+    phrase_def = defs.get("jsonStructureType") if isinstance(defs, dict) else None
+    entity_enum = set(entity_def.get("enum", [])) if isinstance(entity_def, dict) else set()
+    phrase_enum = set(phrase_def.get("enum", [])) if isinstance(phrase_def, dict) else set()
+    return entity_enum, phrase_enum
+
+
+def resolve_apply_field(
+    span: str, target_type: str, schema: Any,
+) -> "tuple[str | None, str | None]":
+    """Decide which annotation field (entities or json_structures) a
+    (span, target_type) operator decision should land in.
+
+    Returns ``(field_key, error)``:
+      - ``field_key`` is "entities" or "json_structures" on success, None on error
+      - ``error`` is a human-readable reason string on rejection, None on success
+
+    Rules:
+      - target_type in entityType only → "entities"
+      - target_type in jsonStructureType only → "json_structures"
+      - target_type in BOTH (shared, currently just "technology") → word count
+        decides: single-word → "entities", multi-word → "json_structures"
+      - target_type in NEITHER → reject (unknown type for this project)
+    """
+    if not isinstance(target_type, str) or not target_type.strip():
+        return None, "target_type is required"
+    entity_enum, phrase_enum = _schema_type_enums(schema)
+    if not entity_enum and not phrase_enum:
+        # No schema available — fall back to word-count heuristic so we
+        # don't block the apply just because the schema couldn't be
+        # resolved. The downstream verbatim/schema check still catches
+        # truly invalid types.
+        return ("entities" if _word_count(span) == 1 else "json_structures"), None
+    in_entity = target_type in entity_enum
+    in_phrase = target_type in phrase_enum
+    if in_entity and in_phrase:
+        return ("entities" if _word_count(span) == 1 else "json_structures"), None
+    if in_entity:
+        return "entities", None
+    if in_phrase:
+        return "json_structures", None
+    return None, (
+        f"target_type {target_type!r} is not defined in this project's "
+        f"entityType or jsonStructureType schema"
+    )
+
+
+def find_shared_type_field_violations(payload: Any) -> "list[dict[str, Any]]":
+    """Detect spans of a SHARED type (currently just ``technology``) placed
+    in the wrong field per the word-count routing rule:
+
+      - single-word span → must live in ``entities.<type>``
+      - multi-word span  → must live in ``json_structures.<type>``
+
+    Also flags the cross-field collision case: the same span appearing in
+    both ``entities.<type>`` AND ``json_structures.<type>`` within one row.
+
+    Returned violation dicts have ``row_index``, ``span``, ``shared_type``,
+    ``current_field``, ``correct_field``, and ``kind`` keys.
+    """
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        row_index = r.get("row_index") if isinstance(r.get("row_index"), int) else 0
+        output = r.get("output")
+        if not isinstance(output, dict):
+            continue
+        entities = output.get("entities") if isinstance(output.get("entities"), dict) else {}
+        phrases = output.get("json_structures") if isinstance(output.get("json_structures"), dict) else {}
+        for typ in _SHARED_TYPES:
+            in_entities = [s for s in (entities.get(typ) or []) if isinstance(s, str) and s.strip()]
+            in_phrases = [s for s in (phrases.get(typ) or []) if isinstance(s, str) and s.strip()]
+            both = set(in_entities) & set(in_phrases)
+            for span in sorted(both):
+                out.append({
+                    "row_index": row_index, "span": span, "shared_type": typ,
+                    "kind": "cross_field_collision",
+                    "current_field": "both",
+                    "correct_field": (
+                        f"entities.{typ}" if _word_count(span) == 1 else f"json_structures.{typ}"
+                    ),
+                })
+            for span in in_entities:
+                if span in both:
+                    continue
+                if _word_count(span) > 1:
+                    out.append({
+                        "row_index": row_index, "span": span, "shared_type": typ,
+                        "kind": "multiword_in_entities",
+                        "current_field": f"entities.{typ}",
+                        "correct_field": f"json_structures.{typ}",
+                    })
+            for span in in_phrases:
+                if span in both:
+                    continue
+                if _word_count(span) == 1:
+                    out.append({
+                        "row_index": row_index, "span": span, "shared_type": typ,
+                        "kind": "singleword_in_json_structures",
+                        "current_field": f"json_structures.{typ}",
+                        "correct_field": f"entities.{typ}",
+                    })
+    return out
 
 
 def find_trailing_punctuation_spans(task: "Task", payload: Any) -> "list[dict[str, Any]]":

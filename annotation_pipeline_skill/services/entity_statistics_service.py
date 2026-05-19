@@ -274,13 +274,21 @@ class EntityStatisticsService:
 
 
 def iter_span_decisions(payload: Any) -> "list[tuple[str, str]]":
-    """Yield (span, entity_type) pairs from an annotation payload.
+    """Yield (span, type) pairs from an annotation payload.
 
-    Walks ``rows[*].output.entities[type] = [span, ...]``. Only the
-    ``entities`` key is iterated — ``json_structures`` phrases are
-    free-form text that don't have a single canonical type per span (a
-    phrase can be both a "goal" and a "constraint" legitimately), so they
-    are NOT subject to the type-classification verifier.
+    Walks BOTH ``rows[*].output.entities[type] = [span, ...]`` AND
+    ``rows[*].output.json_structures[type] = [phrase, ...]``. The two
+    fields exist for training-pipeline reasons (model can't carry all 20+
+    labels at once, so they're split by surface length), but semantically
+    they share the same goal — labeling spans with a type. Statistics,
+    conventions, and divergent-annotation audit therefore operate on the
+    UNION of (span, type) decisions regardless of source field.
+
+    Per-task per-(span, type) deduplication: a phrase that appears in both
+    ``entities.technology`` and ``json_structures.technology`` in the same
+    task is counted ONCE (not twice). This matters because we don't want
+    the same task to register two votes for the same decision via a
+    cross-field violation.
 
     Skips non-string spans, empty spans, and non-conforming structures.
     """
@@ -290,19 +298,25 @@ def iter_span_decisions(payload: Any) -> "list[tuple[str, str]]":
     rows = payload.get("rows")
     if not isinstance(rows, list):
         return out
+    seen: set[tuple[str, str]] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
         output = row.get("output")
         if not isinstance(output, dict):
             continue
-        entities = output.get("entities")
-        if not isinstance(entities, dict):
-            continue
-        for typ, items in entities.items():
-            if not isinstance(items, list):
+        for field_key in ("entities", "json_structures"):
+            field = output.get(field_key)
+            if not isinstance(field, dict):
                 continue
-            for span in items:
-                if isinstance(span, str) and span.strip():
-                    out.append((span, typ))
+            for typ, items in field.items():
+                if not isinstance(items, list):
+                    continue
+                for span in items:
+                    if isinstance(span, str) and span.strip():
+                        key = (span, typ)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append(key)
     return out

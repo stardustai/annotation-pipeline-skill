@@ -449,15 +449,27 @@ class HumanReviewService:
                 continue
 
     def _latest_annotation_payload(self, task_id: str) -> dict | None:
-        """Load and parse the most recent annotation_result artifact's inner
-        annotation JSON. Returns None when there's no annotation_result yet
-        or when the inner text isn't parseable JSON.
+        """Load and parse the most recent annotation payload for a task.
+
+        Prefers human_review_answer artifacts (the operator's corrected
+        answer) over annotation_result artifacts (the model's output),
+        matching the same precedence used by api.py and entity_statistics_service.
 
         Strips ``<think>...</think>`` reasoning blocks and a single leading
-        markdown fence — same wrapper handling the runtime uses.
+        markdown fence from annotation_result text — same wrapper handling
+        the runtime uses.
         """
         import re
-        artifacts = [a for a in self.store.list_artifacts(task_id) if a.kind == "annotation_result"]
+        all_artifacts = self.store.list_artifacts(task_id)
+        # Prefer human_review_answer (operator correction) over model output.
+        hr_artifacts = [a for a in all_artifacts if a.kind == "human_review_answer"]
+        if hr_artifacts:
+            path = self.store.root / hr_artifacts[-1].path
+            if path.exists():
+                outer = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(outer, dict):
+                    return outer.get("answer")
+        artifacts = [a for a in all_artifacts if a.kind == "annotation_result"]
         if not artifacts:
             return None
         path = self.store.root / artifacts[-1].path
@@ -538,6 +550,7 @@ class HumanReviewService:
 
         new_answer = _swap_span_type_in_payload(
             annotation, span=span, current_type=current_type, new_type=new_type,
+            task=task, store=self.store,
         )
         # Auto-clean pre-existing defects that submit_correction would
         # block on. The operator's posterior-fix targets one (span, type)
@@ -807,45 +820,83 @@ def _autoclean_pre_existing_defects(task, payload: dict) -> dict:
 
 def _swap_span_type_in_payload(
     payload: dict, *, span: str, current_type: str, new_type: str | None,
+    task=None, store=None,
 ) -> dict:
-    """Return a deep copy of `payload` where every row's entities[current_type]
-    list has `span` removed; if `new_type` is provided AND it's not the
-    sentinel "not_an_entity", `span` is appended to entities[new_type] in
-    that row. JSON-structures and other fields are untouched.
+    """Return a deep copy of `payload` with ``span`` retyped per the apply
+    routing rules.
+
+    Removal: walks BOTH ``entities[current_type]`` and
+    ``json_structures[current_type]`` (the convention space is unified, so
+    the span could legitimately live in either field for the same type).
+
+    Add: if ``new_type`` is provided AND it's not the sentinel
+    ``"not_an_entity"``, the span is appended to the destination chosen by
+    ``resolve_apply_field``:
+      - type in entityType only → ``entities.<new_type>``
+      - type in jsonStructureType only → ``json_structures.<new_type>``
+      - type in BOTH (shared, currently just "technology") → word-count
+        decides: single-word → entities, multi-word → json_structures.
 
     Strips non-schema-friendly top-level fields like ``discussion_replies``
-    that the annotator/arbiter add for runtime communication — these are
-    not part of the project's annotation output schema and would fail
-    the submit_correction schema validation.
+    that the annotator/arbiter add for runtime communication.
     """
     import copy
     out = copy.deepcopy(payload)
     if isinstance(out, dict):
-        out.pop("discussion_replies", None)
+        for _runtime_key in ("discussion_replies", "feedback_resolution", "task_id"):
+            out.pop(_runtime_key, None)
     rows = out.get("rows") if isinstance(out, dict) else None
     if not isinstance(rows, list):
         return out
+
+    schema = None
+    if task is not None:
+        try:
+            from annotation_pipeline_skill.core.schema_validation import (
+                resolve_output_schema, resolve_apply_field,
+            )
+            schema = resolve_output_schema(task, store)
+        except Exception:  # noqa: BLE001
+            schema = None
+    else:
+        from annotation_pipeline_skill.core.schema_validation import resolve_apply_field
+
+    target_field: str | None = None
+    if new_type and new_type != "not_an_entity":
+        target_field, err = resolve_apply_field(span, new_type, schema)
+        if target_field is None:
+            # Surface a clear error rather than silently writing nothing.
+            raise ValueError(err or f"cannot route (span={span!r}, type={new_type!r})")
+
     for row in rows:
         if not isinstance(row, dict):
             continue
         output = row.get("output")
         if not isinstance(output, dict):
             continue
-        entities = output.get("entities")
-        if not isinstance(entities, dict):
+        present = False
+        for field_key in ("entities", "json_structures"):
+            container = output.get(field_key)
+            if not isinstance(container, dict):
+                continue
+            cur_list = container.get(current_type)
+            if not isinstance(cur_list, list) or span not in cur_list:
+                continue
+            present = True
+            container[current_type] = [s for s in cur_list if s != span]
+            if not container[current_type]:
+                container.pop(current_type, None)
+        if not present:
+            # This row didn't have the span under that type — don't write
+            # the new type either; the swap is row-local.
             continue
-        cur_list = entities.get(current_type)
-        if not isinstance(cur_list, list) or span not in cur_list:
-            continue
-        # Drop span from the old bucket.
-        entities[current_type] = [s for s in cur_list if s != span]
-        if not entities[current_type]:
-            entities.pop(current_type, None)
-        # Add to new bucket unless deleting.
-        if new_type and new_type != "not_an_entity":
-            target = entities.setdefault(new_type, [])
-            if span not in target:
-                target.append(span)
+        if target_field is not None:
+            dest_container = output.setdefault(target_field, {})
+            if not isinstance(dest_container, dict):
+                continue
+            bucket = dest_container.setdefault(new_type, [])
+            if isinstance(bucket, list) and span not in bucket:
+                bucket.append(span)
     return out
 
 

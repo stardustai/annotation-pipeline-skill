@@ -85,7 +85,7 @@ def test_contested_spans(tmp_path):
     assert contested[0]["prior_distribution"] == {"organization": 13, "project": 12, "technology": 5}
 
 
-def test_iter_span_decisions_walks_entities():
+def test_iter_span_decisions_walks_entities_and_json_structures():
     from annotation_pipeline_skill.services.entity_statistics_service import (
         iter_span_decisions,
     )
@@ -106,12 +106,34 @@ def test_iter_span_decisions_walks_entities():
         ]
     }
     decisions = list(iter_span_decisions(payload))
+    # Both fields contribute — entities and json_structures share the same
+    # underlying (span, type) decision space; the split is a training-side
+    # detail, not a semantic distinction.
     assert ("Apple", "organization") in decisions
     assert ("Google", "organization") in decisions
     assert ("Alice", "person") in decisions
-    # json_structures is intentionally NOT included — only entities go through
-    # the type-classification verifier.
-    assert all(typ in ("organization", "person") for _, typ in decisions)
+    assert ("improve perf", "goal") in decisions
+
+
+def test_iter_span_decisions_dedupes_cross_field_duplicates():
+    from annotation_pipeline_skill.services.entity_statistics_service import (
+        iter_span_decisions,
+    )
+    # Same span tagged 'technology' in both entities AND json_structures
+    # within one task — counts as ONE decision, not two.
+    payload = {
+        "rows": [
+            {
+                "row_index": 0,
+                "output": {
+                    "entities": {"technology": ["Kubernetes"]},
+                    "json_structures": {"technology": ["Kubernetes"]},
+                },
+            }
+        ]
+    }
+    decisions = list(iter_span_decisions(payload))
+    assert decisions == [("Kubernetes", "technology")]
 
 
 def test_iter_span_decisions_handles_missing_fields():
