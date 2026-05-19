@@ -26,6 +26,8 @@ class OpenAICompatibleClient:
         }
         if request.max_output_tokens is not None:
             kwargs["max_tokens"] = request.max_output_tokens
+        if request.response_format is not None:
+            kwargs["response_format"] = request.response_format
 
         response = await self.client.chat.completions.create(**kwargs)
         return LLMGenerateResult(

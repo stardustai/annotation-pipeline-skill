@@ -17,6 +17,13 @@ class LLMGenerateRequest:
     max_output_tokens: int | None = None
     cwd: Path | None = None
     env: dict[str, str] = field(default_factory=dict)
+    # OpenAI-compatible chat-completions ``response_format`` payload — e.g.
+    # ``{"type": "json_object"}`` for forced-JSON or
+    # ``{"type": "json_schema", "json_schema": {...}}`` for strict schema
+    # enforcement. Only clients that route through chat.completions
+    # (OpenAICompatibleClient) honor this; codex/claude CLI and
+    # OpenAIResponsesClient.generate ignore it.
+    response_format: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

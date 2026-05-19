@@ -2430,10 +2430,17 @@ class SubagentRuntime:
         for attempt_idx in range(max_retries + 1):
             attempt_instructions = instructions + retry_note
             try:
+                # Request strict JSON when the client supports
+                # response_format (OpenAI chat-completions API, used by
+                # DeepSeek / OpenRouter / similar). Eliminates a whole
+                # class of "arbiter returned prose preamble before JSON"
+                # parse failures. Clients that don't honor it (codex CLI,
+                # responses API .generate) just ignore the field.
                 result = await arbiter_client.generate(LLMGenerateRequest(
                     instructions=attempt_instructions,
                     prompt=prompt,
                     continuity_handle=None,
+                    response_format={"type": "json_object"},
                 ))
             except Exception as exc:  # noqa: BLE001
                 raise _ArbiterCallFailed(str(exc))
