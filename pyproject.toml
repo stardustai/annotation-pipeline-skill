@@ -9,6 +9,8 @@ dependencies = [
   "pyyaml>=6.0",
   "jsonschema>=4.0",
   "robust-json-parser>=0.1",
+  "datasketch>=1.6",
+  "numpy>=1.26",
 ]
 
 [project.scripts]
