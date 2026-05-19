@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   fetchKanbanSnapshot,
   fetchProjects,
@@ -16,7 +16,12 @@ import { EntityKnowledgePanel } from "./components/EntityKnowledgePanel";
 import { TypeStatisticsPanel } from "./components/TypeStatisticsPanel";
 import { KanbanBoard } from "./components/KanbanBoard";
 import { OutputPanel } from "./components/OutputPanel";
-import { DistributionPanel } from "./components/DistributionPanel";
+// Lazy-loaded: the Distribution panel pulls plotly.js-dist-min (~3 MB) into the
+// bundle. Keep it off the critical path so the rest of the dashboard loads fast;
+// the plotly chunk only ships when the operator clicks the Distribution tab.
+const DistributionPanel = lazy(() =>
+  import("./components/DistributionPanel").then((m) => ({ default: m.DistributionPanel })),
+);
 import { PosteriorAuditPanel } from "./components/PosteriorAuditPanel";
 import { ProvidersPanel } from "./components/ProvidersPanel";
 import { RuntimePanel } from "./components/RuntimePanel";
@@ -308,11 +313,13 @@ export default function App() {
         <EntityKnowledgePanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
       ) : null}
       {viewMode === "distribution" ? (
-        <DistributionPanel
-          projectId={selectedProjectId}
-          storeKey={selectedStoreKey}
-          onSelectTask={(tid) => setTask(tid)}
-        />
+        <Suspense fallback={<div className="runtime-muted" style={{ padding: "2rem" }}>Loading Distribution panel…</div>}>
+          <DistributionPanel
+            projectId={selectedProjectId}
+            storeKey={selectedStoreKey}
+            onSelectTask={(tid) => setTask(tid)}
+          />
+        </Suspense>
       ) : null}
       {viewMode === "statistics" ? (
         <TypeStatisticsPanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
