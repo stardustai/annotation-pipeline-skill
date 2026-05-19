@@ -13,6 +13,11 @@ def canonical_task_text(task: Any) -> str:
     """Concatenate ``task.source_ref.payload.rows[*].input`` ordered by
     ``row_index``, joined with newlines. Returns ``""`` when the task
     has no parseable rows.
+
+    Rows missing ``row_index`` (or with a non-int value) fall back to
+    their position in the payload list, which keeps the output stable
+    for partially-typed data but means the ordering of a mixed batch
+    isn't intuitive — feed clean per-task payloads if order matters.
     """
     source_ref = getattr(task, "source_ref", None)
     if not isinstance(source_ref, dict):

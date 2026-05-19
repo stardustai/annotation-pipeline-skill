@@ -1,5 +1,3 @@
-import pytest
-
 from annotation_pipeline_skill.similarity.extractors import canonical_task_text
 
 
