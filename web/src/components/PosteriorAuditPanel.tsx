@@ -1283,10 +1283,19 @@ function ContestedTable({
             <tr style={THEAD_ROW}>
               <th style={TH_FIRST}>Span</th>
               <th style={TH}>Total</th>
-              <th style={{ ...TH, width: "22%" }}>Sample text</th>
+              <th style={{ ...TH, width: "20%" }}>Sample text</th>
               <th style={{ ...TH, width: "12%" }}>Distribution</th>
-              <th style={{ ...TH, width: "22%" }}>Set Convention</th>
-              <th style={{ ...TH, width: "18%" }} title="Declare convention AND retroactively patch every existing ACCEPTED task that tagged this span differently">
+              <th style={{ ...TH, width: "16%" }}>Set type</th>
+              <th
+                style={{ ...TH, width: "14%" }}
+                title="Save the picked type as a project convention. Future tasks see it as a rule. Does NOT touch existing task annotations."
+              >
+                Set convention
+              </th>
+              <th
+                style={{ ...TH, width: "16%" }}
+                title="Retroactively patch every existing ACCEPTED task whose annotation tags this span with a non-target type. Does NOT write a convention."
+              >
                 Apply to all
               </th>
             </tr>
@@ -1313,14 +1322,25 @@ function ContestedTable({
                   <td style={TD}>
                     <DistributionBar distribution={c.prior_distribution} total={c.prior_total} />
                   </td>
+                  {/* Set type — type picker (always shown, even after
+                      convention is set; operator can still change their
+                      mind and use Apply-to-all with a different type). */}
+                  <td style={TD}>
+                    <TopNTypeSelector
+                      selected={pickedType ?? committedType ?? null}
+                      preferredOrder={preferred}
+                      topN={3}
+                      onSelect={(t) => setPicked((p) => ({ ...p, [c.span]: t }))}
+                    />
+                  </td>
+                  {/* Set convention — Confirm button (writes project rule
+                      only; does NOT patch existing tasks). When a convention
+                      already exists, shows ✓ + Unset. */}
                   <td style={TD}>
                     {committedType ? (
                       <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem", alignItems: "flex-start" }}>
                         <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>
-                          ✓ set:{" "}
-                          <strong>
-                            {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
-                          </strong>
+                          ✓ {committedType === NOT_ENTITY ? "🚫 not entity" : committedType}
                         </span>
                         <button
                           type="button"
@@ -1341,36 +1361,25 @@ function ContestedTable({
                           Unset
                         </button>
                       </div>
+                    ) : saveConv ? (
+                      <button
+                        type="button"
+                        disabled={!pickedType || isSubmitting}
+                        onClick={() => pickedType && handleConfirm(c.span, pickedType)}
+                        title="Save the picked type as a project convention. Future tasks see it as a rule. Does NOT touch existing task annotations — use Apply to all for that."
+                        style={{
+                          fontSize: "0.8rem",
+                          background: pickedType ? "var(--success, #047857)" : undefined,
+                          color: pickedType ? "white" : undefined,
+                          opacity: !pickedType || isSubmitting ? 0.6 : 1,
+                        }}
+                      >
+                        {isSubmitting ? "…" : "Confirm"}
+                      </button>
                     ) : (
-                      <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
-                        <TopNTypeSelector
-                          selected={pickedType}
-                          preferredOrder={preferred}
-                          topN={3}
-                          onSelect={(t) => setPicked((p) => ({ ...p, [c.span]: t }))}
-                        />
-                        {saveConv ? (
-                          <button
-                            type="button"
-                            disabled={!pickedType || isSubmitting}
-                            onClick={() => pickedType && handleConfirm(c.span, pickedType)}
-                            title="Save as project convention only — future tasks; existing ACCEPTED tasks are NOT changed"
-                            style={{
-                              fontSize: "0.8rem",
-                              background: pickedType ? "var(--success, #047857)" : undefined,
-                              color: pickedType ? "white" : undefined,
-                              opacity: !pickedType || isSubmitting ? 0.6 : 1,
-                              alignSelf: "flex-start",
-                            }}
-                          >
-                            {isSubmitting ? "…" : "Confirm"}
-                          </button>
-                        ) : (
-                          <span style={{ fontSize: "0.7rem", color: "var(--muted, #6b7280)", fontStyle: "italic" }}>
-                            (convention save off — use Apply to all to patch tasks)
-                          </span>
-                        )}
-                      </div>
+                      <span style={{ fontSize: "0.7rem", color: "var(--muted, #6b7280)", fontStyle: "italic" }}>
+                        (convention save off)
+                      </span>
                     )}
                   </td>
                   <td style={TD}>
