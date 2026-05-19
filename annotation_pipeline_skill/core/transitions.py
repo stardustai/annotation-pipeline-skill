@@ -47,11 +47,13 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     },
     # ACCEPTED is the normal terminal state. Allowed outgoing transitions
     # cover operator audits — scanning already-accepted tasks for a quality
-    # regression. Two paths: ARBITRATING (re-run the LLM arbiter on the
-    # whole task) or HUMAN_REVIEW (operator wants to hand-correct a
+    # regression. Three paths: ARBITRATING (re-run the LLM arbiter on the
+    # whole task), HUMAN_REVIEW (operator wants to hand-correct a
     # specific span without invoking the arbiter; e.g. Posterior Audit's
-    # in-place "Set type & Submit" flow uses this).
-    TaskStatus.ACCEPTED: {TaskStatus.ARBITRATING, TaskStatus.HUMAN_REVIEW},
+    # in-place "Set type & Submit" flow uses this), or REJECTED (operator
+    # retroactively marks the task as bad data — e.g. synthetic / template
+    # batch that's polluting the project's statistics).
+    TaskStatus.ACCEPTED: {TaskStatus.ARBITRATING, TaskStatus.HUMAN_REVIEW, TaskStatus.REJECTED},
     TaskStatus.REJECTED: {TaskStatus.ARBITRATING},
     TaskStatus.BLOCKED: {TaskStatus.PENDING},
     TaskStatus.CANCELLED: set(),
