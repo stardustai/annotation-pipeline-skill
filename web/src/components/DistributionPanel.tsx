@@ -113,7 +113,10 @@ export function DistributionPanel({
   // Default to "jina_small"; synced to available_profiles[0] after first GET.
   const [profile, setProfile] = useState<string>("jina_small");
   const [minClusterSize, setMinClusterSize] = useState<number>(5);
-  // Client-side cosine threshold filter (does NOT affect scan params).
+  // Client-side similarity threshold filter (does NOT affect scan params).
+  // Semantics differ by provider — cosine for jina (~0.85 baseline) vs
+  // Jaccard for MinHash (~0.10 is already a real duplicate). useEffect
+  // below resets the default whenever the cache reports a new provider.
   const [cosineThreshold, setCosineThreshold] = useState<number>(0.85);
 
   // task_id → true for batch reject selection (non-rep tasks only)
@@ -139,6 +142,15 @@ export function DistributionPanel({
         // Sync profile to first available if the current one isn't offered.
         if (d.available_profiles.length > 0 && !d.available_profiles.includes(profile)) {
           setProfile(d.available_profiles[0]);
+        }
+        // Reset similarity-threshold default based on whichever provider
+        // the cached payload is from — jina cosine and MinHash Jaccard
+        // live on very different scales.
+        const providerKey = (d.payload?.params as { provider?: string } | undefined)?.provider;
+        if (providerKey === "minhash") {
+          setCosineThreshold((cur) => (cur > 0.5 ? 0.10 : cur));
+        } else if (providerKey === "jina_http") {
+          setCosineThreshold((cur) => (cur < 0.5 ? 0.85 : cur));
         }
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
@@ -531,15 +543,18 @@ function DuplicatesSubTab({
         }}
       >
         <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.4rem" }}>
-          <span>Cosine threshold</span>
+          <span>Similarity ≥</span>
+          {/* Slider range covers both regimes: 0.01-0.99 so MinHash (Jaccard,
+              real duplicates around 0.10-0.30) and jina (cosine, real
+              duplicates around 0.85+) both have headroom. */}
           <input
             type="range"
-            min={0.70}
+            min={0.01}
             max={0.99}
             step={0.01}
             value={cosineThreshold}
             onChange={(e) => setCosineThreshold(parseFloat(e.target.value))}
-            style={{ width: "120px" }}
+            style={{ width: "160px" }}
           />
           <code style={{ fontFamily: "monospace", minWidth: "3rem" }}>
             {cosineThreshold.toFixed(2)}

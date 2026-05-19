@@ -106,6 +106,17 @@ class DistributionService:
             status_enums = None
 
         # --- Load tasks -------------------------------------------------
+        # Salt for the cache content_hash: any parameter that changes the
+        # produced vector must be in the salt so the cache invalidates
+        # automatically when it changes. For MinHash that's shingle_size
+        # and num_perm; for embedding HTTP providers the model name is
+        # already implicit (different model → different profile typically,
+        # but we belt-and-brace by including the model too).
+        if profile.provider == "minhash":
+            hash_salt = f"minhash-w{profile.shingle_size}-p{profile.num_perm}"
+        else:
+            hash_salt = f"{profile.provider}:{profile.model}"
+
         task_ids: list[str] = []
         task_statuses: list[str] = []
         texts: list[str] = []
@@ -117,7 +128,7 @@ class DistributionService:
             task_ids.append(task.task_id)
             task_statuses.append(task.status.value)
             texts.append(text)
-            text_hashes.append(text_content_hash(text))
+            text_hashes.append(text_content_hash(f"{hash_salt}|{text}"))
 
         # --- Embed (cache-aware) ----------------------------------------
         # Hit the on-disk cache first; only embed the misses.
@@ -211,7 +222,15 @@ class DistributionService:
             ]
             labels = list(labels_arr.tolist())
 
-            # Build Cluster objects with average pairwise cosine similarity.
+            # Build Cluster objects with average pairwise similarity.
+            # Metric depends on the provider: cosine is meaningful for
+            # dense semantic embeddings (jina_http), but for MinHash
+            # signatures (random-ish uint64 hashes cast to float32) the
+            # cosine of two unrelated vectors floors at ~0.5 — bad
+            # threshold semantics in the UI. For MinHash we report the
+            # Jaccard estimate instead: fraction of signature positions
+            # that match between two tasks.
+            is_minhash = profile.provider == "minhash"
             cluster_members: dict[int, list[str]] = {}
             for tid, lbl in zip(task_ids, labels):
                 if lbl == -1:
@@ -226,8 +245,12 @@ class DistributionService:
                     for j in range(i + 1, len(idxs)):
                         a = emb.vectors[idxs[i]]
                         b = emb.vectors[idxs[j]]
-                        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-                        sims.append(float(np.dot(a, b) / denom) if denom else 0.0)
+                        if is_minhash:
+                            # Jaccard estimate: matching hash positions / num_perm.
+                            sims.append(float(np.mean(a == b)))
+                        else:
+                            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+                            sims.append(float(np.dot(a, b) / denom) if denom else 0.0)
                 avg_sim = float(np.mean(sims)) if sims else 1.0
                 clusters.append(
                     Cluster(
@@ -258,6 +281,7 @@ class DistributionService:
         payload: dict[str, Any] = {
             "params": {
                 "profile": profile_name,
+                "provider": profile.provider,
                 "model": profile.model,
                 "min_cluster_size": min_cluster_size,
                 "umap_neighbors": umap_neighbors,
