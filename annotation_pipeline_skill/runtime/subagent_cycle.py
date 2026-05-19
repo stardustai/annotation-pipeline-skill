@@ -184,6 +184,18 @@ class SubagentRuntime:
                 return f"Annotation guideline ({ver.version}):\n{ver.content}"
             except FileNotFoundError:
                 pass  # fall through to project-level fallback
+        # Secondary: latest version of the singleton "Annotation Rules"
+        # document maintained by the dashboard's Annotation Rules tab.
+        try:
+            for doc in self.store.list_documents():
+                if doc.metadata.get("role") == "annotation_rules":
+                    versions = self.store.list_document_versions(doc.document_id)
+                    if versions:
+                        latest = max(versions, key=lambda v: v.created_at)
+                        return f"Annotation guideline ({latest.version}):\n{latest.content}"
+                    break
+        except Exception:
+            pass
         # Fallback: project-level annotation_rules.yaml under the store
         # root. This is what the dashboard's "Annotation Rules" tab
         # edits, and it's the single source of truth for projects that
@@ -2928,15 +2940,16 @@ def _annotation_instructions(
 ) -> str:
     base = (
         "You are an annotation subagent. Return raw JSON only, with no markdown fences or commentary. "
-        "Follow the output_schema and annotation_guidance fields in this prompt (output_schema is the JSON Schema your response must conform to). Honor allowed_entity_types and rules from annotation_guidance when present. "
+        "Follow the output_schema in this prompt: it is the JSON Schema your response must conform to, and its "
+        "$defs section enumerates every allowed entity type (entityType enum), classification task "
+        "(classificationTask enum), and json_structures phrase type (jsonStructureType enum or equivalent). "
+        "Use ONLY those values — labels outside the schema's enums will be rejected by the validator. "
         "For text entity spans, copy exact contiguous text spans from task.source_ref.payload.text. "
-        "Do not add entity labels outside the configured allowed entity types. "
-        "For json_structures: on every row, scan the input text for all 10 phrase types defined in annotation_guidance "
-        "(status, risk, goal, strategy, constraint, decision, task, preference, reason, technology) and populate "
-        "json_structures with arrays of VERBATIM strings copied from the input — no character offsets, just the text "
-        "itself. The pipeline rejects any span that isn't a substring of input.text, so do not paraphrase. Building "
-        "codes, requirements, must/shall statements are almost always constraints. Empty json_structures = {} is only "
-        "acceptable when the input genuinely contains no instance of any type. "
+        "For json_structures: on every row, scan the input text for instances of every phrase type the schema "
+        "declares and populate json_structures with arrays of VERBATIM strings copied from the input — no "
+        "character offsets, just the text itself. The pipeline rejects any span that isn't a substring of "
+        "input.text, so do not paraphrase. Empty json_structures = {} is only acceptable when the input "
+        "genuinely contains no instance of any declared type. "
         "\n\n"
         "HANDLING QC FEEDBACK: for each item in feedback_bundle, choose either to fix or to rebut:\n"
         "(a) if you accept the complaint — silently fix the annotation; no discussion_reply needed.\n"
@@ -3010,14 +3023,12 @@ def _build_qc_instructions(
         "If you fail this task, the NEXT QC pass on the same input MUST produce the same failure list — "
         "do not surface different missing types on different passes; that creates infinite retry loops. "
         "\n\n"
-        "json_structures recall: for each row, scan the input text for all 10 phrase types "
-        "(status, risk, goal, strategy, constraint, decision, task, preference, reason, technology) defined "
-        "in annotation_guidance. Each phrase is a verbatim string copied from input.text — no character offsets, "
-        "and the pipeline rejects spans that aren't substrings of input.text. Building codes / must / shall / "
-        "should statements are clear constraints. Note: json_structures.technology is OPTIONAL — do NOT flag "
-        "tasks for missing technology phrases just because the same name appears in entities.technology. "
-        "json_structures.technology is appropriate only when the technology is the structural subject of a "
-        "phrase (decision about it, constraint on it, status update on it). "
+        "json_structures recall: for each row, scan the input text for every phrase type declared in this "
+        "prompt's output_schema (jsonStructureType enum or equivalent $defs). Each phrase is a verbatim string "
+        "copied from input.text — no character offsets, and the pipeline rejects spans that aren't substrings "
+        "of input.text. Use ONLY phrase types the schema declares; do not invent new ones. When a phrase type "
+        "also appears as an entity type, treat the json_structures version as OPTIONAL — do NOT flag tasks for "
+        "missing json_structures entries just because the same name appears in entities. "
         "\n\n"
         "CONFIDENCE: every entry in failures MUST include a confidence field set to ONE of these "
         "strings (no numbers; the runtime won't accept them):\n"

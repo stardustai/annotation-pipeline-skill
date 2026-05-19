@@ -233,6 +233,19 @@ class SqliteStore:
             del self._local.conn
 
     def save_task(self, task: Task) -> None:
+        # Auto-stamp new tasks with the active annotation-rules version
+        # so the runtime can reproduce later exactly which rule set the
+        # task was annotated against. Only stamps when the task arrives
+        # unstamped — explicit assignments win.
+        if not task.document_version_id:
+            existing_row = self._conn.execute(
+                "SELECT document_version_id FROM tasks WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+            if existing_row is None or not existing_row["document_version_id"]:
+                version_id = self._active_annotation_rules_version_id()
+                if version_id:
+                    task.document_version_id = version_id
         d = task.to_dict()
         self._conn.execute(
             """
@@ -929,6 +942,41 @@ class SqliteStore:
             })
             for r in rows
         ]
+
+    def _active_annotation_rules_version_id(self) -> str | None:
+        """Return the version_id of the latest version of the singleton
+        annotation-rules document, or None if no such document or version
+        exists yet. Used to auto-stamp newly created tasks.
+        """
+        try:
+            doc_row = self._conn.execute(
+                "SELECT document_id, metadata_json FROM documents"
+            ).fetchall()
+        except Exception:
+            return None
+        target_doc_id: str | None = None
+        for r in doc_row:
+            try:
+                meta = json.loads(r["metadata_json"]) if r["metadata_json"] else {}
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict) and meta.get("role") == "annotation_rules":
+                target_doc_id = r["document_id"]
+                break
+        if not target_doc_id:
+            return None
+        ver_row = self._conn.execute(
+            """
+            SELECT version_id FROM document_versions
+            WHERE document_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (target_doc_id,),
+        ).fetchone()
+        if ver_row is None:
+            return None
+        return ver_row["version_id"]
 
     def _content_path_for(self, document_id: str, version: str) -> Path:
         return self.root / "document_versions" / document_id / f"{version}.md"

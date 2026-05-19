@@ -410,6 +410,38 @@ export async function createDocumentVersion(
   return response.json() as Promise<AnnotationDocumentVersion>;
 }
 
+export interface AnnotationRulesDocumentSnapshot {
+  document: AnnotationDocument;
+  versions: AnnotationDocumentVersion[];
+  latest_version_id: string | null;
+}
+
+export async function fetchAnnotationRulesDocument(
+  storeKey: string | null = null,
+): Promise<AnnotationRulesDocumentSnapshot> {
+  const response = await fetch(withStore("/api/annotation-rules-document", storeKey));
+  if (!response.ok) {
+    throw new Error(`Annotation rules document API returned ${response.status}`);
+  }
+  return response.json() as Promise<AnnotationRulesDocumentSnapshot>;
+}
+
+export async function createAnnotationRulesDocumentVersion(
+  payload: { version?: string; content: string; changelog: string; created_by?: string },
+  storeKey: string | null = null,
+): Promise<AnnotationDocumentVersion> {
+  const response = await fetch(withStore("/api/annotation-rules-document/versions", storeKey), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorPayload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+    throw new Error(errorPayload?.detail ?? errorPayload?.error ?? `Create annotation rules version returned ${response.status}`);
+  }
+  return response.json() as Promise<AnnotationDocumentVersion>;
+}
+
 export async function fetchProjectSchema(storeKey: string | null = null): Promise<{ schema: Record<string, unknown> | null }> {
   const response = await fetch(withStore("/api/schema", storeKey));
   if (!response.ok) throw new Error(`Schema fetch returned ${response.status}`);

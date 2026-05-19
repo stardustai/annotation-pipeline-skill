@@ -1015,6 +1015,8 @@ class DashboardApi:
             return self._json_response(200, validate_runtime_snapshot(self._runtime_snapshot(store)))
         if route == "/api/documents":
             return self._json_response(200, {"documents": [doc.to_dict() for doc in store.list_documents()]})
+        if route == "/api/annotation-rules-document":
+            return self._annotation_rules_document_response(store)
         if route.startswith("/api/documents/"):
             remainder = route.removeprefix("/api/documents/")
             parts = remainder.split("/")
@@ -1252,6 +1254,8 @@ class DashboardApi:
             return self._json_response(200, result)
         if route == "/api/documents":
             return self._post_document_response(store, body)
+        if route == "/api/annotation-rules-document/versions":
+            return self._post_annotation_rules_document_version(store, body)
         if route.startswith("/api/documents/") and route.endswith("/versions"):
             doc_id = route.removeprefix("/api/documents/").removesuffix("/versions").strip("/")
             return self._post_document_version_response(store, doc_id, body)
@@ -1615,6 +1619,100 @@ class DashboardApi:
         store.save_document_version(ver)
         return self._json_response(200, ver.to_dict())
 
+    # ---- annotation rules singleton document ---------------------------
+
+    _ANNOTATION_RULES_ROLE = "annotation_rules"
+
+    def _find_or_create_annotation_rules_doc(self, store: SqliteStore):
+        """Return the singleton AnnotationDocument that represents the
+        project's annotation rules. Seeded from `annotation_rules.yaml`
+        on first access if no such document exists yet.
+        """
+        from annotation_pipeline_skill.core.models import (
+            AnnotationDocument,
+            AnnotationDocumentVersion,
+        )
+
+        for d in store.list_documents():
+            if d.metadata.get("role") == self._ANNOTATION_RULES_ROLE:
+                return d
+        doc = AnnotationDocument.new(
+            title="Annotation Rules",
+            description="Project-level annotation rules injected into annotator / QC / arbiter prompts.",
+            created_by="system",
+            metadata={"role": self._ANNOTATION_RULES_ROLE},
+        )
+        store.save_document(doc)
+        # Auto-seed v1 from existing annotation_rules.yaml if present.
+        seed_path = store.root / "annotation_rules.yaml"
+        seed_content = ""
+        if seed_path.exists():
+            try:
+                seed_content = seed_path.read_text(encoding="utf-8")
+            except OSError:
+                seed_content = ""
+        if seed_content.strip():
+            ver = AnnotationDocumentVersion.new(
+                document_id=doc.document_id,
+                version="v1",
+                content=seed_content,
+                changelog="Initial seed from annotation_rules.yaml.",
+                created_by="system",
+                metadata={},
+            )
+            store.save_document_version(ver)
+        return doc
+
+    def _annotation_rules_document_response(
+        self, store: SqliteStore
+    ) -> tuple[int, dict[str, str], bytes]:
+        doc = self._find_or_create_annotation_rules_doc(store)
+        versions = store.list_document_versions(doc.document_id)
+        versions_sorted = sorted(versions, key=lambda v: v.created_at, reverse=True)
+        latest = versions_sorted[0] if versions_sorted else None
+        return self._json_response(
+            200,
+            {
+                "document": doc.to_dict(),
+                "versions": [v.to_dict() for v in versions_sorted],
+                "latest_version_id": latest.version_id if latest else None,
+            },
+        )
+
+    def _post_annotation_rules_document_version(
+        self, store: SqliteStore, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+        if not isinstance(payload, dict):
+            return self._json_response(400, {"error": "invalid_payload"})
+        from annotation_pipeline_skill.core.models import AnnotationDocumentVersion
+
+        doc = self._find_or_create_annotation_rules_doc(store)
+        version_label = str(payload.get("version") or "").strip()
+        if not version_label:
+            existing = store.list_document_versions(doc.document_id)
+            version_label = f"v{len(existing) + 1}"
+        ver = AnnotationDocumentVersion.new(
+            document_id=doc.document_id,
+            version=version_label,
+            content=str(payload.get("content") or ""),
+            changelog=str(payload.get("changelog") or ""),
+            created_by=str(payload.get("created_by") or "operator"),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+        store.save_document_version(ver)
+        # Also mirror the latest content to annotation_rules.yaml so the
+        # filesystem fallback in _load_guideline stays in sync for any
+        # task that lacks a stamped document_version_id.
+        try:
+            (store.root / "annotation_rules.yaml").write_text(ver.content, encoding="utf-8")
+        except OSError:
+            pass
+        return self._json_response(200, ver.to_dict())
+
     def _task_deviations_response(self, store: SqliteStore, task_id: str) -> tuple[int, dict[str, str], bytes]:
         """Return per-(span, type) deviations for a single task against
         the project's entity_statistics. Used by Manual Review to surface
@@ -1695,6 +1793,19 @@ class DashboardApi:
         except FileNotFoundError:
             return self._json_response(404, {"error": "task_not_found"})
 
+        # Apply row-level mask filtering at the read boundary so the
+        # annotator-facing payload never includes rows that have been
+        # masked (whether by row-dedup auto-mask, manual mask, etc.).
+        # Mask state is sourced from the row_masks table.
+        from annotation_pipeline_skill.services.row_mask_service import (
+            RowMaskService,
+            apply_masks_to_task,
+        )
+        masked_task = apply_masks_to_task(store, task)
+        masked_indices = sorted(
+            RowMaskService(store).masked_indices_for_task(task_id)
+        )
+
         artifacts = [
             {**artifact.to_dict(), "payload": self._read_artifact_payload(store, artifact.path)}
             for artifact in store.list_artifacts(task_id)
@@ -1702,7 +1813,10 @@ class DashboardApi:
         return self._json_response(
             200,
             {
-                "task": task.to_dict(),
+                "task": masked_task.to_dict(),
+                # Surface the indices of rows that were filtered out — useful
+                # for the UI to show a "N rows masked" hint and for debugging.
+                "masked_row_indices": masked_indices,
                 "attempts": [attempt.to_dict() for attempt in store.list_attempts(task_id)],
                 "artifacts": artifacts,
                 "events": [event.to_dict() for event in store.list_events(task_id)],

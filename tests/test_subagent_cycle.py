@@ -57,7 +57,9 @@ def test_subagent_runtime_runs_annotation_and_qc_before_accepting(tmp_path):
     assert [artifact.kind for artifact in artifacts] == ["annotation_result", "qc_result"]
     assert artifacts[0].metadata["continuity_handle"] == "thread-1"
     assert store.list_feedback("task-1") == []
-    assert "annotation_guidance" in annotation_client.requests[0].instructions
+    # Annotator prompt is schema-driven now; assert it references output_schema
+    # rather than the legacy annotation_guidance field.
+    assert "output_schema" in annotation_client.requests[0].instructions
     assert "raw JSON" in qc_client.requests[0].instructions
     assert '"annotation_result"' in qc_client.requests[0].prompt
 
