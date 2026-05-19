@@ -165,24 +165,45 @@ export function DistributionPanel({
     setRejectStatus(null);
     try {
       const storeQs = buildStoreQs(storeKey);
-      const r = await fetch(
-        `/api/distribution/scan?project=${encodeURIComponent(projectId)}${storeQs ? "&" + storeQs.slice(1) : ""}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            profile,
-            statuses: null,
-            min_cluster_size: minClusterSize,
-            umap_neighbors: 15,
-            umap_min_dist: 0.1,
-          }),
-        },
-      );
+      const scanUrl = `/api/distribution/scan?project=${encodeURIComponent(projectId)}${storeQs ? "&" + storeQs.slice(1) : ""}`;
+      const r = await fetch(scanUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          profile,
+          statuses: null,
+          min_cluster_size: minClusterSize,
+          umap_neighbors: 15,
+          umap_min_dist: 0.1,
+        }),
+      });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = (await r.json()) as CacheResponse;
-      setCache(d);
-      setSelected({});
+      const launch = await r.json();
+      const job = launch?.job;
+      if (!job?.job_id) {
+        setCache(launch as CacheResponse);
+        setSelected({});
+        return;
+      }
+      // Distribution scans can take minutes (UMAP + HDBSCAN on
+      // thousands of embeddings). Poll every 3s, allow up to 15 min.
+      const deadline = Date.now() + 15 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 3000));
+        const jr = await fetch(`/api/jobs/${encodeURIComponent(job.job_id)}${storeQs}`);
+        if (!jr.ok) continue;
+        const jdata = await jr.json();
+        if (jdata.status === "done") {
+          const fresh = await fetch(buildDistributionUrl(projectId, storeKey, profile));
+          if (fresh.ok) setCache((await fresh.json()) as CacheResponse);
+          setSelected({});
+          return;
+        }
+        if (jdata.status === "error") {
+          throw new Error(jdata.error || "background scan failed");
+        }
+      }
+      throw new Error("scan timed out (15 min)");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

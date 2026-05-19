@@ -147,7 +147,30 @@ export function PosteriorAuditPanel({
         method: "POST",
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      setCache(await r.json());
+      const launch = await r.json();
+      const job = launch?.job;
+      if (!job?.job_id) {
+        // Legacy sync response.
+        setCache(launch);
+        return;
+      }
+      const deadline = Date.now() + 5 * 60 * 1000;
+      const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 2000));
+        const jr = await fetch(`/api/jobs/${encodeURIComponent(job.job_id)}${storeQ}`);
+        if (!jr.ok) continue;
+        const jdata = await jr.json();
+        if (jdata.status === "done") {
+          const fresh = await fetch(urlWithStore("/api/posterior-audit", projectId, storeKey));
+          if (fresh.ok) setCache(await fresh.json());
+          return;
+        }
+        if (jdata.status === "error") {
+          throw new Error(jdata.error || "background job failed");
+        }
+      }
+      throw new Error("background job timed out (5 min)");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

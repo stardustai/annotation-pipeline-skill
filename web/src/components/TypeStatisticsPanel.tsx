@@ -173,7 +173,34 @@ export function TypeStatisticsPanel({
     try {
       const r = await fetch(urlWithStore("/api/type-statistics"), { method: "POST" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      setData(await r.json());
+      const launch = await r.json();
+      const job = launch?.job;
+      if (!job?.job_id) {
+        // Legacy sync response — treat as already-done.
+        setData(launch);
+        return;
+      }
+      // Background job started. Poll status every 2s until done; UI
+      // stays responsive (operator can navigate elsewhere and come
+      // back). Cap polling at ~5 min so we don't loop forever on a
+      // stuck job.
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 2000));
+        const jr = await fetch(urlWithStore("/api/jobs/" + encodeURIComponent(job.job_id)));
+        if (!jr.ok) continue;
+        const jdata = await jr.json();
+        if (jdata.status === "done") {
+          // Refetch the GET endpoint to pull the freshly-written cache.
+          const fresh = await fetch(urlWithStore("/api/type-statistics"));
+          if (fresh.ok) setData(await fresh.json());
+          return;
+        }
+        if (jdata.status === "error") {
+          throw new Error(jdata.error || "background job failed");
+        }
+      }
+      throw new Error("background job timed out (5 min); check server logs");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

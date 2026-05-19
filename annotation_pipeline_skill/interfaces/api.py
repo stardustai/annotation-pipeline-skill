@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
+import traceback
+import uuid
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +34,84 @@ from annotation_pipeline_skill.services.provider_config_service import build_pro
 from annotation_pipeline_skill.services.readiness_service import build_readiness_report
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 from annotation_pipeline_skill.llm.profiles import ProfileValidationError
+
+
+_BACKGROUND_JOBS: dict[str, dict[str, Any]] = {}
+_BACKGROUND_JOBS_LOCK = threading.Lock()
+# Tracks "is there an in-flight long-running job of `kind` for this project"
+# so duplicate POSTs don't pile up parallel scans. Key = (project_id, kind).
+_BACKGROUND_INFLIGHT: dict[tuple[str, str], str] = {}
+
+
+def _start_background_job(
+    *,
+    kind: str,
+    project_id: str,
+    target: Callable[..., Any],
+    args: tuple = (),
+    kwargs: dict | None = None,
+) -> dict[str, Any]:
+    """Spawn `target(*args, **kwargs)` in a daemon thread and return the
+    job descriptor immediately. Caller hands the job_id back to the
+    frontend, which polls GET /api/jobs/<id> for status.
+
+    Idempotent on (project_id, kind): if an in-flight job of the same
+    kind exists, returns it instead of spawning a duplicate. Lets the
+    UI's "scan started" button safely no-op on double-click.
+
+    Background jobs run on detached threads — they don't block the
+    request handler. SQLite is WAL so reads remain available while
+    writes happen.
+    """
+    inflight_key = (project_id, kind)
+    with _BACKGROUND_JOBS_LOCK:
+        existing_id = _BACKGROUND_INFLIGHT.get(inflight_key)
+        if existing_id is not None:
+            job = _BACKGROUND_JOBS.get(existing_id)
+            if job is not None and job.get("status") == "running":
+                return dict(job)
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "job_id": job_id,
+            "kind": kind,
+            "project_id": project_id,
+            "status": "running",
+            "started_at": utc_now().isoformat(),
+            "finished_at": None,
+            "error": None,
+            "result": None,
+        }
+        _BACKGROUND_JOBS[job_id] = job
+        _BACKGROUND_INFLIGHT[inflight_key] = job_id
+
+    def _run() -> None:
+        try:
+            result = target(*args, **(kwargs or {}))
+            with _BACKGROUND_JOBS_LOCK:
+                _BACKGROUND_JOBS[job_id]["status"] = "done"
+                _BACKGROUND_JOBS[job_id]["finished_at"] = utc_now().isoformat()
+                _BACKGROUND_JOBS[job_id]["result"] = result if isinstance(result, dict) else None
+        except Exception as exc:  # noqa: BLE001
+            with _BACKGROUND_JOBS_LOCK:
+                _BACKGROUND_JOBS[job_id]["status"] = "error"
+                _BACKGROUND_JOBS[job_id]["finished_at"] = utc_now().isoformat()
+                _BACKGROUND_JOBS[job_id]["error"] = f"{type(exc).__name__}: {exc}"
+                _BACKGROUND_JOBS[job_id]["traceback"] = traceback.format_exc()
+        finally:
+            with _BACKGROUND_JOBS_LOCK:
+                # Clear the inflight slot whether success or failure;
+                # next POST can spawn a fresh attempt.
+                if _BACKGROUND_INFLIGHT.get(inflight_key) == job_id:
+                    _BACKGROUND_INFLIGHT.pop(inflight_key, None)
+
+    threading.Thread(target=_run, name=f"bg-{kind}-{job_id}", daemon=True).start()
+    return dict(job)
+
+
+def _read_background_job(job_id: str) -> dict[str, Any] | None:
+    with _BACKGROUND_JOBS_LOCK:
+        job = _BACKGROUND_JOBS.get(job_id)
+        return dict(job) if job is not None else None
 
 
 def build_posterior_audit(store, *, project_id: str) -> dict:
@@ -727,6 +808,14 @@ class DashboardApi:
             state = svc.get_cache_state(project_id=project_id, profile_name=profile_name)
             state["available_profiles"] = sorted(profiles.keys())
             return self._json_response(200, state)
+        if route.startswith("/api/jobs/"):
+            job_id = route.removeprefix("/api/jobs/").strip("/")
+            if not job_id:
+                return self._json_response(400, {"error": "job_id_required"})
+            job = _read_background_job(job_id)
+            if job is None:
+                return self._json_response(404, {"error": "job_not_found"})
+            return self._json_response(200, job)
         if route == "/api/type-statistics":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -841,37 +930,41 @@ class DashboardApi:
         if route == "/api/posterior-audit":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
-            payload = build_posterior_audit(store, project_id=project_id)
-            accepted_hash = compute_accepted_hash(store, project_id=project_id)
-            from annotation_pipeline_skill.core.models import utc_now
-            created_at = utc_now().isoformat()
-            write_posterior_audit_cache(
-                store,
+
+            def _rebuild_posterior_audit() -> dict:
+                payload = build_posterior_audit(store, project_id=project_id)
+                accepted_hash = compute_accepted_hash(store, project_id=project_id)
+                created_at = utc_now().isoformat()
+                write_posterior_audit_cache(
+                    store, project_id=project_id, payload=payload,
+                    accepted_hash=accepted_hash, created_at=created_at,
+                )
+                return {"generated_at": created_at}
+
+            job = _start_background_job(
+                kind="posterior_audit_rebuild",
                 project_id=project_id,
-                payload=payload,
-                accepted_hash=accepted_hash,
-                created_at=created_at,
+                target=_rebuild_posterior_audit,
             )
-            return self._json_response(200, {
-                "cached": True,
-                "payload": payload,
-                "generated_at": created_at,
-                "cached_accepted_hash": accepted_hash,
-                "current_accepted_hash": accepted_hash,
-                "stale": False,
-            })
+            return self._json_response(202, {"started": True, "job": job})
         if route == "/api/type-statistics":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
-            payload = build_type_statistics(store, project_id=project_id)
-            from annotation_pipeline_skill.core.models import utc_now
-            created_at = utc_now().isoformat()
-            write_type_statistics_cache(
-                store, project_id=project_id, payload=payload, created_at=created_at,
+
+            def _rebuild_type_statistics() -> dict:
+                payload = build_type_statistics(store, project_id=project_id)
+                created_at = utc_now().isoformat()
+                write_type_statistics_cache(
+                    store, project_id=project_id, payload=payload, created_at=created_at,
+                )
+                return {"generated_at": created_at}
+
+            job = _start_background_job(
+                kind="type_statistics_rebuild",
+                project_id=project_id,
+                target=_rebuild_type_statistics,
             )
-            return self._json_response(200, {
-                "cached": True, "payload": payload, "generated_at": created_at,
-            })
+            return self._json_response(202, {"started": True, "job": job})
         if route == "/api/distribution/scan":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -894,7 +987,8 @@ class DashboardApi:
                 return self._json_response(400, {"error": "profiles_file_missing"})
             from annotation_pipeline_skill.services.distribution_service import DistributionService
             svc = DistributionService(store, profiles)
-            try:
+
+            def _run_distribution_scan() -> dict:
                 payload = svc.scan(
                     project_id=project_id,
                     profile_name=profile_name,
@@ -903,20 +997,19 @@ class DashboardApi:
                     umap_neighbors=umap_neighbors,
                     umap_min_dist=umap_min_dist,
                 )
-            except KeyError as exc:
-                return self._json_response(400, {"error": "invalid_profile", "detail": str(exc)})
-            except Exception as exc:  # noqa: BLE001 — embed step may time out
-                return self._json_response(500, {"error": "scan_failed", "detail": str(exc)})
-            current_hash = compute_distribution_content_hash(store, project_id=project_id, statuses=statuses)
-            from annotation_pipeline_skill.core.models import utc_now as _utc_now_dist
-            generated_at = payload.get("params", {}).get("generated_at", _utc_now_dist().isoformat())
-            return self._json_response(200, {
-                "cached": True,
-                "payload": payload,
-                "generated_at": generated_at,
-                "cached_content_hash": current_hash,
-                "current_content_hash": current_hash,
-                "stale": False,
+                generated_at = payload.get("params", {}).get(
+                    "generated_at", utc_now().isoformat(),
+                )
+                return {"generated_at": generated_at}
+
+            job = _start_background_job(
+                kind=f"distribution_scan:{profile_name}",
+                project_id=project_id,
+                target=_run_distribution_scan,
+            )
+            return self._json_response(202, {
+                "started": True,
+                "job": job,
                 "available_profiles": sorted(profiles.keys()),
             })
         if route == "/api/distribution/reject":
