@@ -448,6 +448,7 @@ export function DistributionPanel({
               onSelectAll={handleSelectAll}
               onClearAll={handleClearAll}
               onReject={() => handleReject(filteredClusters)}
+              onSelectTask={onSelectTask}
             />
           ) : null}
 
@@ -482,6 +483,7 @@ type DuplicatesSubTabProps = {
   onSelectAll: () => void;
   onClearAll: () => void;
   onReject: () => void;
+  onSelectTask?: (taskId: string) => void;
 };
 
 function DuplicatesSubTab({
@@ -498,6 +500,7 @@ function DuplicatesSubTab({
   onSelectAll,
   onClearAll,
   onReject,
+  onSelectTask,
 }: DuplicatesSubTabProps): React.ReactElement {
   function toggleTask(taskId: string, checked: boolean) {
     setSelected((prev) => {
@@ -603,25 +606,39 @@ function DuplicatesSubTab({
                   cos={cluster.similarity.toFixed(3)}
                 </span>
                 <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
-                  rep=<code style={{ fontFamily: "monospace" }}>{rep}</code>
+                  rep=
+                  <button
+                    type="button"
+                    onClick={() => onSelectTask?.(rep)}
+                    title="Open task drawer"
+                    style={{
+                      fontFamily: "monospace", fontSize: "0.8rem",
+                      background: "transparent", border: "none", padding: 0,
+                      color: "inherit", textDecoration: "underline",
+                      textUnderlineOffset: "2px", cursor: "pointer",
+                    }}
+                  >
+                    {rep}
+                  </button>
                 </span>
               </div>
 
               {/* ── Member rows ──────────────────────────────────────── */}
+              {/* Each row: checkbox toggles batch-reject selection (independent);
+                  the task-id button + preview opens the drawer for inspection. */}
               <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
                 {preview5.map((taskId) => {
                   const coord = coordMap.get(taskId);
                   const preview = coord?.text_preview ?? "";
                   const isChecked = selected[taskId] === true;
                   return (
-                    <label
+                    <div
                       key={taskId}
                       style={{
                         display: "flex",
                         alignItems: "flex-start",
                         gap: "0.5rem",
                         fontSize: "0.82rem",
-                        cursor: "pointer",
                         padding: "0.2rem 0",
                       }}
                     >
@@ -629,18 +646,35 @@ function DuplicatesSubTab({
                         type="checkbox"
                         checked={isChecked}
                         onChange={(e) => toggleTask(taskId, e.target.checked)}
-                        style={{ marginTop: "2px", flexShrink: 0 }}
+                        title="Include in batch reject"
+                        style={{ marginTop: "2px", flexShrink: 0, cursor: "pointer" }}
                       />
-                      <span>
-                        <code style={{ fontFamily: "monospace", fontSize: "0.8rem" }}>{taskId}</code>
+                      <button
+                        type="button"
+                        onClick={() => onSelectTask?.(taskId)}
+                        title="Open task drawer"
+                        style={{
+                          flex: 1, textAlign: "left",
+                          background: "transparent", border: "none", padding: 0,
+                          color: "inherit", cursor: "pointer", font: "inherit",
+                        }}
+                      >
+                        <code
+                          style={{
+                            fontFamily: "monospace", fontSize: "0.8rem",
+                            textDecoration: "underline", textUnderlineOffset: "2px",
+                          }}
+                        >
+                          {taskId}
+                        </code>
                         {preview ? (
                           <span className="runtime-muted" style={{ marginLeft: "0.4rem" }}>
                             — {preview.slice(0, 80)}
                             {preview.length > 80 ? "…" : ""}
                           </span>
                         ) : null}
-                      </span>
-                    </label>
+                      </button>
+                    </div>
                   );
                 })}
                 {members.length > 5 ? (
