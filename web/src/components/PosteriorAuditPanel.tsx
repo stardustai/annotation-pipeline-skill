@@ -395,7 +395,7 @@ export function PosteriorAuditPanel({
           {subtab === "low_info" ? (
             <>
               <div style={FORMULA_BLOCK_STYLE}>
-                <strong>Low info entries</strong> — all divergent spans whose tokens score
+                <strong>Low info entries</strong> — all spans whose tokens score
                 ≥&nbsp;<code>{lowInfoThreshold.toFixed(1)}</code> on the Zipf frequency scale
                 (common everyday words). Set to <code>not_an_entity</code> in bulk rather than
                 adjudicating one-by-one.
