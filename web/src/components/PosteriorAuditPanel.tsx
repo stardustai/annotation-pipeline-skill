@@ -588,13 +588,14 @@ function DeviationsTable({
       totalErrors += initialData.errors?.length ?? 0;
       const allCandidates = initialData.candidate_task_ids ?? [];
       const serverTotal = allCandidates.length;
+      // cursor is an index into allCandidates (task IDs), not a count of
+      // fixed/errored candidates. The server processed the first BATCH task
+      // IDs on the initial call, so start after those.
+      let cursor = Math.min(BATCH, allCandidates.length);
       setRetroProgress((prev) => ({
         ...prev,
-        [span]: { processed: initialData.fixed + initialData.errors.length, total: serverTotal },
+        [span]: { processed: cursor, total: serverTotal },
       }));
-      // Server already processed the first BATCH of the candidate list,
-      // so we skip those when iterating.
-      let cursor = initialData.fixed + initialData.errors.length;
       while (cursor < allCandidates.length) {
         const slice = allCandidates.slice(cursor, cursor + BATCH);
         const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
@@ -1159,11 +1160,11 @@ function ContestedTable({
       totalErrors += initialData.errors?.length ?? 0;
       const allCandidates = initialData.candidate_task_ids ?? [];
       const serverTotal = allCandidates.length;
+      let cursor = Math.min(BATCH, allCandidates.length);
       setRetroProgress((prev) => ({
         ...prev,
-        [span]: { processed: initialData.fixed + initialData.errors.length, total: serverTotal },
+        [span]: { processed: cursor, total: serverTotal },
       }));
-      let cursor = initialData.fixed + initialData.errors.length;
       while (cursor < allCandidates.length) {
         const slice = allCandidates.slice(cursor, cursor + BATCH);
         const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
@@ -1600,7 +1601,7 @@ function LowInfoTable({
         candidate_task_ids: string[] | null;
       };
       const allCandidates = initialData.candidate_task_ids ?? [];
-      let cursor = initialData.fixed + initialData.errors.length;
+      let cursor = Math.min(BATCH, allCandidates.length);
       while (cursor < allCandidates.length) {
         const slice = allCandidates.slice(cursor, cursor + BATCH);
         const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
