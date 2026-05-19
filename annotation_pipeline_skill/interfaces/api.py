@@ -712,6 +712,21 @@ class DashboardApi:
                 "current_accepted_hash": current_hash,
                 "stale": cached["accepted_hash"] != current_hash,
             })
+        if route == "/api/distribution":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            profile_name = query.get("profile", ["jina_small"])[0]
+            profiles_path = self.workspace_root / "similarity_profiles.yaml"
+            try:
+                from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
+                profiles = load_similarity_profiles(profiles_path)
+            except FileNotFoundError:
+                profiles = {}
+            from annotation_pipeline_skill.services.distribution_service import DistributionService
+            svc = DistributionService(store, profiles)
+            state = svc.get_cache_state(project_id=project_id, profile_name=profile_name)
+            state["available_profiles"] = sorted(profiles.keys())
+            return self._json_response(200, state)
         if route == "/api/type-statistics":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -857,6 +872,84 @@ class DashboardApi:
             return self._json_response(200, {
                 "cached": True, "payload": payload, "generated_at": created_at,
             })
+        if route == "/api/distribution/scan":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            try:
+                data = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(data, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            profile_name = data.get("profile", "jina_small")
+            statuses = data.get("statuses")  # None = all stages
+            min_cluster_size = int(data.get("min_cluster_size", 5))
+            umap_neighbors = int(data.get("umap_neighbors", 15))
+            umap_min_dist = float(data.get("umap_min_dist", 0.1))
+            profiles_path = self.workspace_root / "similarity_profiles.yaml"
+            try:
+                from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
+                profiles = load_similarity_profiles(profiles_path)
+            except FileNotFoundError:
+                return self._json_response(400, {"error": "profiles_file_missing"})
+            from annotation_pipeline_skill.services.distribution_service import DistributionService
+            svc = DistributionService(store, profiles)
+            try:
+                payload = svc.scan(
+                    project_id=project_id,
+                    profile_name=profile_name,
+                    statuses=statuses,
+                    min_cluster_size=min_cluster_size,
+                    umap_neighbors=umap_neighbors,
+                    umap_min_dist=umap_min_dist,
+                )
+            except KeyError as exc:
+                return self._json_response(400, {"error": "invalid_profile", "detail": str(exc)})
+            except Exception as exc:  # noqa: BLE001 — embed step may time out
+                return self._json_response(500, {"error": "scan_failed", "detail": str(exc)})
+            current_hash = compute_distribution_content_hash(store, project_id=project_id, statuses=statuses)
+            from annotation_pipeline_skill.core.models import utc_now as _utc_now_dist
+            generated_at = payload.get("params", {}).get("generated_at", _utc_now_dist().isoformat())
+            return self._json_response(200, {
+                "cached": True,
+                "payload": payload,
+                "generated_at": generated_at,
+                "cached_content_hash": current_hash,
+                "current_content_hash": current_hash,
+                "stale": False,
+                "available_profiles": sorted(profiles.keys()),
+            })
+        if route == "/api/distribution/reject":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            try:
+                data = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(data, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            task_ids = data.get("task_ids")
+            if not isinstance(task_ids, list) or not task_ids:
+                return self._json_response(400, {"error": "task_ids_required"})
+            profiles_path = self.workspace_root / "similarity_profiles.yaml"
+            try:
+                from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
+                profiles = load_similarity_profiles(profiles_path)
+            except FileNotFoundError:
+                profiles = {}
+            from annotation_pipeline_skill.services.distribution_service import DistributionService
+            svc = DistributionService(store, profiles)
+            result = svc.reject_duplicates(
+                project_id=project_id,
+                task_ids=task_ids,
+                cluster_id=data.get("cluster_id"),
+                representative_task_id=data.get("representative_task_id"),
+                cluster_similarity=data.get("cluster_similarity"),
+                embedding_profile=data.get("embedding_profile", ""),
+                embedding_model=data.get("embedding_model", ""),
+                actor=data.get("actor", "operator"),
+            )
+            return self._json_response(200, result)
         if route == "/api/documents":
             return self._post_document_response(store, body)
         if route.startswith("/api/documents/") and route.endswith("/versions"):
