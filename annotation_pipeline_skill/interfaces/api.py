@@ -508,6 +508,89 @@ def compute_distribution_content_hash(
     return f"sha256:{h.hexdigest()[:16]}:n={len(rows)}"
 
 
+def read_row_dedup_cache(
+    store, *, project_id: str, profile_name: str,
+) -> dict | None:
+    row = store._conn.execute(
+        "SELECT payload_json, content_hash, created_at "
+        "FROM row_dedup_cache WHERE project_id=? AND profile_name=?",
+        (project_id, profile_name),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "payload": json.loads(row["payload_json"]),
+        "content_hash": row["content_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def write_row_dedup_cache(
+    store, *, project_id: str, profile_name: str,
+    payload: dict, content_hash: str, created_at: str,
+) -> None:
+    store._conn.execute(
+        "INSERT INTO row_dedup_cache "
+        "(project_id, profile_name, payload_json, content_hash, created_at) "
+        "VALUES (?,?,?,?,?) "
+        "ON CONFLICT(project_id, profile_name) DO UPDATE SET "
+        "payload_json=excluded.payload_json, "
+        "content_hash=excluded.content_hash, "
+        "created_at=excluded.created_at",
+        (project_id, profile_name,
+         json.dumps(payload, ensure_ascii=False),
+         content_hash, created_at),
+    )
+    store._conn.commit()
+
+
+def compute_row_dedup_content_hash(
+    store, *, project_id: str, statuses: list[str] | None = None,
+) -> str:
+    """Fingerprint the row-level input that RowDedupService operates on.
+
+    Incorporates (task_id, status, source_ref_json sha256) for every task
+    in the status filter, PLUS the set of active row_masks for those tasks.
+    Row masks are included so that masking a row (or removing a mask) marks
+    the cache stale — the cluster list changes even though no task text
+    changed.
+    """
+    import hashlib as _hashlib
+    h = _hashlib.sha256()
+    if statuses:
+        placeholders = ",".join("?" * len(statuses))
+        sql = (
+            "SELECT task_id, status, source_ref_json FROM tasks "
+            f"WHERE pipeline_id=? AND status IN ({placeholders}) "
+            "ORDER BY task_id"
+        )
+        params: list[object] = [project_id, *statuses]
+    else:
+        sql = (
+            "SELECT task_id, status, source_ref_json FROM tasks "
+            "WHERE pipeline_id=? ORDER BY task_id"
+        )
+        params = [project_id]
+    rows = store._conn.execute(sql, params).fetchall()
+    for r in rows:
+        text = r["source_ref_json"] or ""
+        ref_h = _hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        h.update(f"{r['task_id']}|{r['status']}|{ref_h}\n".encode("utf-8"))
+    # Also include row masks so masking a row marks the cache stale.
+    task_ids = [r["task_id"] for r in rows]
+    if task_ids:
+        id_placeholders = ",".join("?" * len(task_ids))
+        mask_rows = store._conn.execute(
+            f"SELECT task_id, row_index FROM row_masks "
+            f"WHERE task_id IN ({id_placeholders}) "
+            "ORDER BY task_id, row_index",
+            task_ids,
+        ).fetchall()
+        for mr in mask_rows:
+            h.update(f"mask:{mr['task_id']}:{mr['row_index']}\n".encode("utf-8"))
+    return f"sha256:{h.hexdigest()[:16]}:n={len(rows)}"
+
+
 def build_type_statistics(store, *, project_id: str) -> dict:
     """Walk every ACCEPTED task in the project and aggregate counts by
     entity type AND by json_structure phrase type. The "Statistics"
@@ -808,6 +891,21 @@ class DashboardApi:
             state = svc.get_cache_state(project_id=project_id, profile_name=profile_name)
             state["available_profiles"] = sorted(profiles.keys())
             return self._json_response(200, state)
+        if route == "/api/row-dedup":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            profile_name = query.get("profile", ["MinHash"])[0]
+            profiles_path = self.workspace_root / "similarity_profiles.yaml"
+            try:
+                from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
+                profiles = load_similarity_profiles(profiles_path)
+            except FileNotFoundError:
+                profiles = {}
+            from annotation_pipeline_skill.services.row_dedup_service import RowDedupService
+            svc = RowDedupService(store, profiles)
+            state = svc.get_cache_state(project_id=project_id, profile_name=profile_name)
+            state["available_profiles"] = sorted(profiles.keys())
+            return self._json_response(200, state)
         if route.startswith("/api/jobs/"):
             job_id = route.removeprefix("/api/jobs/").strip("/")
             if not job_id:
@@ -1041,6 +1139,75 @@ class DashboardApi:
                 embedding_profile=data.get("embedding_profile", ""),
                 embedding_model=data.get("embedding_model", ""),
                 actor=data.get("actor", "operator"),
+            )
+            return self._json_response(200, result)
+        if route == "/api/row-dedup/scan":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            try:
+                data = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(data, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            profile_name = data.get("profile", "MinHash")
+            statuses = data.get("statuses")  # None = all stages
+            jaccard_threshold = float(data.get("jaccard_threshold", 0.5))
+            max_rows_per_task = int(data.get("max_rows_per_task", 100))
+            profiles_path = self.workspace_root / "similarity_profiles.yaml"
+            try:
+                from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
+                profiles = load_similarity_profiles(profiles_path)
+            except FileNotFoundError:
+                return self._json_response(400, {"error": "profiles_file_missing"})
+            from annotation_pipeline_skill.services.row_dedup_service import RowDedupService
+            svc = RowDedupService(store, profiles)
+            # Run synchronously (scan_rows is typically fast; background job
+            # can be wired up later if needed)
+            try:
+                svc.scan_rows(
+                    project_id=project_id,
+                    profile_name=profile_name,
+                    statuses=statuses,
+                    jaccard_threshold=jaccard_threshold,
+                    max_rows_per_task=max_rows_per_task,
+                )
+            except KeyError as exc:
+                return self._json_response(400, {"error": "unknown_profile", "detail": str(exc)})
+            state = svc.get_cache_state(project_id=project_id, profile_name=profile_name)
+            state["available_profiles"] = sorted(profiles.keys())
+            return self._json_response(200, state)
+        if route == "/api/row-dedup/mask":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            try:
+                data = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(data, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            members = data.get("members")
+            if not isinstance(members, list) or not members:
+                return self._json_response(400, {"error": "members_required"})
+            cluster_id = data.get("cluster_id", "")
+            cluster_similarity = float(data.get("cluster_similarity", 0.0))
+            embedding_profile = data.get("embedding_profile", "")
+            embedding_model = data.get("embedding_model", "")
+            profiles_path = self.workspace_root / "similarity_profiles.yaml"
+            try:
+                from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
+                profiles = load_similarity_profiles(profiles_path)
+            except FileNotFoundError:
+                profiles = {}
+            from annotation_pipeline_skill.services.row_dedup_service import RowDedupService
+            svc = RowDedupService(store, profiles)
+            result = svc.mask_duplicates(
+                project_id=project_id,
+                members=members,
+                cluster_id=cluster_id,
+                similarity=cluster_similarity,
+                profile_name=embedding_profile,
+                model=embedding_model,
             )
             return self._json_response(200, result)
         if route == "/api/documents":
@@ -1326,6 +1493,35 @@ class DashboardApi:
         except (FileNotFoundError, OSError, ProfileValidationError) as exc:
             return self._json_response(400, {"error": "invalid_provider_config", "detail": str(exc)})
         return self._json_response(200, snapshot)
+
+    def handle_delete(self, path: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
+        parsed_path = urlparse(path)
+        route = parsed_path.path
+        query = parse_qs(parsed_path.query)
+        store = self._resolve_store(query)
+        project_id = query.get("project", [None])[0]
+        if route == "/api/row-dedup/mask":
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            try:
+                data = json.loads(body or b"{}")
+            except json.JSONDecodeError as exc:
+                return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+            if not isinstance(data, dict):
+                return self._json_response(400, {"error": "invalid_payload"})
+            pairs_raw = data.get("pairs")
+            if not isinstance(pairs_raw, list) or not pairs_raw:
+                return self._json_response(400, {"error": "pairs_required"})
+            from annotation_pipeline_skill.services.row_mask_service import RowMaskService
+            mask_svc = RowMaskService(store)
+            pairs = [
+                (p["task_id"], int(p["row_index"]))
+                for p in pairs_raw
+                if isinstance(p, dict) and "task_id" in p and "row_index" in p
+            ]
+            removed = mask_svc.remove_many(pairs)
+            return self._json_response(200, {"removed": removed})
+        return self._json_response(404, {"error": "not_found"})
 
     def _json_response(self, status: int, payload: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -2348,6 +2544,12 @@ def make_handler(api: DashboardApi, static_root: Path | None = None) -> type[Bas
             content_length = int(self.headers.get("content-length", "0"))
             request_body = self.rfile.read(content_length)
             status, headers, body = api.handle_post(self.path, request_body)
+            self._send(status, headers, body)
+
+        def do_DELETE(self) -> None:
+            content_length = int(self.headers.get("content-length", "0"))
+            request_body = self.rfile.read(content_length)
+            status, headers, body = api.handle_delete(self.path, request_body)
             self._send(status, headers, body)
 
         def _send(self, status: int, headers: dict[str, str], body: bytes) -> None:
