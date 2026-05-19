@@ -3,7 +3,16 @@ import { fetchProviderConfig, saveProviderConfig } from "../api";
 import { createProviderProfile, profileStatusLabel, profileTitle, providerConfigPayload } from "../providers";
 import type { ProviderConfigSnapshot, ProviderName, ProviderProfileConfig } from "../types";
 
-const stageTargets = ["annotation", "qc", "coordinator", "human_review"];
+// Stages the runtime resolves via `client_factory(target_name)`. Order
+// matters for layout (top row = the most-edited two; second row =
+// arbitration; third = fallback). Note: `arbiter_secondary` is the
+// prior-divergence second arbiter and should usually be a different
+// LLM family from `arbiter` to keep the cross-LLM check honest.
+const stageTargets = [
+  "annotation", "qc",
+  "arbiter", "arbiter_secondary",
+  "coordinator", "fallback",
+];
 
 export function ProvidersPanel() {
   // Providers are workspace-global: a single llm_profiles.yaml shared across
@@ -126,6 +135,43 @@ export function ProvidersPanel() {
 
       {message ? <div className="notice compact">{message}</div> : null}
 
+      {/* Stage Targets — pinned to the TOP since it's the most-edited
+          block and the routing decisions here determine which profile
+          handles which pipeline stage. Single source of truth for the
+          stage → profile mapping; the Annotation Agents form no longer
+          edits this. */}
+      <div className="provider-targets" style={{ marginBottom: "1rem" }}>
+        <h3 style={{ marginTop: 0 }}>Stage Targets</h3>
+        <p style={{ marginTop: "-0.25rem", marginBottom: "0.5rem", fontSize: "0.85rem", color: "var(--muted, #6b7280)" }}>
+          Each stage routes to one profile at runtime via{" "}
+          <code>client_factory(stage_name)</code>. <code>arbiter_secondary</code>{" "}
+          is the prior-divergence second arbiter — use a different LLM family
+          from <code>arbiter</code> for an honest cross-LLM check.{" "}
+          <code>fallback</code> is invoked on transient provider errors
+          (429 / 5xx) when a primary stage call fails.
+        </p>
+        <div className="target-grid">
+          {stageTargets.map((stage) => (
+            <label key={stage}>
+              <span>{stage}</span>
+              <select value={snapshot.targets[stage] ?? ""} onChange={(event) => updateTarget(stage, event.target.value)}>
+                <option value="">Unassigned</option>
+                {snapshot.profiles.map((profile) => (
+                  <option key={profile.name} value={profile.name}>
+                    {profile.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ))}
+          <NumberField
+            label="Local CLI Global Concurrency"
+            value={snapshot.limits.local_cli_global_concurrency}
+            onChange={(value) => setSnapshot({ ...snapshot, limits: { local_cli_global_concurrency: value } })}
+          />
+        </div>
+      </div>
+
       <div className="providers-layout">
         <aside className="provider-list">
           <div className="provider-add-row">
@@ -223,29 +269,6 @@ export function ProvidersPanel() {
         </div>
       </div>
 
-      <div className="provider-targets">
-        <h3>Stage Targets</h3>
-        <div className="target-grid">
-          {stageTargets.map((stage) => (
-            <label key={stage}>
-              <span>{stage}</span>
-              <select value={snapshot.targets[stage] ?? ""} onChange={(event) => updateTarget(stage, event.target.value)}>
-                <option value="">Unassigned</option>
-                {snapshot.profiles.map((profile) => (
-                  <option key={profile.name} value={profile.name}>
-                    {profile.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ))}
-          <NumberField
-            label="Local CLI Global Concurrency"
-            value={snapshot.limits.local_cli_global_concurrency}
-            onChange={(value) => setSnapshot({ ...snapshot, limits: { local_cli_global_concurrency: value } })}
-          />
-        </div>
-      </div>
     </section>
   );
 }

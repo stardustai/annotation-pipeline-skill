@@ -35,14 +35,7 @@ function parseQcSampling(raw: Record<string, unknown> | undefined): QcSampling {
   };
 }
 
-// Stages the runtime resolves via llm_profiles.yaml `targets`. `fallback` is
-// the profile used when a primary stage call fails. Order matters for layout;
-// any extra stages found in the loaded targets are appended after these.
-const KNOWN_STAGES = ["annotation", "qc", "arbiter", "coordinator", "fallback"] as const;
-
 export function AnnotatorsForm({ storeKey }: AnnotatorsFormProps) {
-  const [profiles, setProfiles] = useState<string[]>([]);
-  const [stageTargets, setStageTargets] = useState<Record<string, string>>({});
   const [qcSampling, setQcSampling] = useState<QcSampling>(defaultQcSampling);
   const [otherSampling, setOtherSampling] = useState<Record<string, Record<string, unknown>>>({});
   const [loading, setLoading] = useState(true);
@@ -56,8 +49,6 @@ export function AnnotatorsForm({ storeKey }: AnnotatorsFormProps) {
     fetchAnnotatorsConfig(storeKey)
       .then((snap) => {
         if (!active) return;
-        setProfiles(snap.available_profiles);
-        setStageTargets(snap.stage_targets ?? {});
         const { qc, ...rest } = snap.sampling;
         setQcSampling(parseQcSampling(qc as Record<string, unknown> | undefined));
         setOtherSampling(rest);
@@ -74,10 +65,6 @@ export function AnnotatorsForm({ storeKey }: AnnotatorsFormProps) {
     };
   }, [storeKey]);
 
-  function updateStageTarget(stage: string, profile: string) {
-    setStageTargets((current) => ({ ...current, [stage]: profile }));
-  }
-
   async function submit() {
     setSaving(true);
     setMessage(null);
@@ -85,11 +72,11 @@ export function AnnotatorsForm({ storeKey }: AnnotatorsFormProps) {
     try {
       const sampling: Record<string, Record<string, unknown>> = { ...otherSampling };
       sampling.qc = { ...qcSampling };
-      const cleanTargets = Object.fromEntries(
-        Object.entries(stageTargets).filter(([, v]) => typeof v === "string" && v.length > 0),
-      );
-      // Annotators block on disk is preserved by the backend when omitted here.
-      await saveAnnotatorsConfig({ sampling, stage_targets: cleanTargets }, storeKey);
+      // stage_targets is NOT sent from this form anymore — it lives in
+      // the Providers tab as the single editing point. Backend's save
+      // handler tolerates the field being absent (only updates
+      // llm_profiles.yaml when explicitly supplied).
+      await saveAnnotatorsConfig({ sampling }, storeKey);
       setMessage("Saved");
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "Unable to save");
@@ -100,14 +87,15 @@ export function AnnotatorsForm({ storeKey }: AnnotatorsFormProps) {
 
   if (loading) return <div className="drawer-state">Loading annotators…</div>;
 
-  const stages = Array.from(new Set([...KNOWN_STAGES, ...Object.keys(stageTargets)]));
-
   return (
     <div className="annotators-form">
       <div className="config-editor-header">
         <div>
           <h2>Annotation Agents</h2>
-          <p>Choose the LLM profile that runs each annotation stage and tune QC sampling.</p>
+          <p>
+            Tune QC sampling here. Stage → profile routing moved to the{" "}
+            <strong>Providers</strong> tab (single source of truth).
+          </p>
         </div>
         <button className="primary-button" type="button" disabled={saving} onClick={submit}>
           {saving ? "Saving" : "Save"}
@@ -116,39 +104,6 @@ export function AnnotatorsForm({ storeKey }: AnnotatorsFormProps) {
 
       {error ? <div className="drawer-error">{error}</div> : null}
       {message ? <div className="notice compact">{message}</div> : null}
-
-      <section className="annotators-section">
-        <h3>Stage Targets</h3>
-        <p className="empty-detail" style={{ marginTop: "-4px" }}>
-          The runtime resolves each pipeline stage to a profile via{" "}
-          <code>llm_profiles.yaml</code> targets. <code>fallback</code> is used
-          when a primary stage call fails. Edits here write to the workspace
-          file and take effect on the next dispatch.
-        </p>
-        <div className="annotator-card-fields">
-          {stages.map((stage) => (
-            <label key={stage}>
-              <span style={{ textTransform: "capitalize" }}>{stage}</span>
-              <select
-                value={stageTargets[stage] ?? ""}
-                onChange={(e) => updateStageTarget(stage, e.target.value)}
-              >
-                <option value="">— unset —</option>
-                {profiles.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
-                {stageTargets[stage] && !profiles.includes(stageTargets[stage]) ? (
-                  <option value={stageTargets[stage]}>
-                    {stageTargets[stage]} (not in profiles)
-                  </option>
-                ) : null}
-              </select>
-            </label>
-          ))}
-        </div>
-      </section>
 
       <section className="annotators-section">
         <h3>QC Sampling</h3>
