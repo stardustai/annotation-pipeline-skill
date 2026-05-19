@@ -120,7 +120,7 @@ Threshold 4.0 is the initial default; can be made a project-level config later.
 | `contested_spans` | `divergent_entries` | `PosteriorAuditPanel.tsx` (all references) |
 | `contested_spans` | `divergent_entries` | `batch_apply_all_contested.py` cache read |
 
-**Cache backward compatibility:** read as `payload?.divergent_entries ?? payload?.contested_spans`. No migration needed for existing cached payloads.
+**Cache migration:** after rename, invalidate existing cached payloads by clearing the `posterior_audit_cache` table. Operator must trigger a rebuild.
 
 ---
 
@@ -153,4 +153,4 @@ Columns: **Span** | **Wordfreq** | **Distribution** | **Total** | **Action**
 - Unit test `_type_entropy`: zero-count input, single-type, uniform split.
 - Unit test `_wordfreq_score`: English phrase, Chinese phrase, OOV token (returns 0, average degrades gracefully).
 - Integration: `build_posterior_audit` output contains all three keys; `low_info_entries` is a subset of `divergent_entries` items.
-- Frontend: smoke test that old cache (with `contested_spans` key) renders correctly via fallback.
+- Frontend: after cache clear + rebuild, all three keys present and rendered correctly.
