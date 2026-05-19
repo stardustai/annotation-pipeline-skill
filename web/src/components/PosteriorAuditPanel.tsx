@@ -1573,7 +1573,7 @@ function LowInfoTable({
   }, [filtered.length]);
   const visible = filtered.slice(page * LOW_INFO_PAGE_SIZE, (page + 1) * LOW_INFO_PAGE_SIZE);
 
-  async function applyNotAnEntity(span: string) {
+  async function applyNotAnEntity(span: string): Promise<boolean> {
     setRowStatus((s) => ({ ...s, [span]: "submitting" }));
     try {
       const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
@@ -1622,11 +1622,13 @@ function LowInfoTable({
         });
       } catch { /* best-effort */ }
       setRowStatus((s) => ({ ...s, [span]: "done" }));
+      return true;
     } catch (e) {
       setRowStatus((s) => ({
         ...s,
         [span]: `error: ${e instanceof Error ? e.message : String(e)}`,
       }));
+      return false;
     }
   }
 
@@ -1638,11 +1640,16 @@ function LowInfoTable({
     setBulkRunning(true);
     setError(null);
     const spans = Array.from(selected);
+    let failures = 0;
     for (const span of spans) {
-      await applyNotAnEntity(span);
+      const ok = await applyNotAnEntity(span);
+      if (!ok) failures += 1;
     }
     setBulkRunning(false);
     setSelected(new Set());
+    if (failures > 0) {
+      setError(`${failures} span(s) failed. Check rows for details.`);
+    }
     onAfterFix?.();
   }
 
@@ -1740,7 +1747,7 @@ function LowInfoTable({
                       type="checkbox"
                       checked={selected.has(c.span)}
                       onChange={() => toggleSelect(c.span)}
-                      disabled={isDone || isSubmitting}
+                      disabled={isDone || isSubmitting || bulkRunning}
                       style={{ margin: 0, cursor: "pointer" }}
                     />
                   </td>
@@ -1758,8 +1765,11 @@ function LowInfoTable({
                     ) : (
                       <button
                         type="button"
-                        disabled={isSubmitting}
-                        onClick={() => applyNotAnEntity(c.span).then(() => onAfterFix?.())}
+                        disabled={isSubmitting || bulkRunning}
+                        onClick={async () => {
+                          const ok = await applyNotAnEntity(c.span);
+                          if (ok) onAfterFix?.();
+                        }}
                         style={{
                           fontSize: "0.8rem",
                           background: "var(--danger, #b91c1c)",
@@ -1767,8 +1777,8 @@ function LowInfoTable({
                           border: "none",
                           padding: "2px 8px",
                           borderRadius: "4px",
-                          cursor: isSubmitting ? "wait" : "pointer",
-                          opacity: isSubmitting ? 0.7 : 1,
+                          cursor: (isSubmitting || bulkRunning) ? "wait" : "pointer",
+                          opacity: (isSubmitting || bulkRunning) ? 0.7 : 1,
                         }}
                       >
                         {isSubmitting ? "Applying…" : "Set not_an_entity"}
