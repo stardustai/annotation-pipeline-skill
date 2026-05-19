@@ -233,16 +233,21 @@ class SqliteStore:
             del self._local.conn
 
     def save_task(self, task: Task) -> None:
-        # Auto-stamp new tasks with the active annotation-rules version
-        # so the runtime can reproduce later exactly which rule set the
-        # task was annotated against. Only stamps when the task arrives
-        # unstamped — explicit assignments win.
+        # Auto-stamp brand-new tasks with the active annotation-rules
+        # version so the runtime can reproduce later exactly which rule
+        # set the task was annotated against. Only stamps when the row
+        # does not yet exist — historical NULL-version tasks must stay
+        # NULL (stamping them with the current active version would be
+        # fake provenance: those tasks were annotated under a different
+        # / unrecorded rule state). NULL means "pre-versioning era";
+        # _load_guideline handles that by falling back to the latest
+        # singleton version when the task is re-run.
         if not task.document_version_id:
             existing_row = self._conn.execute(
-                "SELECT document_version_id FROM tasks WHERE task_id = ?",
+                "SELECT task_id FROM tasks WHERE task_id = ?",
                 (task.task_id,),
             ).fetchone()
-            if existing_row is None or not existing_row["document_version_id"]:
+            if existing_row is None:
                 version_id = self._active_annotation_rules_version_id()
                 if version_id:
                     task.document_version_id = version_id

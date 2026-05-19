@@ -62,6 +62,88 @@ def test_save_task_is_upsert(tmp_path):
     store.close()
 
 
+def test_save_task_auto_stamps_brand_new_with_active_rules_version(tmp_path):
+    """When a brand-new task is saved and an active annotation-rules
+    document exists, the task should be stamped with that version_id.
+    """
+    from annotation_pipeline_skill.core.models import (
+        AnnotationDocument,
+        AnnotationDocumentVersion,
+    )
+
+    store = SqliteStore.open(tmp_path)
+    doc = AnnotationDocument.new(
+        title="Annotation Rules",
+        description="",
+        created_by="system",
+        metadata={"role": "annotation_rules"},
+    )
+    store.save_document(doc)
+    ver = AnnotationDocumentVersion.new(
+        document_id=doc.document_id,
+        version="v1",
+        content="rule body",
+        changelog="initial",
+        created_by="system",
+    )
+    store.save_document_version(ver)
+
+    task = _make_task("task-new")
+    assert task.document_version_id is None
+    store.save_task(task)
+
+    loaded = store.load_task("task-new")
+    assert loaded.document_version_id == ver.version_id
+    store.close()
+
+
+def test_save_task_does_not_stamp_historical_null_version_tasks(tmp_path):
+    """A historical task already in the DB with document_version_id = NULL
+    must STAY NULL across subsequent save_task calls — otherwise we'd be
+    fabricating provenance ("annotated against rules v3" when it was
+    actually annotated under the pre-versioning era).
+    """
+    from annotation_pipeline_skill.core.models import (
+        AnnotationDocument,
+        AnnotationDocumentVersion,
+    )
+
+    store = SqliteStore.open(tmp_path)
+    # Historical task lands first, BEFORE any rules document exists.
+    task = _make_task("task-historical")
+    store.save_task(task)
+    assert store.load_task("task-historical").document_version_id is None
+
+    # Operator later creates the first versioned rules document.
+    doc = AnnotationDocument.new(
+        title="Annotation Rules",
+        description="",
+        created_by="system",
+        metadata={"role": "annotation_rules"},
+    )
+    store.save_document(doc)
+    ver = AnnotationDocumentVersion.new(
+        document_id=doc.document_id,
+        version="v1",
+        content="rule body",
+        changelog="initial",
+        created_by="system",
+    )
+    store.save_document_version(ver)
+
+    # Any subsequent save_task on the historical row (status flip, etc.)
+    # MUST NOT silently backfill document_version_id — that'd be a lie.
+    task.status = TaskStatus.PENDING
+    store.save_task(task)
+    assert store.load_task("task-historical").document_version_id is None
+
+    # A brand-new task created after the version exists, however, gets stamped.
+    new_task = _make_task("task-new")
+    store.save_task(new_task)
+    assert store.load_task("task-new").document_version_id == ver.version_id
+    store.close()
+
+
 def test_list_tasks_returns_all(tmp_path):
     store = SqliteStore.open(tmp_path)
     store.save_task(_make_task("task-1", pipeline_id="a"))
