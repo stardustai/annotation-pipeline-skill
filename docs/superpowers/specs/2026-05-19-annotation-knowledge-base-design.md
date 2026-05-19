@@ -1,0 +1,378 @@
+# Annotation Knowledge Base — Design Spec
+
+**Date:** 2026-05-19
+**Status:** Draft
+
+---
+
+## Problem
+
+Annotators (LLM subagents) currently receive `annotation_rules.yaml` and the entity-convention auto-injection (`EntityConventionService.find_matches_in_text`) baked into the prompt. This has three shortcomings:
+
+1. **Passive injection wastes tokens.** All matching conventions are dumped into every prompt regardless of whether the agent actually needs them on a given row. Long contexts crowd out the row text itself.
+2. **Statistical summaries lack instructive value.** A figure like `type_entropy: 0.85` or `top_share: 0.6` tells an agent the span is contested, but not *when* to choose each type. Agents need sentence-level cases to mode-match against.
+3. **No way to consult history mid-decision.** When an agent encounters an unfamiliar span, it has no mechanism to ask "what did past tasks decide here?" — the system either pre-injected the answer or it didn't.
+
+The `memory-ner` project accumulates merge-derived guidance in `ANNOTATION_GUIDE.merge_updates.md`, a 1349-line file of human-curated rules with evidence. We want the same effect — agents informed by past decisions — but **on-demand, retrieval-driven, and trace-grounded** rather than written manually.
+
+---
+
+## Goals
+
+- Provide annotator / QC / arbiter subagents an MCP tool, `check_past_experience(entry)`, that returns past decisions for a candidate span.
+- The tool returns: current convention, type distribution, and **per-type sentence-level examples** so the agent learns from concrete cases, not statistics.
+- Examples are selected for **maximum diversity** (MinHash + farthest-first traversal) so 2–3 snippets cover the breadth of past contexts.
+- The tool is registered via the MCP protocol layer (`--mcp-config`), not prompt injection.
+- LLM provider switching (Claude API, DeepSeek, etc.) works via the `ANTHROPIC_BASE_URL` environment variable, configured per profile in `llm_profiles.yaml`.
+
+---
+
+## Non-Goals
+
+- **No new domain table.** No `SpanKnowledge` / `Evidence` / `MergeRule` tables. All data is sourced from the existing `entity_conventions` (with one schema extension) and `posterior_audit` (live computation).
+- **No row-level full-text BM25 index.** The added cost (jieba indexing, rebuild scheduling, freshness invariants) is not justified until we have evidence the per-span examples are insufficient.
+- **No automated pattern rules.** We do *not* synthesize `annotation_rules.yaml` entries from merge events. Pattern learning is example-driven, left to the agent.
+- **No Codex CLI MCP integration in this phase.** First pass targets Claude CLI; Codex parity is a follow-up.
+- **No replacement of existing `find_matches_in_text` auto-injection.** It continues to operate; the new tool is additive.
+
+---
+
+## Architecture
+
+```
+                  ┌──────────────────────────────────┐
+                  │  annotator / qc / arbiter subagent│
+                  │  (claude CLI, ANTHROPIC_BASE_URL  │
+                  │   may point at any LLM)          │
+                  └────────────────┬─────────────────┘
+                       MCP stdio (via --mcp-config)
+                                   │
+                                   ▼
+                  ┌──────────────────────────────────┐
+                  │  annotation-kb MCP server         │
+                  │  (Python, stdio)                  │
+                  │  Exposes: check_past_experience   │
+                  └────────────────┬─────────────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                    ▼
+       ┌────────────┐      ┌────────────┐      ┌────────────┐
+       │  entity_   │      │ posterior_ │      │  wordfreq  │
+       │ conventions│      │   audit    │      │  (library) │
+       │  (SQLite)  │      │ (computed) │      │            │
+       └────────────┘      └────────────┘      └────────────┘
+```
+
+Three components are added:
+
+1. **`entity_conventions.proposals` schema extension** — each proposal carries `row_id` and `context_snippet` for trace and example surfacing.
+2. **`annotation_pipeline_skill.mcp.kb_server`** — a stdio MCP server exposing one tool.
+3. **`llm_profiles.yaml` `mcp_servers` + `env` fields** — the runtime composes the `claude` invocation from the profile.
+
+A fourth, smaller change extends `annotation_pipeline_skill.similarity.minhash.shingle()` with a CJK fallback so the diversity scoring works on Chinese text.
+
+---
+
+## Tool Contract
+
+### `check_past_experience(entry: str) -> dict`
+
+**Input.**
+- `entry`: a candidate entity / span text (case-insensitive lookup; original case preserved in returned snippets).
+
+**Output.**
+
+```json
+{
+  "entry": "Apple",
+  "convention": {
+    "status": "disputed",
+    "type": null,
+    "evidence_count": 8
+  },
+  "distribution": {
+    "organization": 5,
+    "product": 3
+  },
+  "examples_by_type": {
+    "organization": [
+      "[task_019/row_18452] ...Apple's customer support helped me yesterday with my refund...",
+      "[task_022/row_22310] ...Apple announced a new privacy policy for developers..."
+    ],
+    "product": [
+      "[task_021/row_21100] ...My Apple iPad keeps crashing on the latest update..."
+    ]
+  },
+  "meta": {
+    "wordfreq_zipf": 4.1,
+    "generic_word": false
+  }
+}
+```
+
+**Field semantics.**
+
+| Field | Source | Notes |
+|---|---|---|
+| `convention.status` | `entity_conventions.status` | `"active"`, `"disputed"`, or `"none"` (if span not in conventions table). |
+| `convention.type` | `entity_conventions.entity_type` | `null` when `status` is `disputed` or `none`. |
+| `convention.evidence_count` | `entity_conventions.evidence_count` | 0 when `status` is `"none"`. |
+| `distribution` | Aggregated from `entity_conventions.proposals[*].type` | Counts of each type ever proposed for this span. Empty `{}` when no proposals. |
+| `examples_by_type` | `entity_conventions.proposals[*].context_snippet`, grouped by `type`, diversity-selected | Up to 3 snippets per type; format `[<task_id>/<row_id>] <snippet>`. Empty `{}` when no snippets available (legacy proposals predating the schema extension). |
+| `meta.wordfreq_zipf` | Reuse `_wordfreq_score()` (currently in `interfaces/api.py`) — see "Shared utility move" below | Zipf scale 0–7. |
+| `meta.generic_word` | `wordfreq_zipf >= 5.0 and evidence_count < 5` | Conservative flag; agent makes final call. |
+
+**Shared utility move.** The existing `_wordfreq_score()` private function in `interfaces/api.py` does exactly what we need (jieba-free tokenization via `wordfreq.tokenize`, language auto-detection by CJK range). We promote it to a new module `annotation_pipeline_skill/text/wordfreq_utils.py` so both `api.py` (existing low_info computation) and `kb_server.py` (new tool) import the same implementation.
+
+**Error / empty behavior.**
+
+- Unknown span (not in `entity_conventions`): return `convention.status = "none"`, `evidence_count = 0`, empty `distribution`, empty `examples_by_type`. `meta.wordfreq_zipf` is still computed.
+- Empty string entry: return `{"error": "entry is required"}` (the MCP layer surfaces this as a tool error).
+- Database unavailable: tool raises; MCP server returns a structured error so the agent can fall back to non-tool reasoning.
+
+---
+
+## Schema Extension
+
+`entity_conventions.proposals` is a JSON array column. Each proposal is currently:
+
+```python
+{"type": str, "source": str, "task_id": str | None, "notes": str | None, "at": str}
+```
+
+After this change:
+
+```python
+{
+  "type": str,
+  "source": str,
+  "task_id": str | None,
+  "row_id": str | None,              # NEW
+  "context_snippet": str | None,     # NEW — see below
+  "notes": str | None,
+  "at": str,
+}
+```
+
+**`context_snippet` construction.** When `record_decision()` is called with a `row_content` argument, the snippet is `row_content[max(0, hit-80) : hit+len(span)+80]` where `hit` is the case-insensitive first occurrence of `span` in `row_content`. The snippet is clamped to 200 characters and surrounded by `…` on each end when truncated. If `row_content` is not provided (e.g., operator declarations from the dashboard), `context_snippet` is `None`.
+
+**Migration.** No schema migration is required — `proposals_json` is a free-form JSON blob. Legacy rows simply lack the two new keys; the tool treats missing `context_snippet` as "no example available" and gracefully omits them from `examples_by_type`.
+
+**`record_decision()` signature change.**
+
+```python
+def record_decision(
+    self,
+    *,
+    project_id: str,
+    span: str,
+    entity_type: str,
+    source: str,
+    task_id: str | None = None,
+    row_id: str | None = None,         # NEW
+    row_content: str | None = None,    # NEW
+    notes: str | None = None,
+) -> EntityConvention:
+    ...
+```
+
+All call sites are updated to pass `row_id` and `row_content` where available. Sites that don't know (e.g., operator declarations from a UI button) pass neither and produce no snippet.
+
+---
+
+## Diversity Sampling
+
+For each `(span, type)` pair, the tool collects all proposals' `context_snippet` values, then selects up to 3 that maximize mutual dissimilarity.
+
+### MinHash shingle update (CJK fallback)
+
+`annotation_pipeline_skill/similarity/minhash.py::shingle()` currently word-splits on whitespace. For CJK text this degenerates to a single token, making Jaccard binary (0 or 1) and useless for diversity ranking.
+
+```python
+import re
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
+
+def shingle(text: str, n: int = 5) -> set[str]:
+    if not text:
+        return set()
+    normalized = _WHITESPACE_RE.sub(" ", text.lower()).strip()
+
+    if _CJK_RE.search(normalized):
+        # CJK path: lazy-import jieba so ASCII-only projects don't pay the load cost.
+        import jieba
+        tokens = [t for t in jieba.cut(normalized) if t.strip()]
+    else:
+        tokens = normalized.split(" ")
+
+    if len(tokens) < n:
+        return {normalized} if normalized else set()
+    return {" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}
+```
+
+The existing `MinHashLSHFinder` and `row_dedup_service` callers see no behavioral change for ASCII inputs — the CJK branch is dormant unless CJK characters are present.
+
+### Farthest-first selection
+
+```python
+def select_diverse_examples(snippets: list[str], k: int = 3) -> list[str]:
+    if len(snippets) <= k:
+        return snippets
+    minhashes = [build_minhash(s) for s in snippets]
+    # Seed with the lexicographically smallest snippet for determinism.
+    seed_idx = min(range(len(snippets)), key=lambda i: snippets[i])
+    selected = [seed_idx]
+    while len(selected) < k:
+        best_i, best_dist = -1, -1.0
+        for i in range(len(snippets)):
+            if i in selected:
+                continue
+            d = 1.0 - max(minhashes[i].jaccard(minhashes[j]) for j in selected)
+            if d > best_dist:
+                best_dist, best_i = d, i
+        selected.append(best_i)
+    return [snippets[i] for i in selected]
+```
+
+Determinism note: snippets are deduplicated before sampling, and the seed is chosen deterministically so identical input always yields identical output.
+
+---
+
+## MCP Server
+
+**Location:** `annotation_pipeline_skill/mcp/kb_server.py`
+
+**Protocol:** stdio JSON-RPC, the MCP standard.
+
+**Launch:** invoked as a subprocess by Claude CLI when configured via `--mcp-config`. Receives the project root via CLI flag.
+
+```bash
+python -m annotation_pipeline_skill.mcp.kb_server --project-root <path>
+```
+
+**Tools exposed:** `check_past_experience` only. (Single-tool scope avoids over-promising; additional tools are explicit future work.)
+
+**Dependencies (new to pyproject.toml):**
+
+- `mcp` — official MCP Python SDK for the stdio server.
+- `jieba` — only loaded when CJK text is detected by `shingle()`; lazy import keeps cold-start cost off ASCII-only projects.
+
+`wordfreq` is already a project dependency. Server holds a read-only SQLite connection to the project's `db.sqlite` and instantiates `EntityConventionService` for queries — it does not perform writes.
+
+**Performance budget:** each `check_past_experience` call should return in <100 ms for typical inputs (single span, <50 proposals). The hot path is one indexed SELECT on `entity_conventions` plus MinHash over <50 snippets.
+
+---
+
+## Profile Integration
+
+`llm_profiles.yaml` gains two optional fields per profile:
+
+```yaml
+profiles:
+  annotator_claude:
+    runtime: claude_cli
+    env:
+      ANTHROPIC_BASE_URL: https://api.anthropic.com
+      ANTHROPIC_API_KEY: ${CLAUDE_API_KEY}
+    mcp_servers:
+      - name: annotation-kb
+        command: python
+        args: ["-m", "annotation_pipeline_skill.mcp.kb_server"]
+    cli_args:
+      strict_mcp_config: true
+      disallowed_tools: ["Bash", "Edit", "Write"]
+
+  annotator_deepseek:
+    runtime: claude_cli            # reuse Claude CLI binary
+    env:
+      ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+      ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY}
+    mcp_servers:
+      - name: annotation-kb
+        command: python
+        args: ["-m", "annotation_pipeline_skill.mcp.kb_server"]
+    cli_args:
+      strict_mcp_config: true
+      disallowed_tools: ["Bash", "Edit", "Write"]
+```
+
+The runtime (`subagent_cycle.py`) builds a per-invocation `mcp-config.json` from the profile and passes:
+
+```bash
+ANTHROPIC_BASE_URL=$URL ANTHROPIC_API_KEY=$KEY \
+claude --print --bare \
+       --strict-mcp-config \
+       --mcp-config=/tmp/<run-id>-mcp.json \
+       --disallowedTools="Bash,Edit,Write" \
+       --append-system-prompt-file=<task-prompt>
+```
+
+`--bare` is used to keep the subagent free of host-side hooks, plugins, and auto-memory, ensuring the only tools available are the MCP-provided ones and `--tools`-restricted built-ins.
+
+---
+
+## Lifecycle Example
+
+A condensed end-to-end trace, focusing on the new behavior.
+
+1. **Task A imported.** No effect on this system (no BM25 to rebuild).
+2. **Row 18452 reaches annotator.** Agent reads `"Flynx is much better than the old browser. Crashes on Android 10."`. It calls `check_past_experience("Flynx")` and `check_past_experience("Android")` via MCP. Both return `convention.status = "none"`. Agent falls back to its prompt rules, tags `Android` only — misses `Flynx`.
+3. **QC + arbiter accept golden** with both `Flynx → technology` and `Android → technology`. `record_decision()` runs twice with `row_id="row_18452"` and `row_content="Flynx is much better…"`. Each proposal carries a fresh `context_snippet`.
+4. **Row 18453 reaches annotator** (`"Telegram is faster than Facebook on my Redmi 3S."`). Agent calls `check_past_experience("Android")` — gets back `{convention: technology (active, 1 evidence), examples_by_type: {technology: ["[task_019/row_18452] …Crashes on Android 10…"]}}`. Agent generalizes "named tech terms → technology" from the single example and tags Telegram, Facebook, Redmi 3S correctly.
+5. **Task B imported, weeks later, with span `"Apple"`.** Apple's history now contains 5 `organization` proposals and 3 `product` proposals across multiple tasks. Tool returns `convention.status = "disputed"`, both type buckets in `examples_by_type` with diversity-selected snippets. Agent matches current row context ("Apple's customer support helped…") to the `organization` examples and chooses correctly.
+
+---
+
+## Testing
+
+**Unit.**
+
+- `EntityConventionService.record_decision` with new args persists `row_id` and `context_snippet` in the proposal JSON; without `row_content`, the snippet is `None`.
+- `shingle()` produces meaningful n-grams for a Chinese sentence (jieba path) and unchanged output for an English sentence (whitespace path).
+- `select_diverse_examples` is deterministic, returns ≤ k items, and prefers low-Jaccard pairs over a hand-crafted near-duplicate set.
+
+**Integration.**
+
+- End-to-end: insert a synthetic project with 8 proposals for the span `"Apple"` (mix of organization / product, with context snippets), call `check_past_experience("Apple")`, assert the returned `examples_by_type` has both buckets, snippet counts ≤ 3, and that the chosen snippets are not pairwise near-duplicates.
+- Empty / unknown span returns the documented "none" shape with no exceptions.
+- MCP server smoke test: spawn the server via stdio, send a `tools/list` request, then a `tools/call` for `check_past_experience`, validate the response shape.
+
+**Profile integration.**
+
+- `subagent_cycle.py` composes a valid `mcp-config.json` from a profile carrying `mcp_servers`; the resulting `claude` invocation includes `--mcp-config` and `--strict-mcp-config`.
+- Live Claude CLI test (manual, behind a flag): launch a subagent against a fixture project and verify the agent can call the tool. Skipped in CI to avoid network and authentication requirements.
+
+---
+
+## Risks and Mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Agents over-call the tool (e.g., for every token) and inflate latency. | Tool returns in <100 ms; system prompt advises "consult only on candidate entity spans, not every token." |
+| `context_snippet` leaks PII from past rows into a different task's agent. | Snippets are limited to 200 chars around the span; project-scoped query enforces same-project boundary; no cross-project leakage. |
+| Agents copy snippet content verbatim into their answer instead of generalizing. | Snippets are not gold output for the *current* row — they're from *other* rows. The system prompt explicitly directs the agent to use them as analogies, not as answers. |
+| jieba initialization adds ~0.2 s to MCP server startup. | One-time cost on server spawn; the server is long-lived per annotation run. Acceptable. |
+| MCP SDK version drift breaks the stdio protocol. | Pin the `mcp` package version in `pyproject.toml`; integration smoke test catches breakage. |
+| Profile authors forget to set `ANTHROPIC_BASE_URL` and silently hit Anthropic. | Profile validation in `provider_config_service` warns when `mcp_servers` is set but `ANTHROPIC_BASE_URL` is unset or matches the default. |
+
+---
+
+## Open Questions
+
+- Should `meta.generic_word` thresholds (`zipf >= 5.0`, `evidence_count < 5`) be project-configurable? Defer until we have a project that needs to tune them.
+- Codex CLI MCP support: out of scope here, but worth confirming Codex's MCP integration story before promising parity.
+
+---
+
+## Phasing
+
+This spec is intended for a **single implementation plan**. The work decomposes into roughly the following slices, each of which should be a separate commit / PR in the implementation plan:
+
+1. Schema extension and `record_decision()` signature change, with all call sites updated.
+2. `shingle()` CJK fallback and `select_diverse_examples()` utility.
+3. MCP server (`kb_server.py`) and the `check_past_experience` tool implementation.
+4. Profile integration (`llm_profiles.yaml` schema, `subagent_cycle.py` invocation update).
+5. Tests across all of the above, including a Claude CLI smoke test gated by a fixture flag.
+
+Estimated total effort: **5–6 person-days**.
