@@ -221,17 +221,24 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
             entry = {**entry, "resolved_convention_type": conv_type}
         divergent_entries.append(entry)
 
-    # low_info_entries: ALL divergent spans with high wordfreq, regardless of
-    # whether they have an active convention.
+    # low_info_entries: ALL spans in entity_statistics with high wordfreq,
+    # regardless of divergent/settled status or convention.
     LOW_INFO_THRESHOLD = 4.0
+    all_stat_rows = store._conn.execute(
+        "SELECT span_lower, entity_type, count FROM entity_statistics WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    all_per_span: dict[str, dict[str, int]] = {}
+    for r in all_stat_rows:
+        all_per_span.setdefault(r["span_lower"], {})[r["entity_type"]] = r["count"]
     low_info_entries = []
-    for entry in divergent_entries:
-        wf = _wordfreq_score(entry["span"])
+    for span, dist in all_per_span.items():
+        wf = _wordfreq_score(span)
         if wf >= LOW_INFO_THRESHOLD:
             low_info_entries.append({
-                "span": entry["span"],
-                "prior_total": entry["prior_total"],
-                "prior_distribution": entry["prior_distribution"],
+                "span": span,
+                "prior_total": sum(dist.values()),
+                "prior_distribution": dist,
                 "wordfreq": round(wf, 3),
             })
     low_info_entries.sort(key=lambda r: r["wordfreq"], reverse=True)
