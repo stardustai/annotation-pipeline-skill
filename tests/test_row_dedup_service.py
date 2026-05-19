@@ -97,7 +97,6 @@ def test_scan_rows_with_minhash_finds_template_groups(tmp_path):
     assert isinstance(result["clusters"], list)
     assert result["params"]["profile"] == "MinHash"
     assert result["params"]["metric"] == "jaccard"
-    assert result["params"]["skipped_tasks_too_many_rows"] == 0
 
     # Should find at least one cluster (the template rows)
     assert len(result["clusters"]) >= 1
@@ -260,32 +259,6 @@ def test_get_cache_state_stale_after_new_mask(tmp_path):
     assert state_after["cached"] is True
     assert state_after["stale"] is True
     assert state_after["cached_content_hash"] != state_after["current_content_hash"]
-
-
-def test_scan_rows_skips_tasks_with_too_many_rows(tmp_path):
-    """Tasks with more rows than max_rows_per_task are skipped."""
-    store = _open_store(tmp_path)
-    pipeline_id = "proj"
-
-    # One normal task (2 rows), one oversized task (5 rows)
-    t1 = _make_task("t-small", pipeline_id, [
-        {"row_index": i, "input": f"normal row {i}"} for i in range(2)
-    ])
-    t2 = _make_task("t-big", pipeline_id, [
-        {"row_index": i, "input": f"big row {i}"} for i in range(5)
-    ])
-    store.save_task(t1)
-    store.save_task(t2)
-
-    svc = _make_service(store)
-    result = svc.scan_rows(
-        project_id=pipeline_id,
-        profile_name="MinHash",
-        max_rows_per_task=3,  # t2 has 5 rows → skip
-    )
-
-    assert result["params"]["skipped_tasks_too_many_rows"] == 1
-    assert result["row_count"] == 2  # only t1's rows
 
 
 def test_scan_rows_cache_hit_on_second_run(tmp_path):

@@ -110,7 +110,6 @@ def test_row_dedup_scan_populates_cache_and_get_returns_payload(tmp_path):
         "profile": "MinHash",
         "statuses": None,
         "jaccard_threshold": 0.3,
-        "max_rows_per_task": 100,
     }).encode()
 
     status, _headers, body = api.handle_post(

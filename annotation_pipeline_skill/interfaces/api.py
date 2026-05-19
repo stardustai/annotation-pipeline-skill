@@ -1189,7 +1189,6 @@ class DashboardApi:
             profile_name = data.get("profile", "MinHash")
             statuses = data.get("statuses")  # None = all stages
             jaccard_threshold = float(data.get("jaccard_threshold", 0.5))
-            max_rows_per_task = int(data.get("max_rows_per_task", 100))
             profiles_path = self.workspace_root / "similarity_profiles.yaml"
             try:
                 from annotation_pipeline_skill.similarity.profiles import load_similarity_profiles
@@ -1206,7 +1205,6 @@ class DashboardApi:
                     profile_name=profile_name,
                     statuses=statuses,
                     jaccard_threshold=jaccard_threshold,
-                    max_rows_per_task=max_rows_per_task,
                 )
             except KeyError as exc:
                 return self._json_response(400, {"error": "unknown_profile", "detail": str(exc)})

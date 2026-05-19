@@ -64,10 +64,8 @@ export type RowDedupPayload = {
     jaccard_threshold: number;
     metric: string;
     statuses: string[] | null;
-    max_rows_per_task: number;
     generated_at: string;
     embedding_cache: { hits: number; misses: number };
-    skipped_tasks_too_many_rows: number;
   };
   clusters: RowCluster[];
   row_count: number;
@@ -145,6 +143,25 @@ function pickRowRep(members: RowMember[]): RowMember {
     if (a.task_id > b.task_id) return 1;
     return a.row_index - b.row_index;
   })[0] ?? members[0];
+}
+
+// Word-aware truncation matching backend util.text.truncate_to_words.
+// Each CJK ideograph / kana / hangul char counts as one word; whitespace-
+// delimited Latin/number/punctuation runs count as one. Backend already
+// truncates to 100 words server-side — this is a defensive client cap
+// for legacy cache payloads that pre-date the backend change.
+const WORD_TOKEN_RE = /[一-鿿぀-ヿ가-힯]|\S+/g;
+
+function truncateToWords(text: string, maxWords: number): string {
+  if (!text || maxWords <= 0) return text;
+  let count = 0;
+  let lastEnd = 0;
+  for (const m of text.matchAll(WORD_TOKEN_RE)) {
+    count++;
+    lastEnd = (m.index ?? 0) + m[0].length;
+    if (count >= maxWords) return text.slice(0, lastEnd);
+  }
+  return text;
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -410,7 +427,6 @@ function RowDuplicatesSubTab({
   const [rowCache, setRowCache] = useState<RowDedupCacheResponse | null>(null);
   const [rowProfile, setRowProfile] = useState<string>("MinHash");
   const [jaccardThreshold, setJaccardThreshold] = useState<number>(0.5);
-  const [maxRowsPerTask, setMaxRowsPerTask] = useState<number>(100);
   const [selectedRows, setSelectedRows] = useState<Record<string, true>>({});
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<string | null>(null);
@@ -480,7 +496,6 @@ function RowDuplicatesSubTab({
           profile: rowProfile,
           statuses: null,
           jaccard_threshold: jaccardThreshold,
-          max_rows_per_task: maxRowsPerTask,
         }),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
@@ -656,19 +671,6 @@ function RowDuplicatesSubTab({
           <code style={{ fontFamily: "monospace", minWidth: "3rem" }}>
             {jaccardThreshold.toFixed(2)}
           </code>
-        </label>
-
-        <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
-          Max rows/task
-          <input
-            type="number"
-            min={1}
-            max={10000}
-            value={maxRowsPerTask}
-            onChange={(e) => setMaxRowsPerTask(Math.max(1, parseInt(e.target.value, 10) || 100))}
-            style={{ width: "5rem", fontSize: "0.85rem" }}
-            disabled={loading}
-          />
         </label>
 
         <button
@@ -890,17 +892,22 @@ function RowDuplicatesSubTab({
                               {member.task_id}:{member.row_index}
                             </code>
                             {member.text_preview ? (
-                              <span
-                                className="runtime-muted"
-                                style={{
-                                  marginLeft: "0.4rem",
-                                  whiteSpace: "normal",
-                                  lineHeight: 1.45,
-                                }}
-                              >
-                                — {member.text_preview.slice(0, 200)}
-                                {member.text_preview.length > 200 ? "…" : ""}
-                              </span>
+                              {(() => {
+                                const truncated = truncateToWords(member.text_preview, 100);
+                                return (
+                                  <span
+                                    className="runtime-muted"
+                                    style={{
+                                      marginLeft: "0.4rem",
+                                      whiteSpace: "normal",
+                                      lineHeight: 1.45,
+                                    }}
+                                  >
+                                    — {truncated}
+                                    {truncated.length < member.text_preview.length ? "…" : ""}
+                                  </span>
+                                );
+                              })()}
                             ) : null}
                           </button>
                         </div>

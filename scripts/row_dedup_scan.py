@@ -57,7 +57,6 @@ def main(argv: list[str]) -> int:
         help="Jaccard for minhash provider, cosine for embedding providers (same flag, "
              "different metric — read the cluster report's params.metric field for clarity)",
     )
-    ap.add_argument("--max-rows-per-task", type=int, default=100)
     ap.add_argument("--statuses", default=None,
                     help='Comma-separated TaskStatus values to include; default: all stages')
     ap.add_argument("--report-path", default="/tmp/row-dedup-clusters.json",
@@ -99,7 +98,6 @@ def main(argv: list[str]) -> int:
         profile_name=args.profile,
         statuses=statuses,
         jaccard_threshold=args.jaccard_threshold,
-        max_rows_per_task=args.max_rows_per_task,
     )
 
     metric = payload["params"]["metric"]
@@ -107,11 +105,6 @@ def main(argv: list[str]) -> int:
     print(f"  clusters: {len(payload['clusters'])}  metric: {metric}")
     cache_stats = payload["params"].get("embedding_cache") or {}
     print(f"  embedding cache hits/misses: {cache_stats.get('hits')}/{cache_stats.get('misses')}")
-    if payload["params"].get("skipped_tasks_too_many_rows"):
-        print(
-            f"  skipped {payload['params']['skipped_tasks_too_many_rows']} tasks "
-            f"with > {args.max_rows_per_task} rows"
-        )
 
     report_path = pathlib.Path(args.report_path)
     report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -27,6 +27,7 @@ from annotation_pipeline_skill.similarity.embedding_cache import text_content_ha
 from annotation_pipeline_skill.similarity.embeddings import build_embedding_client
 from annotation_pipeline_skill.similarity.profiles import SimilarityProfile
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+from annotation_pipeline_skill.util.text import truncate_to_words
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +136,6 @@ class RowDedupService:
         profile_name: str,
         statuses: list[str] | None = None,
         jaccard_threshold: float = 0.5,
-        max_rows_per_task: int = 100,
     ) -> dict:
         """Scan all rows in a project for near-duplicates.
 
@@ -150,8 +150,6 @@ class RowDedupService:
         jaccard_threshold:
             Similarity threshold for clustering. Interpreted as Jaccard
             for ``minhash`` provider, as cosine similarity for others.
-        max_rows_per_task:
-            Tasks with more rows than this are skipped (safety guard).
 
         Returns
         -------
@@ -195,7 +193,6 @@ class RowDedupService:
 
         # Collect (task_id, row_index, row_text) triplets
         triplets: list[tuple[str, int, str]] = []  # (task_id, row_index, row_text)
-        skipped_tasks = 0
         contributing_task_ids: set[str] = set()
 
         for task in all_tasks:
@@ -206,10 +203,6 @@ class RowDedupService:
             )
             if not isinstance(rows, list):
                 rows = []
-
-            if len(rows) > max_rows_per_task:
-                skipped_tasks += 1
-                continue
 
             masked = masked_by_task.get(task.task_id, set())
             for row in rows:
@@ -314,7 +307,7 @@ class RowDedupService:
                         preview = ""
                         for t2, i2, txt2 in triplets:
                             if t2 == m_tid and i2 == m_idx:
-                                preview = txt2[:240]
+                                preview = truncate_to_words(txt2, 100)
                                 break
                         members.append({
                             "task_id": m_tid,
@@ -361,7 +354,7 @@ class RowDedupService:
                             members.append({
                                 "task_id": tid,
                                 "row_index": idx,
-                                "text_preview": text[:240],
+                                "text_preview": truncate_to_words(text, 100),
                             })
                             component_vecs.append(all_vecs[pos])
 
@@ -383,10 +376,8 @@ class RowDedupService:
                 "jaccard_threshold": jaccard_threshold,
                 "metric": metric,
                 "statuses": statuses,
-                "max_rows_per_task": max_rows_per_task,
                 "generated_at": generated_at,
                 "embedding_cache": cache_stats,
-                "skipped_tasks_too_many_rows": skipped_tasks,
             },
             "clusters": clusters_out,
             "row_count": len(triplets),
