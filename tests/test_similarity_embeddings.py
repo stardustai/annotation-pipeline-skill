@@ -22,6 +22,24 @@ def test_random_client_returns_deterministic_vectors():
     np.testing.assert_allclose(out.vectors[0], out.vectors[2])
 
 
+def test_jina_http_url_handles_v1_already_in_base_url():
+    """base_url may or may not already include the OpenAI /v1 prefix; in
+    either case the final URL should land at .../v1/embeddings (not
+    .../v1/v1/embeddings)."""
+    p1 = SimilarityProfile(
+        name="a", provider="jina_http", model="m", base_url="https://example.com",
+    )
+    p2 = SimilarityProfile(
+        name="b", provider="jina_http", model="m", base_url="https://example.com/v1",
+    )
+    p3 = SimilarityProfile(
+        name="c", provider="jina_http", model="m", base_url="https://example.com/v1/",
+    )
+    assert JinaHTTPEmbeddingClient(p1)._url == "https://example.com/v1/embeddings"
+    assert JinaHTTPEmbeddingClient(p2)._url == "https://example.com/v1/embeddings"
+    assert JinaHTTPEmbeddingClient(p3)._url == "https://example.com/v1/embeddings"
+
+
 def test_jina_http_client_batches_and_returns_vectors(monkeypatch):
     profile = SimilarityProfile(
         name="jina_small", provider="jina_http",

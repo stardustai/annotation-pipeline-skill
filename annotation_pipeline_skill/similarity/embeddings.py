@@ -45,7 +45,14 @@ class JinaHTTPEmbeddingClient:
         if not profile.base_url:
             raise ValueError(f"profile {profile.name!r} needs base_url")
         self._http = httpx.Client(timeout=profile.timeout_seconds)
-        self._url = profile.base_url.rstrip("/") + "/v1/embeddings"
+        # base_url may or may not already include the OpenAI /v1 prefix
+        # (existing llm_profiles.yaml uses both conventions). Normalize so
+        # the call always lands at .../v1/embeddings regardless.
+        root = profile.base_url.rstrip("/")
+        if root.endswith("/v1"):
+            self._url = f"{root}/embeddings"
+        else:
+            self._url = f"{root}/v1/embeddings"
 
     def embed(self, texts: list[str]) -> EmbeddingResult:
         if not texts:
