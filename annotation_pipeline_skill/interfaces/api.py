@@ -1517,17 +1517,20 @@ class DashboardApi:
                 if not isinstance(ann, dict):
                     skipped += 1
                     continue
-                current_type: str | None = None
-                current_span_form: str | None = None
+                # Collect ALL (span_form, type) pairs for this span in this
+                # task — a span can appear in multiple entity-type buckets
+                # (e.g. cross-type collision, or different row capitalisation).
+                # Without collecting all of them, only the first encountered
+                # type gets fixed and subsequent calls are needed.
+                task_pairs: list[tuple[str, str]] = []
                 for s, t in iter_span_decisions(ann):
-                    if s.lower() == span_lower:
-                        current_type = t
-                        current_span_form = s
-                        break
-                if current_type is None or current_type == entity_type_str:
+                    if s.lower() == span_lower and t != entity_type_str:
+                        task_pairs.append((s, t))
+                if not task_pairs:
                     skipped += 1
                     continue
-                candidates.append((tid, current_span_form or span, current_type))
+                for span_form, current_type in task_pairs:
+                    candidates.append((tid, span_form, current_type))
         else:
             # Full scan. Pre-filter via SQL LIKE on source_ref_json so we
             # only read annotations for tasks whose input could possibly
@@ -1545,17 +1548,22 @@ class DashboardApi:
                 ann = hr._latest_annotation_payload(tid)
                 if not isinstance(ann, dict):
                     continue
-                current_type = None
-                current_span_form = None
+                task_pairs = []
                 for s, t in iter_span_decisions(ann):
-                    if s.lower() == span_lower:
-                        current_type = t
-                        current_span_form = s
-                        break
-                if current_type is None or current_type == entity_type_str:
-                    continue
-                candidates.append((tid, current_span_form or span, current_type))
-            candidate_task_ids = [c[0] for c in candidates]
+                    if s.lower() == span_lower and t != entity_type_str:
+                        task_pairs.append((s, t))
+                for span_form, current_type in task_pairs:
+                    candidates.append((tid, span_form, current_type))
+            # candidate_task_ids is the unique set of affected tasks (for the
+            # UI's task-count display and batch iteration). The candidates list
+            # may have multiple entries per task when the span appears under
+            # more than one entity type.
+            seen: set[str] = set()
+            candidate_task_ids = []
+            for tid, _, _ in candidates:
+                if tid not in seen:
+                    seen.add(tid)
+                    candidate_task_ids.append(tid)
 
         # Process the requested batch.
         if dry_run:
