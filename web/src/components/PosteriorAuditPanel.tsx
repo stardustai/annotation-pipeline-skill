@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import type { PosteriorAudit, TaskDeviation, ContestedSpan } from "../types";
+import type { PosteriorAudit, TaskDeviation, DivergentEntry, LowInfoEntry } from "../types";
 import {
   DistributionBar,
   OriginalTextCell,
@@ -33,7 +33,7 @@ type CacheResponse = {
   stale: boolean;
 };
 
-type Subtab = "deviations" | "contested";
+type Subtab = "deviations" | "contested" | "low_info";
 
 const TABLE_STYLE: React.CSSProperties = {
   width: "100%",
@@ -180,7 +180,8 @@ export function PosteriorAuditPanel({
 
   const payload = cache?.payload ?? null;
   const deviations = payload?.task_deviations ?? [];
-  const contested = payload?.contested_spans ?? [];
+  const contested = payload?.divergent_entries ?? [];
+  const lowInfo = payload?.low_info_entries ?? [];
   const stale = cache?.stale ?? false;
   const generatedAt = cache?.generated_at ?? null;
   const cachedExists = cache?.cached ?? false;
@@ -250,13 +251,14 @@ export function PosteriorAuditPanel({
 
       {cachedExists &&
        deviations.length === 0 &&
-       contested.length === 0 ? (
+       contested.length === 0 &&
+       lowInfo.length === 0 ? (
         <p className="runtime-muted">
           All accepted tasks agree with current statistics; no divergent annotations.
         </p>
       ) : null}
 
-      {cachedExists && (deviations.length > 0 || contested.length > 0) ? (
+      {cachedExists && (deviations.length > 0 || contested.length > 0 || lowInfo.length > 0) ? (
         <>
           <div
             style={{
@@ -282,11 +284,18 @@ export function PosteriorAuditPanel({
               >
                 Divergent annotations ({contested.length})
               </button>
+              <button
+                className={subtab === "low_info" ? "view-tab selected" : "view-tab"}
+                type="button"
+                onClick={() => { setSubtab("low_info"); setFilter(""); }}
+              >
+                Low info entries ({lowInfo.length})
+              </button>
             </nav>
             <input
               type="search"
               placeholder={
-                subtab === "deviations" ? "Filter task / span / type…" : "Filter span / type…"
+                subtab === "deviations" ? "Filter task / span / type…" : "Filter span…"
               }
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
@@ -375,6 +384,30 @@ export function PosteriorAuditPanel({
                 />
               ) : (
                 <p className="runtime-muted">No contested spans.</p>
+              )}
+            </>
+          ) : null}
+          {subtab === "low_info" ? (
+            <>
+              <div style={FORMULA_BLOCK_STYLE}>
+                <strong>Low info entries</strong> — divergent spans with no active convention whose
+                tokens score ≥&nbsp;<code>4.0</code> on the Zipf frequency scale (common everyday
+                words). Set to <code>not_an_entity</code> in bulk rather than adjudicating one-by-one.
+                <br />
+                <span style={{ color: "var(--muted, #6b7280)" }}>
+                  Scored via <code>wordfreq</code> (multilingual; Zipf 0–7, 6+ = "the / very / nice").
+                </span>
+              </div>
+              {lowInfo.length > 0 ? (
+                <LowInfoTable
+                  items={lowInfo}
+                  projectId={projectId!}
+                  storeKey={storeKey ?? null}
+                  onAfterFix={reloadCache}
+                  externalFilter={filter}
+                />
+              ) : (
+                <p className="runtime-muted">No low-info spans above threshold.</p>
               )}
             </>
           ) : null}
@@ -994,7 +1027,7 @@ function ContestedTable({
   externalFilter,
   saveAsConvention,
 }: {
-  items: ContestedSpan[];
+  items: DivergentEntry[];
   projectId: string;
   storeKey: string | null;
   onDeclare: (span: string, entityType: string) => Promise<void> | void;
@@ -1060,7 +1093,7 @@ function ContestedTable({
 
   // Open the confirmation dialog with the impact numbers; actual work
   // starts in runRetroactiveSweep after the operator confirms.
-  function requestApplyToAll(c: ContestedSpan, type: string) {
+  function requestApplyToAll(c: DivergentEntry, type: string) {
     const otherCount = type === NOT_ENTITY
       ? c.prior_total
       : c.prior_total - (c.prior_distribution[type] || 0);
@@ -1306,7 +1339,8 @@ function ContestedTable({
             <tr style={THEAD_ROW}>
               <th style={TH_FIRST}>Span</th>
               <th style={TH}>Total</th>
-              <th style={{ ...TH, width: "20%" }}>Sample text</th>
+              <th style={{ ...TH, width: "6%" }} title="Shannon entropy of type distribution (higher = more disagreement)">Entropy</th>
+              <th style={{ ...TH, width: "18%" }}>Sample text</th>
               <th style={{ ...TH, width: "12%" }}>Distribution</th>
               <th style={{ ...TH, width: "16%" }}>Set type</th>
               <th
@@ -1335,6 +1369,9 @@ function ContestedTable({
                 <tr key={c.span} style={TR}>
                   <td style={{ ...TD_MONO }}>{c.span}</td>
                   <td style={TD}>{c.prior_total}</td>
+                  <td style={{ ...TD, fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+                    {c.type_entropy.toFixed(2)}
+                  </td>
                   <td style={TD}>
                     <OriginalTextCell
                       projectId={projectId}
@@ -1498,6 +1535,252 @@ function ContestedTable({
         pageSize={CONTESTED_PAGE_SIZE}
         onPageChange={setPage}
       />
+    </>
+  );
+}
+
+const LOW_INFO_PAGE_SIZE = 30;
+
+function LowInfoTable({
+  items,
+  projectId,
+  storeKey,
+  onAfterFix,
+  externalFilter,
+}: {
+  items: LowInfoEntry[];
+  projectId: string;
+  storeKey: string | null;
+  onAfterFix?: () => void;
+  externalFilter?: string;
+}): React.ReactElement {
+  const filter = externalFilter ?? "";
+  const [page, setPage] = useState(0);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
+  const [bulkRunning, setBulkRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const lower = filter.trim().toLowerCase();
+  const filtered = lower
+    ? items.filter((c) => c.span.toLowerCase().includes(lower))
+    : items;
+  useEffect(() => { setPage(0); }, [filter]);
+  useEffect(() => {
+    const maxPage = Math.max(0, Math.ceil(filtered.length / LOW_INFO_PAGE_SIZE) - 1);
+    if (page > maxPage) setPage(maxPage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered.length]);
+  const visible = filtered.slice(page * LOW_INFO_PAGE_SIZE, (page + 1) * LOW_INFO_PAGE_SIZE);
+
+  async function applyNotAnEntity(span: string) {
+    setRowStatus((s) => ({ ...s, [span]: "submitting" }));
+    try {
+      const storeQ = storeKey ? `?store=${encodeURIComponent(storeKey)}` : "";
+      const baseBody = {
+        project_id: projectId,
+        span,
+        entity_type: "not_an_entity",
+        actor: "low_info_ui",
+        set_convention: false,
+      };
+      const BATCH = 10;
+      const initialResp = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...baseBody, batch_size: BATCH }),
+      });
+      if (!initialResp.ok) {
+        const txt = await initialResp.text();
+        throw new Error(`HTTP ${initialResp.status}: ${txt.slice(0, 200)}`);
+      }
+      const initialData = (await initialResp.json()) as {
+        fixed: number; skipped: number;
+        errors: { task_id: string; reason: string }[];
+        candidate_task_ids: string[] | null;
+      };
+      const allCandidates = initialData.candidate_task_ids ?? [];
+      let cursor = initialData.fixed + initialData.errors.length;
+      while (cursor < allCandidates.length) {
+        const slice = allCandidates.slice(cursor, cursor + BATCH);
+        const r = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...baseBody, task_ids: slice, batch_size: BATCH }),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
+        }
+        cursor += slice.length;
+      }
+      try {
+        await fetch(`/api/entity-statistics/recount${storeQ}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project_id: projectId, span }),
+        });
+      } catch { /* best-effort */ }
+      setRowStatus((s) => ({ ...s, [span]: "done" }));
+    } catch (e) {
+      setRowStatus((s) => ({
+        ...s,
+        [span]: `error: ${e instanceof Error ? e.message : String(e)}`,
+      }));
+    }
+  }
+
+  async function applyBulk() {
+    if (selected.size === 0) return;
+    if (!window.confirm(
+      `Set ${selected.size} span(s) to not_an_entity? This patches all matching accepted task annotations.`,
+    )) return;
+    setBulkRunning(true);
+    setError(null);
+    const spans = Array.from(selected);
+    for (const span of spans) {
+      await applyNotAnEntity(span);
+    }
+    setBulkRunning(false);
+    setSelected(new Set());
+    onAfterFix?.();
+  }
+
+  function toggleSelect(span: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(span)) next.delete(span);
+      else next.add(span);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    if (visible.every((c) => selected.has(c.span))) {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const c of visible) next.delete(c.span);
+        return next;
+      });
+    } else {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const c of visible) next.add(c.span);
+        return next;
+      });
+    }
+  }
+
+  const allVisibleSelected = visible.length > 0 && visible.every((c) => selected.has(c.span));
+
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.4rem 0", fontSize: "0.8rem" }}>
+        <span style={{ color: "var(--muted, #6b7280)" }}>
+          {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
+          {selected.size > 0 ? ` · ${selected.size} selected` : ""}
+        </span>
+        {selected.size > 0 ? (
+          <button
+            type="button"
+            disabled={bulkRunning}
+            onClick={applyBulk}
+            style={{
+              fontSize: "0.8rem",
+              background: "var(--danger, #b91c1c)",
+              color: "white",
+              border: "none",
+              padding: "2px 10px",
+              borderRadius: "4px",
+              cursor: bulkRunning ? "wait" : "pointer",
+              opacity: bulkRunning ? 0.7 : 1,
+            }}
+          >
+            {bulkRunning ? "Applying…" : `Set not_an_entity for selected (${selected.size})`}
+          </button>
+        ) : null}
+      </div>
+      {error ? <div className="notice compact">{error}</div> : null}
+      <Pagination
+        total={filtered.length}
+        page={page}
+        pageSize={LOW_INFO_PAGE_SIZE}
+        onPageChange={setPage}
+      />
+      <div className="runtime-card">
+        <table style={TABLE_STYLE}>
+          <thead>
+            <tr style={THEAD_ROW}>
+              <th style={{ ...TH_FIRST, width: "3%" }}>
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={toggleAll}
+                  style={{ margin: 0, cursor: "pointer" }}
+                  title="Select/deselect all visible rows"
+                />
+              </th>
+              <th style={TH_FIRST}>Span</th>
+              <th style={{ ...TH, width: "8%" }} title="Average Zipf frequency of tokens (0–7 scale; ≥6 = 'the/very/nice')">Wordfreq</th>
+              <th style={{ ...TH, width: "22%" }}>Distribution</th>
+              <th style={{ ...TH, width: "8%" }}>Total</th>
+              <th style={{ ...TH, width: "20%" }}>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visible.map((c) => {
+              const status = rowStatus[c.span];
+              const isDone = status === "done";
+              const isSubmitting = status === "submitting";
+              const isErr = status?.startsWith("error:");
+              return (
+                <tr key={c.span} style={{ ...TR, opacity: isDone ? 0.5 : 1 }}>
+                  <td style={{ ...TD, width: "3%" }}>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(c.span)}
+                      onChange={() => toggleSelect(c.span)}
+                      disabled={isDone || isSubmitting}
+                      style={{ margin: 0, cursor: "pointer" }}
+                    />
+                  </td>
+                  <td style={{ ...TD_MONO }}>{c.span}</td>
+                  <td style={{ ...TD, fontVariantNumeric: "tabular-nums" }}>{c.wordfreq.toFixed(2)}</td>
+                  <td style={TD}>
+                    <DistributionBar distribution={c.prior_distribution} total={c.prior_total} />
+                  </td>
+                  <td style={TD}>{c.prior_total}</td>
+                  <td style={TD}>
+                    {isDone ? (
+                      <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>✓ done</span>
+                    ) : isErr ? (
+                      <span style={{ fontSize: "0.75rem", color: "var(--danger, #b91c1c)" }}>{status?.slice(7)}</span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={isSubmitting}
+                        onClick={() => applyNotAnEntity(c.span).then(() => onAfterFix?.())}
+                        style={{
+                          fontSize: "0.8rem",
+                          background: "var(--danger, #b91c1c)",
+                          color: "white",
+                          border: "none",
+                          padding: "2px 8px",
+                          borderRadius: "4px",
+                          cursor: isSubmitting ? "wait" : "pointer",
+                          opacity: isSubmitting ? 0.7 : 1,
+                        }}
+                      >
+                        {isSubmitting ? "Applying…" : "Set not_an_entity"}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </>
   );
 }
