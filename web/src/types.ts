@@ -308,18 +308,27 @@ export type TaskDeviation = {
   prior_total: number;
 };
 
-export type ContestedSpan = {
+export type DivergentEntry = {
   span: string;
   prior_total: number;
   prior_distribution: Record<string, number>;
   top_share: number;
   runner_up_share: number;
+  type_entropy: number;
   resolved_convention_type?: string;
+};
+
+export type LowInfoEntry = {
+  span: string;
+  prior_total: number;
+  prior_distribution: Record<string, number>;
+  wordfreq: number;
 };
 
 export type PosteriorAudit = {
   task_deviations: TaskDeviation[];
-  contested_spans: ContestedSpan[];
+  divergent_entries: DivergentEntry[];
+  low_info_entries: LowInfoEntry[];
 };
 
 export type EntityConvention = {
