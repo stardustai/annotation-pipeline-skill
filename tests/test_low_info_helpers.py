@@ -34,9 +34,9 @@ def test_wordfreq_score_english():
 
 def test_wordfreq_score_chinese():
     from annotation_pipeline_skill.interfaces.api import _wordfreq_score
-    # 系统 (system) is a very common Chinese word
+    # 系统 (system) is a very common Chinese word; should score >= 4.0 (low-info threshold)
     score = _wordfreq_score("系统")
-    assert score > 0.0
+    assert score >= 4.0
 
 
 def test_wordfreq_score_empty():
@@ -46,6 +46,6 @@ def test_wordfreq_score_empty():
 
 def test_wordfreq_score_oov():
     from annotation_pipeline_skill.interfaces.api import _wordfreq_score
-    # A truly rare/invented token returns 0 from zipf_frequency; average degrades gracefully.
+    # A truly rare/invented token returns 0 from zipf_frequency; should NOT be flagged as low-info.
     score = _wordfreq_score("xyzzyqwerty")
-    assert score >= 0.0  # no crash, some score
+    assert 0.0 <= score < 4.0
