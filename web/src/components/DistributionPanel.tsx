@@ -425,7 +425,7 @@ export function DistributionPanel({
                 type="button"
                 onClick={() => setSubtab("scatter")}
               >
-                Scatter
+                Scatter plot
               </button>
             </nav>
           </div>
