@@ -1310,13 +1310,16 @@ class DashboardApi:
                     ]
                     payload_in_cache["task_deviations"] = kept
                     # If this fix also wrote a project-wide convention,
-                    # stamp the matching contested_spans rows so the
+                    # stamp the matching divergent_entries rows so the
                     # Contested tab's badge reflects the new policy on
                     # refresh (mirrors /api/conventions cache surgery).
                     if save_as_convention:
                         decided_type = new_type or "not_an_entity"
                         span_lower = span.strip().lower()
-                        for c in payload_in_cache.get("contested_spans", []):
+                        for c in payload_in_cache.get("divergent_entries", []):
+                            if c.get("span", "").lower() == span_lower:
+                                c["resolved_convention_type"] = decided_type
+                        for c in payload_in_cache.get("low_info_entries", []):
                             if c.get("span", "").lower() == span_lower:
                                 c["resolved_convention_type"] = decided_type
                     new_hash = compute_accepted_hash(store, project_id=project_for_cache)
@@ -1382,15 +1385,22 @@ class DashboardApi:
                     if cached is not None:
                         cache_payload = cached["payload"]
                         span_lower = span.strip().lower()
-                        contested = cache_payload.get("contested_spans", [])
+                        divergent = cache_payload.get("divergent_entries", [])
                         changed = False
-                        for c in contested:
+                        for c in divergent:
+                            if (c.get("span") or "").lower() == span_lower and \
+                               "resolved_convention_type" in c:
+                                c.pop("resolved_convention_type", None)
+                                changed = True
+                        low_info = cache_payload.get("low_info_entries", [])
+                        for c in low_info:
                             if (c.get("span") or "").lower() == span_lower and \
                                "resolved_convention_type" in c:
                                 c.pop("resolved_convention_type", None)
                                 changed = True
                         if changed:
-                            cache_payload["contested_spans"] = contested
+                            cache_payload["divergent_entries"] = divergent
+                            cache_payload["low_info_entries"] = low_info
                             write_posterior_audit_cache(
                                 store, project_id=pid, payload=cache_payload,
                                 accepted_hash=cached["accepted_hash"],
@@ -1427,16 +1437,21 @@ class DashboardApi:
         except (ValueError, TypeError) as exc:
             return self._json_response(400, {"error": str(exc)})
         # Stamp this span's `resolved_convention_type` on the cached
-        # Posterior Audit `contested_spans` so a refresh after Set
-        # Convention shows the badge inline (UI annotates the row instead
-        # of hiding it — operator wants to observe the change).
+        # Posterior Audit `divergent_entries` and `low_info_entries` so a
+        # refresh after Set Convention shows the badge inline (UI annotates
+        # the row instead of hiding it — operator wants to observe the change).
         cached = read_posterior_audit_cache(store, project_id=pid)
         if cached is not None:
             payload_in_cache = cached["payload"]
             span_lower = span.strip().lower()
-            contested = payload_in_cache.get("contested_spans", [])
+            divergent = payload_in_cache.get("divergent_entries", [])
             mutated = False
-            for c in contested:
+            for c in divergent:
+                if c.get("span", "").lower() == span_lower:
+                    c["resolved_convention_type"] = entity_type
+                    mutated = True
+            low_info = payload_in_cache.get("low_info_entries", [])
+            for c in low_info:
                 if c.get("span", "").lower() == span_lower:
                     c["resolved_convention_type"] = entity_type
                     mutated = True
