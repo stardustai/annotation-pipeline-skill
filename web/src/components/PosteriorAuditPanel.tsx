@@ -280,7 +280,7 @@ export function PosteriorAuditPanel({
                   cursor: "pointer",
                   userSelect: "none",
                 }}
-                title="When checked, Confirm / Apply-to-all also writes a project convention (future tasks see it as a rule). Uncheck for a one-off bulk task fix that doesn't pollute the convention table."
+                title="Shows the Confirm-convention button per row. Apply-to-all NEVER writes a convention regardless of this checkbox — it only patches matching task annotations. Confirm and Apply are independent actions; click both if you want both effects."
               >
                 <input
                   type="checkbox"
@@ -1074,10 +1074,11 @@ function ContestedTable({
         span,
         entity_type: type === NOT_ENTITY ? "not_an_entity" : type,
         actor: "posterior_audit_retroactive_ui",
-        // Honor the per-session "Save as convention" toggle in the
-        // panel header — when false, skip the project convention write
-        // (still patches matching tasks).
-        set_convention: saveConv,
+        // Apply-to-all NEVER writes the project convention — convention
+        // write is a separate action via the Confirm button. Decoupling
+        // the two lets the operator patch tasks without committing to a
+        // project rule (and vice versa).
+        set_convention: false,
       };
       const BATCH = 10;
       const initialResp = await fetch(`/api/posterior-audit/retroactive-fix${storeQ}`, {
@@ -1416,10 +1417,11 @@ function ContestedTable({
                         );
                       })()
                     ) : (() => {
-                      // After plain Confirm, committedType is set but no
-                      // retro happened yet — still let the operator trigger
-                      // the retroactive sweep against the committed type.
-                      // Before any confirm, the button uses pickedType.
+                      // Decoupled from convention write: Apply-to-all
+                      // ONLY patches task annotations now. Operator uses
+                      // the Confirm button (in the Set Convention column)
+                      // separately to write the project rule. This lets
+                      // each side be exercised independently.
                       const triggerType = committedType ?? pickedType;
                       const otherCount = triggerType
                         ? (triggerType === NOT_ENTITY
@@ -1427,14 +1429,11 @@ function ContestedTable({
                             : c.prior_total - (c.prior_distribution[triggerType] || 0))
                         : 0;
                       const noun = otherCount === 1 ? "occurrence" : "occurrences";
-                      const verb = committedType ? "Apply" : "Confirm & apply";
                       const label = triggerType
-                        ? `${verb} to other ${otherCount} ${noun}`
-                        : verb;
+                        ? `Apply to other ${otherCount} ${noun}`
+                        : "Apply to all";
                       const title = triggerType
-                        ? (committedType
-                            ? `Retroactively patch ${otherCount} ACCEPTED task annotation(s) where '${c.span}' is tagged as something other than ${committedType === NOT_ENTITY ? "not_an_entity" : committedType}`
-                            : `Declare convention AND retroactively patch ${otherCount} ACCEPTED task annotation(s) where '${c.span}' is tagged differently`)
+                        ? `Patch ${otherCount} ACCEPTED task annotation(s) where '${c.span}' is tagged as something other than ${triggerType === NOT_ENTITY ? "not_an_entity" : triggerType}. Does NOT write a project convention — use the Confirm button for that.`
                         : "Pick a type in the Set Convention column first";
                       const disabled = !triggerType || otherCount === 0 || isSubmitting;
                       return (
