@@ -232,7 +232,7 @@ class EntityStatisticsService:
             distribution=dist,
         )
 
-    def contested_spans(self, *, project_id: str) -> list[dict[str, Any]]:
+    def divergent_entries(self, *, project_id: str) -> list[dict[str, Any]]:
         """Return spans where the prior distribution has no clear winner.
 
         Criteria (all required):

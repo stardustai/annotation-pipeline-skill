@@ -63,7 +63,7 @@ def test_check_divergent(tmp_path):
     assert result.distribution == {"organization": 9, "project": 1}
 
 
-def test_contested_spans(tmp_path):
+def test_divergent_entries(tmp_path):
     store = SqliteStore.open(tmp_path)
     svc = EntityStatisticsService(store)
     # Contested: 13 org + 12 project + 5 tech (top=43%, runner-up=40%)
@@ -78,11 +78,11 @@ def test_contested_spans(tmp_path):
         svc.increment(project_id="p", span="Apple", entity_type="organization")
     svc.increment(project_id="p", span="Apple", entity_type="project")
 
-    contested = svc.contested_spans(project_id="p")
-    assert len(contested) == 1
-    assert contested[0]["span"] == "Microsoft" or contested[0]["span"] == "microsoft"
-    assert contested[0]["prior_total"] == 30
-    assert contested[0]["prior_distribution"] == {"organization": 13, "project": 12, "technology": 5}
+    entries = svc.divergent_entries(project_id="p")
+    assert len(entries) == 1
+    assert entries[0]["span"] == "Microsoft" or entries[0]["span"] == "microsoft"
+    assert entries[0]["prior_total"] == 30
+    assert entries[0]["prior_distribution"] == {"organization": 13, "project": 12, "technology": 5}
 
 
 def test_iter_span_decisions_walks_entities_and_json_structures():
