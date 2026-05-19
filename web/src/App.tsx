@@ -308,7 +308,11 @@ export default function App() {
         <EntityKnowledgePanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
       ) : null}
       {viewMode === "distribution" ? (
-        <DistributionPanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
+        <DistributionPanel
+          projectId={selectedProjectId}
+          storeKey={selectedStoreKey}
+          onSelectTask={(tid) => setTask(tid)}
+        />
       ) : null}
       {viewMode === "statistics" ? (
         <TypeStatisticsPanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
