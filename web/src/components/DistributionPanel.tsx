@@ -826,14 +826,23 @@ function ScatterSubTab({ coords, onSelectTask }: ScatterSubTabProps): React.Reac
     };
   });
 
+  // Force axis auto-range on every render so a fresh scan (especially
+  // when switching profiles between MinHash and jina_small — the coord
+  // ranges differ by ~100×) re-fits the screen instead of keeping the
+  // previous zoom. `uirevision` ties this re-fit to the data identity:
+  // toggling status filters doesn't reset zoom (same uirevision), but
+  // running a new scan does (different first task_id / coord count
+  // produce a new revision string).
+  const uirevision = `${coords.length}:${coords[0]?.task_id ?? ""}`;
   const layout: Partial<Plotly.Layout> = {
     autosize: true,
     hovermode: "closest" as const,
     margin: { l: 50, r: 30, t: 30, b: 50 },
-    xaxis: { title: { text: "UMAP-1" } },
-    yaxis: { title: { text: "UMAP-2" } },
+    xaxis: { title: { text: "UMAP-1" }, autorange: true },
+    yaxis: { title: { text: "UMAP-2" }, autorange: true },
     legend: { itemsizing: "constant" as const },
     showlegend: true,
+    uirevision,
   };
 
   const config: Partial<Plotly.Config> = {

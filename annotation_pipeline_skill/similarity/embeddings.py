@@ -123,9 +123,60 @@ class RandomEmbeddingClient:
         return None
 
 
+class MinHashSignatureClient:
+    """Treats MinHash signatures as fixed-dim vectors for the same UMAP+HDBSCAN
+    pipeline that runs against real embeddings.
+
+    Each task's canonical text is shingled (word-level n-grams), the shingles
+    are fed into a MinHash with ``profile.num_perm`` permutations, and the
+    resulting integer hash array becomes the vector (cast to float32 so it
+    plays nicely with the rest of the numpy stack). The distance metric in
+    signature space is then a proxy for Jaccard similarity — pairs of tasks
+    with overlapping shingle sets have many matching hash positions and end
+    up close in UMAP-2D.
+
+    Offline (no network), deterministic, much cheaper than embeddings —
+    the right tool for byte-level near-duplicate detection.
+    """
+
+    def __init__(self, profile: SimilarityProfile):
+        self.profile = profile
+        self.num_perm = int(profile.num_perm or 128)
+        self.shingle_size = int(profile.shingle_size or 5)
+
+    def embed(self, texts: list[str]) -> EmbeddingResult:
+        if not texts:
+            return EmbeddingResult(
+                vectors=np.zeros((0, self.num_perm), dtype=np.float32),
+                model=self.profile.model, provider="minhash",
+            )
+        # Late import to avoid pulling datasketch when the user only ever
+        # uses an embedding provider.
+        from datasketch import MinHash
+
+        from annotation_pipeline_skill.similarity.minhash import shingle
+
+        out = np.zeros((len(texts), self.num_perm), dtype=np.float32)
+        for i, t in enumerate(texts):
+            shingles = shingle(t, n=self.shingle_size)
+            m = MinHash(num_perm=self.num_perm)
+            for s in shingles:
+                m.update(s.encode("utf-8"))
+            # m.hashvalues is a numpy uint64 array of length num_perm.
+            out[i] = m.hashvalues.astype(np.float32)
+        return EmbeddingResult(
+            vectors=out, model=self.profile.model, provider="minhash",
+        )
+
+    def close(self) -> None:
+        return None
+
+
 def build_embedding_client(profile: SimilarityProfile) -> EmbeddingProvider:
     if profile.provider == "jina_http":
         return JinaHTTPEmbeddingClient(profile)
     if profile.provider == "random":
         return RandomEmbeddingClient(profile)
+    if profile.provider == "minhash":
+        return MinHashSignatureClient(profile)
     raise ValueError(f"unknown embedding provider: {profile.provider!r}")

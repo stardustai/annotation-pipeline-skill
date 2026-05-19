@@ -90,3 +90,29 @@ def test_jina_http_client_chunks_when_batch_size_positive(monkeypatch):
     assert calls[0] == ["aa", "b"]
     assert calls[1] == ["ccc", "dddd"]
     assert out.vectors.shape == (4, 3)
+
+
+def test_minhash_client_produces_signature_vectors():
+    from annotation_pipeline_skill.similarity.embeddings import (
+        MinHashSignatureClient,
+    )
+    profile = SimilarityProfile(
+        name="mh", provider="minhash", model="minhash-w5-p128",
+        shingle_size=5, num_perm=128,
+    )
+    client = build_embedding_client(profile)
+    assert isinstance(client, MinHashSignatureClient)
+    out = client.embed([
+        "the quick brown fox jumps over the lazy dog",
+        "the quick brown fox jumps over the lazy dog",  # identical
+        "completely different sentence about machine learning model",
+    ])
+    assert out.vectors.shape == (3, 128)
+    assert out.provider == "minhash"
+    # Identical texts produce identical signatures.
+    np.testing.assert_array_equal(out.vectors[0], out.vectors[1])
+    # Different texts produce mostly-different signatures (MinHash signature
+    # agreement is a Jaccard estimator; for these unrelated inputs we expect
+    # roughly all 128 positions to differ).
+    diff = (out.vectors[0] != out.vectors[2]).sum()
+    assert diff > 100, f"expected >100 differing positions, got {diff}"

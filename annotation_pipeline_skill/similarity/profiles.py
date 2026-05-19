@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-ALLOWED_PROVIDERS = {"jina_http", "random"}
+ALLOWED_PROVIDERS = {"jina_http", "random", "minhash"}
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,9 @@ class SimilarityProfile:
     max_tokens: int | None = None
     timeout_seconds: float = 60.0
     dim: int | None = None  # for the random-baseline provider
+    # MinHash-only parameters (ignored by other providers).
+    shingle_size: int = 5
+    num_perm: int = 128
 
     def resolve_api_key(self) -> str | None:
         if self.api_key:
@@ -69,5 +72,11 @@ def load_similarity_profiles(path: Path | str) -> dict[str, SimilarityProfile]:
             max_tokens=body.get("max_tokens"),
             timeout_seconds=float(body.get("timeout_seconds") or 60.0),
             dim=body.get("dim"),
+            shingle_size=int(
+                body["shingle_size"] if body.get("shingle_size") is not None else 5
+            ),
+            num_perm=int(
+                body["num_perm"] if body.get("num_perm") is not None else 128
+            ),
         )
     return out
