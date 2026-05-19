@@ -357,6 +357,76 @@ def write_posterior_audit_cache(
     store._conn.commit()
 
 
+def read_distribution_cache(
+    store, *, project_id: str, profile_name: str,
+) -> dict | None:
+    row = store._conn.execute(
+        "SELECT payload_json, content_hash, created_at "
+        "FROM distribution_cache WHERE project_id=? AND profile_name=?",
+        (project_id, profile_name),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "payload": json.loads(row["payload_json"]),
+        "content_hash": row["content_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def write_distribution_cache(
+    store, *, project_id: str, profile_name: str,
+    payload: dict, content_hash: str, created_at: str,
+) -> None:
+    store._conn.execute(
+        "INSERT INTO distribution_cache "
+        "(project_id, profile_name, payload_json, content_hash, created_at) "
+        "VALUES (?,?,?,?,?) "
+        "ON CONFLICT(project_id, profile_name) DO UPDATE SET "
+        "payload_json=excluded.payload_json, "
+        "content_hash=excluded.content_hash, "
+        "created_at=excluded.created_at",
+        (project_id, profile_name,
+         json.dumps(payload, ensure_ascii=False),
+         content_hash, created_at),
+    )
+    store._conn.commit()
+
+
+def compute_distribution_content_hash(
+    store, *, project_id: str, statuses: list[str] | None = None,
+) -> str:
+    """Fingerprint the input set the distribution scan operates on.
+
+    Includes (task_id, status, source_ref_json sha256) for every task in
+    the configured status filter, ordered by task_id. Status is in the
+    hash because moving a task ACCEPTED→REJECTED changes the scatter
+    even though the underlying text didn't.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    if statuses:
+        placeholders = ",".join("?" * len(statuses))
+        sql = (
+            "SELECT task_id, status, source_ref_json FROM tasks "
+            f"WHERE pipeline_id=? AND status IN ({placeholders}) "
+            "ORDER BY task_id"
+        )
+        params = [project_id, *statuses]
+    else:
+        sql = (
+            "SELECT task_id, status, source_ref_json FROM tasks "
+            "WHERE pipeline_id=? ORDER BY task_id"
+        )
+        params = [project_id]
+    rows = store._conn.execute(sql, params).fetchall()
+    for r in rows:
+        text = r["source_ref_json"] or ""
+        ref_h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        h.update(f"{r['task_id']}|{r['status']}|{ref_h}\n".encode("utf-8"))
+    return f"sha256:{h.hexdigest()[:16]}:n={len(rows)}"
+
+
 def build_type_statistics(store, *, project_id: str) -> dict:
     """Walk every ACCEPTED task in the project and aggregate counts by
     entity type AND by json_structure phrase type. The "Statistics"

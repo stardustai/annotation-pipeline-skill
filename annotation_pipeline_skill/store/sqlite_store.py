@@ -83,6 +83,21 @@ CREATE TABLE IF NOT EXISTS type_statistics_cache (
     payload_json TEXT NOT NULL,
     created_at   TEXT NOT NULL
 );
+
+-- Cached per-(project, profile) embedding-cluster scan + 2D scatter
+-- coords. Payload shape: {"clusters": [...], "coords": [...], "params": {...}}.
+-- One row per (project_id, embedding profile name) — distinct profiles
+-- (e.g. jina_small vs random_baseline) keep separate caches. content_hash
+-- is a fingerprint of the input set (task_ids + canonical_text hashes) so
+-- the UI can mark the cache stale when tasks are added / rejected.
+CREATE TABLE IF NOT EXISTS distribution_cache (
+    project_id    TEXT NOT NULL,
+    profile_name  TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    content_hash  TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (project_id, profile_name)
+);
 """
 
 
