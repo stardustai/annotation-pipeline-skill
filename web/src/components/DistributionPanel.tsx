@@ -891,24 +891,22 @@ function RowDuplicatesSubTab({
                             >
                               {member.task_id}:{member.row_index}
                             </code>
-                            {member.text_preview ? (
-                              {(() => {
-                                const truncated = truncateToWords(member.text_preview, 100);
-                                return (
-                                  <span
-                                    className="runtime-muted"
-                                    style={{
-                                      marginLeft: "0.4rem",
-                                      whiteSpace: "normal",
-                                      lineHeight: 1.45,
-                                    }}
-                                  >
-                                    — {truncated}
-                                    {truncated.length < member.text_preview.length ? "…" : ""}
-                                  </span>
-                                );
-                              })()}
-                            ) : null}
+                            {member.text_preview ? (() => {
+                              const truncated = truncateToWords(member.text_preview, 100);
+                              return (
+                                <span
+                                  className="runtime-muted"
+                                  style={{
+                                    marginLeft: "0.4rem",
+                                    whiteSpace: "normal",
+                                    lineHeight: 1.45,
+                                  }}
+                                >
+                                  — {truncated}
+                                  {truncated.length < member.text_preview.length ? "…" : ""}
+                                </span>
+                              );
+                            })() : null}
                           </button>
                         </div>
                       );

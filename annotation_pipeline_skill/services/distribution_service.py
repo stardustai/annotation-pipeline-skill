@@ -33,6 +33,7 @@ from annotation_pipeline_skill.similarity.embeddings import build_embedding_clie
 from annotation_pipeline_skill.services.row_mask_service import RowMaskService
 from annotation_pipeline_skill.similarity.extractors import canonical_task_text
 from annotation_pipeline_skill.similarity.profiles import SimilarityProfile
+from annotation_pipeline_skill.util.text import truncate_to_words
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 _REJECT_STAGE = "similarity_dedup_embedding"
@@ -285,7 +286,7 @@ class DistributionService:
                 "y": coords_xy[i][1] if coords_xy else 0.0,
                 "status": task_statuses[i],
                 "cluster_id": f"emb-{lbl}" if lbl != -1 else None,
-                "text_preview": texts[i][:240],
+                "text_preview": truncate_to_words(texts[i], 100),
             })
 
         payload: dict[str, Any] = {
