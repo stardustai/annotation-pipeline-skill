@@ -25,6 +25,10 @@ from annotation_pipeline_skill.interfaces.api import (
     write_distribution_cache,
 )
 from annotation_pipeline_skill.similarity.clusters import Cluster
+from annotation_pipeline_skill.similarity.embedding_cache import (
+    TaskEmbeddingCache,
+    text_content_hash,
+)
 from annotation_pipeline_skill.similarity.embeddings import build_embedding_client
 from annotation_pipeline_skill.similarity.extractors import canonical_task_text
 from annotation_pipeline_skill.similarity.profiles import SimilarityProfile
@@ -105,6 +109,7 @@ class DistributionService:
         task_ids: list[str] = []
         task_statuses: list[str] = []
         texts: list[str] = []
+        text_hashes: list[str] = []
         for task in self._store.list_tasks_by_pipeline(project_id):
             if status_enums is not None and task.status not in status_enums:
                 continue
@@ -112,16 +117,72 @@ class DistributionService:
             task_ids.append(task.task_id)
             task_statuses.append(task.status.value)
             texts.append(text)
+            text_hashes.append(text_content_hash(text))
 
-        # --- Embed -------------------------------------------------------
-        client = build_embedding_client(profile)
-        try:
-            emb = client.embed(texts) if texts else None
-        finally:
+        # --- Embed (cache-aware) ----------------------------------------
+        # Hit the on-disk cache first; only embed the misses.
+        cache = TaskEmbeddingCache(self._store)
+        cached = cache.get_many(
+            profile_name=profile_name,
+            task_specs=list(zip(task_ids, text_hashes)),
+        )
+        miss_indices = [i for i, tid in enumerate(task_ids) if tid not in cached]
+        miss_texts = [texts[i] for i in miss_indices]
+        cache_stats = {
+            "hits": len(task_ids) - len(miss_indices),
+            "misses": len(miss_indices),
+        }
+
+        emb = None  # legacy variable name kept for compatibility with code below.
+        miss_dim = 0
+        if miss_texts:
+            client = build_embedding_client(profile)
             try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
+                fresh = client.embed(miss_texts)
+            finally:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            miss_dim = int(fresh.vectors.shape[1]) if fresh.vectors.size else 0
+            # Persist the fresh embeddings before assembling the full array
+            # so a crash mid-pipeline still leaves the cache richer than before.
+            cache.put_many(
+                profile_name=profile_name,
+                model=profile.model,
+                dim=miss_dim,
+                entries=[
+                    (task_ids[i], text_hashes[i], fresh.vectors[k])
+                    for k, i in enumerate(miss_indices)
+                ],
+            )
+
+        if task_ids:
+            # Stitch cached + freshly-embedded into a single (N, dim) array.
+            sample_vec = (
+                next(iter(cached.values())).vector if cached
+                else fresh.vectors[0] if miss_texts else None
+            )
+            if sample_vec is None:
+                # No tasks had usable text — leave emb=None so UMAP step is skipped.
+                emb = None
+            else:
+                dim = int(sample_vec.shape[0])
+                full = np.zeros((len(task_ids), dim), dtype=np.float32)
+                miss_pos = 0
+                for i, tid in enumerate(task_ids):
+                    if tid in cached:
+                        full[i] = cached[tid].vector
+                    else:
+                        full[i] = fresh.vectors[miss_pos]
+                        miss_pos += 1
+                # Wrap in the same EmbeddingResult-like shape downstream uses.
+                from annotation_pipeline_skill.similarity.embeddings import (
+                    EmbeddingResult,
+                )
+                emb = EmbeddingResult(
+                    vectors=full, model=profile.model, provider=profile.provider,
+                )
 
         # --- UMAP + HDBSCAN (skip when no tasks) -------------------------
         coords_xy: list[tuple[float, float]] = []
@@ -203,6 +264,7 @@ class DistributionService:
                 "umap_min_dist": umap_min_dist,
                 "statuses": statuses,
                 "generated_at": generated_at,
+                "embedding_cache": cache_stats,
             },
             "clusters": [asdict(c) for c in clusters],
             "coords": coords_out,

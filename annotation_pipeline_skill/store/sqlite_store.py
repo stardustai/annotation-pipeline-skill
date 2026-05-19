@@ -98,6 +98,23 @@ CREATE TABLE IF NOT EXISTS distribution_cache (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (project_id, profile_name)
 );
+
+-- Per-task embedding cache keyed by (task_id, profile_name). vector is a
+-- raw float32 BLOB (dim values, little-endian). content_hash is sha256 of
+-- the canonical_task_text — when the task's input text changes the cache
+-- row is invalidated by hash mismatch (NOT auto-deleted; lookup compares
+-- and re-embeds on miss). One profile's embeddings don't poison another's
+-- so jina_small and random_baseline coexist.
+CREATE TABLE IF NOT EXISTS task_embeddings (
+    task_id       TEXT NOT NULL,
+    profile_name  TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    dim           INTEGER NOT NULL,
+    content_hash  TEXT NOT NULL,
+    vector        BLOB NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (task_id, profile_name)
+);
 """
 
 
