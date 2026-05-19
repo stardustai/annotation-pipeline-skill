@@ -252,6 +252,18 @@ export async function fetchConfigSnapshot(storeKey: string | null = null): Promi
   return response.json() as Promise<ConfigSnapshot>;
 }
 
+export async function fetchConfigFile(
+  id: string,
+  storeKey: string | null = null,
+): Promise<{ id: string; path: string; content: string; exists: boolean }> {
+  const snap = await fetchConfigSnapshot(storeKey);
+  const file = snap.files.find((f) => f.id === id);
+  if (!file) {
+    throw new Error(`Config file '${id}' not in snapshot`);
+  }
+  return { id: file.id, path: file.path, content: file.content, exists: file.exists };
+}
+
 export async function saveConfigFile(id: string, content: string, storeKey: string | null = null): Promise<void> {
   const response = await fetch(withStore(`/api/config/${encodeURIComponent(id)}`, storeKey), {
     method: "PUT",

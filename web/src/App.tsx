@@ -9,7 +9,7 @@ import {
 } from "./api";
 import { ConfigPanel } from "./components/ConfigPanel";
 import { DashboardStatsBar } from "./components/DashboardStatsBar";
-import { DocumentsPanel } from "./components/DocumentsPanel";
+import { AnnotationRulesPanel } from "./components/AnnotationRulesPanel";
 import { SchemaPanel } from "./components/SchemaPanel";
 import { EventLogPanel } from "./components/EventLogPanel";
 import { EntityKnowledgePanel } from "./components/EntityKnowledgePanel";
@@ -31,7 +31,7 @@ import type { KanbanSnapshot, ProjectSummary, StoreInfo, TaskCard, TaskDetail } 
 import { useUrlState, type UrlState } from "./url_state";
 
 const emptySnapshot: KanbanSnapshot = { project_id: null, columns: [] };
-type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "documents" | "schema" | "posterior-audit" | "entity-knowledge" | "distribution" | "statistics";
+type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "annotation-rules" | "schema" | "posterior-audit" | "entity-knowledge" | "distribution" | "statistics";
 
 const urlDefaults: UrlState = { view: "kanban", store: null, project: null, task: null };
 
@@ -246,8 +246,8 @@ export default function App() {
         <button className={viewMode === "events" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("events")}>
           Event Log
         </button>
-        <button className={viewMode === "documents" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("documents")}>
-          Documents
+        <button className={viewMode === "annotation-rules" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("annotation-rules")}>
+          Annotation Rules
         </button>
         <button className={viewMode === "schema" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("schema")}>
           Schema
@@ -283,7 +283,7 @@ export default function App() {
       {viewMode === "providers" ? <ProvidersPanel /> : null}
       {viewMode === "config" ? <ConfigPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "events" ? <EventLogPanel projectId={selectedProjectId} storeKey={selectedStoreKey} /> : null}
-      {viewMode === "documents" ? <DocumentsPanel storeKey={selectedStoreKey} /> : null}
+      {viewMode === "annotation-rules" ? <AnnotationRulesPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "schema" ? <SchemaPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "posterior-audit" ? (
         <PosteriorAuditPanel

@@ -177,13 +177,26 @@ class SubagentRuntime:
         await self._run_task(task, stage_target)
 
     def _load_guideline(self, task: Task) -> str | None:
-        if not task.document_version_id:
-            return None
-        try:
-            ver = self.store.load_document_version(task.document_version_id)
-        except FileNotFoundError:
-            return None
-        return f"Annotation guideline ({ver.version}):\n{ver.content}"
+        # Preferred: task is bound to a versioned AnnotationDocument.
+        if task.document_version_id:
+            try:
+                ver = self.store.load_document_version(task.document_version_id)
+                return f"Annotation guideline ({ver.version}):\n{ver.content}"
+            except FileNotFoundError:
+                pass  # fall through to project-level fallback
+        # Fallback: project-level annotation_rules.yaml under the store
+        # root. This is what the dashboard's "Annotation Rules" tab
+        # edits, and it's the single source of truth for projects that
+        # haven't migrated to per-task AnnotationDocument linkage.
+        rules_path = self.store.root / "annotation_rules.yaml"
+        if rules_path.exists():
+            try:
+                content = rules_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                return None
+            if content:
+                return f"Annotation rules (project):\n{content}"
+        return None
 
     async def _run_task(self, task: Task, stage_target: str) -> None:
         if task.status is TaskStatus.ARBITRATING:
@@ -1345,7 +1358,15 @@ class SubagentRuntime:
         """
         if not failed_span:
             return []
-        source_payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
+        # If the row we'd be looking up is masked, treat it as if the row
+        # doesn't exist — the operator removed it; we shouldn't surface
+        # its text in retry context. apply_masks_to_task drops the row
+        # entirely, so the for-loop below naturally returns no text.
+        from annotation_pipeline_skill.services.row_mask_service import (
+            apply_masks_to_task,
+        )
+        mtask = apply_masks_to_task(self.store, task)
+        source_payload = mtask.source_ref.get("payload") if isinstance(mtask.source_ref, dict) else None
         if not isinstance(source_payload, dict):
             return []
         source_rows = source_payload.get("rows")
@@ -2421,11 +2442,15 @@ class SubagentRuntime:
         # entity names like "attribute" / "system" that the schema validator
         # rejected, causing the fix to silently fall back to HR.
         from annotation_pipeline_skill.core.schema_validation import resolve_output_schema
+        from annotation_pipeline_skill.services.row_mask_service import apply_masks_to_task
         output_schema = resolve_output_schema(task, self.store)
+        # Apply mask filter so the arbiter never sees (and never tries
+        # to correct annotations for) rows the operator has masked.
+        masked_task = apply_masks_to_task(self.store, task)
         prompt = json.dumps(
             {
                 "task_id": task.task_id,
-                "input": task.source_ref.get("payload", {}),
+                "input": masked_task.source_ref.get("payload", {}),
                 "current_annotation": current_annotation,
                 "output_schema": output_schema,
                 "disputed_items": items,
@@ -2640,12 +2665,18 @@ class SubagentRuntime:
         from annotation_pipeline_skill.services.entity_convention_service import (
             EntityConventionService,
         )
+        from annotation_pipeline_skill.services.row_mask_service import (
+            apply_masks_to_task,
+        )
         try:
-            payload = task.source_ref.get("payload") if isinstance(task.source_ref, dict) else None
+            # Filter masked rows BEFORE concatenating, so masked content
+            # can't surface in the convention-matcher's substring search.
+            mtask = apply_masks_to_task(self.store, task)
+            payload = mtask.source_ref.get("payload") if isinstance(mtask.source_ref, dict) else None
             rows = payload.get("rows") if isinstance(payload, dict) else None
             if not isinstance(rows, list):
                 return None
-            # Concatenate all rows' input text for a single substring search.
+            # Concatenate the surviving rows' input text for substring search.
             combined = "\n".join(
                 r.get("input", "") for r in rows if isinstance(r, dict) and isinstance(r.get("input"), str)
             )
@@ -2680,7 +2711,10 @@ class SubagentRuntime:
     def _annotation_prompt(self, task: Task) -> str:
         return json.dumps(
             {
-                "task": _task_payload(task),
+                # Pass store so masked rows are filtered out before the
+                # annotator sees them — masked = "doesn't exist" at every
+                # downstream boundary.
+                "task": _task_payload(task, store=self.store),
                 "feedback_bundle": build_feedback_bundle(self.store, task.task_id),
                 "prior_artifacts": self._artifact_context(task.task_id),
                 "output_schema": resolve_output_schema(task, self.store),
@@ -2691,7 +2725,7 @@ class SubagentRuntime:
     def _qc_prompt(self, task: Task, annotation_artifact: ArtifactRef) -> str:
         return json.dumps(
             {
-                "task": _task_payload(task),
+                "task": _task_payload(task, store=self.store),
                 "annotation_artifact": {
                     **annotation_artifact.to_dict(),
                     "payload": self._slim_annotation_payload(annotation_artifact),
@@ -3015,10 +3049,26 @@ def _build_qc_instructions(
     return "\n\n".join(parts)
 
 
-def _task_payload(task: Task) -> dict[str, Any]:
+def _task_payload(task: Task, store: "SqliteStore | None" = None) -> dict[str, Any]:
+    """Build the prompt input for annotator / QC / arbiter subagents.
+
+    When ``store`` is provided, masked rows are filtered out of
+    ``source_ref.payload.rows`` before the prompt is built, so LLM
+    subagents never see (and can never annotate) rows that have been
+    masked at the operator's review step. Passing ``store=None`` keeps
+    the legacy behaviour for any caller that still needs the unfiltered
+    payload (rare — most call sites have a store handy).
+    """
+    sref = task.source_ref
+    if store is not None:
+        from annotation_pipeline_skill.services.row_mask_service import (
+            apply_masks_to_task,
+        )
+        masked = apply_masks_to_task(store, task)
+        sref = masked.source_ref
     return {
         "task_id": task.task_id,
-        "source_ref": task.source_ref,
+        "source_ref": sref,
         "selected_annotator_id": task.selected_annotator_id,
         "metadata": task.metadata,
     }

@@ -30,8 +30,13 @@ export function ConfigPanel({ storeKey }: ConfigPanelProps) {
     fetchConfigSnapshot(storeKey)
       .then((snapshot) => {
         if (!active) return;
-        setFiles(snapshot.files);
-        const first = snapshot.files[0] ?? null;
+        // annotation_rules.yaml has its own top-level "Annotation Rules"
+        // tab now (with runtime-prompt-injection wiring) — hide it from
+        // this generic file editor so operators don't edit it in two
+        // places.
+        const visible = snapshot.files.filter((f) => f.id !== "annotation_rules.yaml");
+        setFiles(visible);
+        const first = visible[0] ?? null;
         setSelectedId(first?.id ?? null);
         setDraft(first?.content ?? "");
       })
