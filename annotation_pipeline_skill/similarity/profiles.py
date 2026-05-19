@@ -59,7 +59,13 @@ def load_similarity_profiles(path: Path | str) -> dict[str, SimilarityProfile]:
             base_url=body.get("base_url"),
             api_key=body.get("api_key"),
             api_key_env=body.get("api_key_env"),
-            batch_size=int(body.get("batch_size") or 32),
+            # batch_size: 0 is a meaningful value ("don't batch on the
+            # client side; send all inputs in one request"). The naive
+            # ``or 32`` fallback ate the 0 and clobbered it back to 32 —
+            # explicit None-check restores 0 as a legitimate setting.
+            batch_size=int(
+                body["batch_size"] if body.get("batch_size") is not None else 32
+            ),
             max_tokens=body.get("max_tokens"),
             timeout_seconds=float(body.get("timeout_seconds") or 60.0),
             dim=body.get("dim"),

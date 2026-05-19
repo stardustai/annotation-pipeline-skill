@@ -40,32 +40,53 @@ def test_jina_http_url_handles_v1_already_in_base_url():
     assert JinaHTTPEmbeddingClient(p3)._url == "https://example.com/v1/embeddings"
 
 
-def test_jina_http_client_batches_and_returns_vectors(monkeypatch):
+class _FakeResp:
+    def __init__(self, vectors):
+        self.vectors = vectors
+    def raise_for_status(self): pass
+    def json(self):
+        return {"data": [{"embedding": v} for v in self.vectors]}
+
+
+def _make_fake_post(calls):
+    def fake_post(url, json, headers, timeout):
+        calls.append(json["input"])
+        return _FakeResp([[float(len(t)), 0.0, 1.0] for t in json["input"]])
+    return fake_post
+
+
+def test_jina_http_client_sends_all_in_one_request_by_default(monkeypatch):
+    """Default behaviour (batch_size=0/None): one HTTP POST regardless of
+    input size — server is expected to do its own internal batching."""
     profile = SimilarityProfile(
         name="jina_small", provider="jina_http",
-        model="jina-embeddings-v3-small-en",
-        base_url="http://127.0.0.1:8001", api_key="sk-test",
+        model="m", base_url="http://x", api_key="sk-test",
+        batch_size=0,
+    )
+    client = build_embedding_client(profile)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(client._http, "post", _make_fake_post(calls))
+    out = client.embed(["aa", "b", "ccc", "dddd"])
+    # Exactly one HTTP call containing the whole input list.
+    assert len(calls) == 1
+    assert calls[0] == ["aa", "b", "ccc", "dddd"]
+    assert out.vectors.shape == (4, 3)
+    np.testing.assert_array_equal(out.vectors[:, 0], [2.0, 1.0, 3.0, 4.0])
+
+
+def test_jina_http_client_chunks_when_batch_size_positive(monkeypatch):
+    """Opt-in chunking: positive batch_size still works for servers that
+    cap inputs per request."""
+    profile = SimilarityProfile(
+        name="jina_small", provider="jina_http",
+        model="m", base_url="http://x", api_key="sk-test",
         batch_size=2,
     )
     client = build_embedding_client(profile)
-    calls = []
-
-    class FakeResp:
-        def __init__(self, vectors):
-            self.vectors = vectors
-        def raise_for_status(self): pass
-        def json(self):
-            return {"data": [{"embedding": v} for v in self.vectors]}
-
-    def fake_post(url, json, headers, timeout):
-        calls.append(json["input"])
-        return FakeResp([[float(len(t)), 0.0, 1.0] for t in json["input"]])
-
-    monkeypatch.setattr(client._http, "post", fake_post)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(client._http, "post", _make_fake_post(calls))
     out = client.embed(["aa", "b", "ccc", "dddd"])
-    # batch_size=2 → exactly 2 HTTP calls
     assert len(calls) == 2
     assert calls[0] == ["aa", "b"]
     assert calls[1] == ["ccc", "dddd"]
     assert out.vectors.shape == (4, 3)
-    np.testing.assert_array_equal(out.vectors[:, 0], [2.0, 1.0, 3.0, 4.0])

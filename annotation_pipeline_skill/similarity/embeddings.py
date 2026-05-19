@@ -55,6 +55,14 @@ class JinaHTTPEmbeddingClient:
             self._url = f"{root}/v1/embeddings"
 
     def embed(self, texts: list[str]) -> EmbeddingResult:
+        """Send the full input list in one POST.
+
+        The server is expected to do its own internal batching (the
+        local Jina provider uses a 50ms batching window). Client-side
+        batching would only add round-trip overhead and prevent the
+        server from filling its GPU efficiently. Profile ``batch_size``
+        is honoured ONLY when > 0 — set 0 (or omit) for "one request".
+        """
         if not texts:
             return EmbeddingResult(
                 vectors=np.zeros((0, 0), dtype=np.float32),
@@ -64,13 +72,18 @@ class JinaHTTPEmbeddingClient:
         api_key = self.profile.resolve_api_key()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        # Determine chunking: batch_size=0/None → single request; else
+        # use it as a hard cap per HTTP call.
+        bs = self.profile.batch_size
+        if bs is None or bs <= 0 or bs >= len(texts):
+            chunks: list[list[str]] = [texts]
+        else:
+            chunks = [texts[i : i + bs] for i in range(0, len(texts), bs)]
         all_vecs: list[list[float]] = []
-        bs = max(1, self.profile.batch_size)
-        for i in range(0, len(texts), bs):
-            batch = texts[i : i + bs]
+        for chunk in chunks:
             resp = self._http.post(
                 self._url,
-                json={"model": self.profile.model, "input": batch},
+                json={"model": self.profile.model, "input": chunk},
                 headers=headers,
                 timeout=self.profile.timeout_seconds,
             )

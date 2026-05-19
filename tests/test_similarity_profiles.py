@@ -44,6 +44,23 @@ profiles:
         load_similarity_profiles(path)
 
 
+def test_batch_size_zero_is_preserved(tmp_path):
+    """``batch_size: 0`` is a meaningful 'no client-side batching' signal
+    and must not silently fall back to the default 32."""
+    yaml_text = """
+profiles:
+  no_batch:
+    provider: jina_http
+    model: m
+    base_url: http://x
+    batch_size: 0
+"""
+    path = tmp_path / "similarity_profiles.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+    profiles = load_similarity_profiles(path)
+    assert profiles["no_batch"].batch_size == 0
+
+
 def test_profile_resolve_api_key_falls_back_to_env(monkeypatch):
     monkeypatch.setenv("JINA_API_KEY", "from-env")
     p = SimilarityProfile(
