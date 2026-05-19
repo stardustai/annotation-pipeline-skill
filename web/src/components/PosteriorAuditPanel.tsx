@@ -109,6 +109,11 @@ export function PosteriorAuditPanel({
   // bulk task fix WITHOUT introducing a project rule (e.g. context-
   // specific span where the type only applies in this corpus).
   const [saveAsConvention, setSaveAsConvention] = useState(true);
+  // Low-info threshold — client-side filter over the backend's pre-scored list.
+  // Backend floor is 4.0; raising this narrows the list. Lowering below 4.0
+  // requires a full Re-check (backend won't have scored those entries).
+  const LOW_INFO_BACKEND_FLOOR = 4.0;
+  const [lowInfoThreshold, setLowInfoThreshold] = useState(4.0);
 
   useEffect(() => {
     if (!projectId) {
@@ -391,24 +396,54 @@ export function PosteriorAuditPanel({
             <>
               <div style={FORMULA_BLOCK_STYLE}>
                 <strong>Low info entries</strong> — divergent spans with no active convention whose
-                tokens score ≥&nbsp;<code>4.0</code> on the Zipf frequency scale (common everyday
-                words). Set to <code>not_an_entity</code> in bulk rather than adjudicating one-by-one.
+                tokens score ≥&nbsp;<code>{lowInfoThreshold.toFixed(1)}</code> on the Zipf frequency
+                scale (common everyday words). Set to <code>not_an_entity</code> in bulk rather than
+                adjudicating one-by-one.
                 <br />
                 <span style={{ color: "var(--muted, #6b7280)" }}>
                   Scored via <code>wordfreq</code> (multilingual; Zipf 0–7, 6+ = "the / very / nice").
                 </span>
               </div>
-              {lowInfo.length > 0 ? (
-                <LowInfoTable
-                  items={lowInfo}
-                  projectId={projectId!}
-                  storeKey={storeKey ?? null}
-                  onAfterFix={reloadCache}
-                  externalFilter={filter}
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", margin: "0.4rem 0 0.6rem", fontSize: "0.85rem" }}>
+                <label htmlFor="low-info-threshold" style={{ color: "var(--muted, #6b7280)" }}>
+                  Wordfreq threshold:
+                </label>
+                <input
+                  id="low-info-threshold"
+                  type="number"
+                  min={0}
+                  max={7}
+                  step={0.5}
+                  value={lowInfoThreshold}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!isNaN(v)) setLowInfoThreshold(Math.max(0, Math.min(7, v)));
+                  }}
+                  style={{ width: "4.5rem", padding: "1px 4px", fontSize: "0.85rem" }}
                 />
-              ) : (
-                <p className="runtime-muted">No low-info spans above threshold.</p>
-              )}
+                {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
+                  <span style={{ color: "var(--warning, #d97706)", fontSize: "0.8rem" }}>
+                    ⚠ Below backend floor ({LOW_INFO_BACKEND_FLOOR}). Re-check to see more entries.
+                  </span>
+                ) : null}
+              </div>
+              {(() => {
+                const visibleItems = lowInfo.filter((c) => c.wordfreq >= lowInfoThreshold);
+                return visibleItems.length > 0 ? (
+                  <LowInfoTable
+                    items={visibleItems}
+                    projectId={projectId!}
+                    storeKey={storeKey ?? null}
+                    onAfterFix={reloadCache}
+                    externalFilter={filter}
+                  />
+                ) : (
+                  <p className="runtime-muted">
+                    No low-info spans above threshold {lowInfoThreshold.toFixed(1)}.
+                    {lowInfo.length > 0 ? ` (${lowInfo.length} below threshold — lower the value to see them.)` : ""}
+                  </p>
+                );
+              })()}
             </>
           ) : null}
         </>
