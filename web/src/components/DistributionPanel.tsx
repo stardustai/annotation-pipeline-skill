@@ -271,127 +271,119 @@ export function DistributionPanel({
         <div>
           <h2 style={{ marginBottom: "0.25rem" }}>Distribution</h2>
           <p style={{ marginTop: 0, fontSize: "0.85rem" }}>
-            Embed tasks, project to 2-D with UMAP, and find duplicate clusters with HDBSCAN.
-            {cachedExists ? (
-              <>
-                {" · "}
-                <strong>Last scan:</strong> {fmtTime(generatedAt)}
-                {" — "}
-                {stale ? (
-                  <span style={{ color: "var(--warning, #d97706)", fontWeight: 600 }}>
-                    content has changed since this scan{" "}
-                    <span className="runtime-muted" style={{ fontSize: "0.8rem", fontWeight: 400 }}>
-                      ({cache?.cached_content_hash} → {cache?.current_content_hash})
-                    </span>
-                  </span>
-                ) : (
-                  <span className="runtime-muted">in sync with current content</span>
-                )}
-              </>
-            ) : (
-              <span className="runtime-muted"> · no cached scan yet</span>
-            )}
+            Find duplicate rows (Duplicates) and visualize the project's task
+            distribution in 2-D (Scatter plot). Each sub-tab manages its own
+            profile / threshold / scan.
           </p>
         </div>
-        {/* ── Controls ─────────────────────────────────────────────────── */}
-        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
-          <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
-            Profile
-            <select
-              value={profile}
-              onChange={(e) => setProfile(e.target.value)}
-              style={{ fontSize: "0.85rem" }}
-              disabled={loading}
+        {/* Scatter-specific scan controls live in the panel header only when
+            the Scatter plot sub-tab is active. The Duplicates sub-tab has
+            its own independent control bar inside RowDuplicatesSubTab —
+            putting both at this level was the source of the duplicate
+            Profile/Scan UI that the operator complained about. */}
+        {subtab === "scatter" ? (
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
+            <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+              Profile
+              <select
+                value={profile}
+                onChange={(e) => setProfile(e.target.value)}
+                style={{ fontSize: "0.85rem" }}
+                disabled={loading}
+              >
+                {availableProfiles.map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+            </label>
+            <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+              Min cluster size
+              <input
+                type="number"
+                min={2}
+                max={100}
+                value={minClusterSize}
+                onChange={(e) => setMinClusterSize(Math.max(2, parseInt(e.target.value, 10) || 2))}
+                style={{ width: "4.5rem", fontSize: "0.85rem" }}
+                disabled={loading}
+              />
+            </label>
+            <span className="runtime-muted" style={{ fontSize: "0.78rem" }}>
+              {cachedExists
+                ? <>Last scan: {fmtTime(generatedAt)}{stale ? " (stale)" : ""}</>
+                : "no cached scan yet"}
+            </span>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={handleScan}
+              disabled={loading || !projectId}
+              style={
+                stale
+                  ? { background: "var(--warning, #d97706)", borderColor: "var(--warning, #d97706)" }
+                  : undefined
+              }
             >
-              {availableProfiles.map((p) => (
-                <option key={p} value={p}>{p}</option>
-              ))}
-            </select>
-          </label>
-          <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
-            Min cluster size
-            <input
-              type="number"
-              min={2}
-              max={100}
-              value={minClusterSize}
-              onChange={(e) => setMinClusterSize(Math.max(2, parseInt(e.target.value, 10) || 2))}
-              style={{ width: "4.5rem", fontSize: "0.85rem" }}
-              disabled={loading}
-            />
-          </label>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={handleScan}
-            disabled={loading || !projectId}
-            style={
-              stale
-                ? { background: "var(--warning, #d97706)", borderColor: "var(--warning, #d97706)" }
-                : undefined
-            }
-          >
-            {loading ? "Scanning…" : stale ? "Re-Scan (stale)" : cachedExists ? "Re-Scan" : "Scan"}
-          </button>
-        </div>
+              {loading ? "Scanning…" : stale ? "Re-Scan (stale)" : cachedExists ? "Re-Scan" : "Scan"}
+            </button>
+          </div>
+        ) : null}
       </div>
 
       {error ? <div className="notice compact">{error}</div> : null}
 
-      {!cachedExists && !loading ? (
-        <p className="runtime-muted">
-          No cached scan yet. Click <strong>Scan</strong> to run the first embedding + UMAP + HDBSCAN pass.
-        </p>
+      {/* ── Sub-tab nav (always visible — each sub-tab owns its own cache) ── */}
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.5rem" }}>
+        <nav className="view-tabs" aria-label="Distribution sections" style={{ margin: 0 }}>
+          <button
+            className={subtab === "duplicates" ? "view-tab selected" : "view-tab"}
+            type="button"
+            onClick={() => setSubtab("duplicates")}
+          >
+            Duplicates ({rowDedupClusterCount})
+          </button>
+          <button
+            className={subtab === "scatter" ? "view-tab selected" : "view-tab"}
+            type="button"
+            onClick={() => setSubtab("scatter")}
+          >
+            Scatter plot
+          </button>
+        </nav>
+      </div>
+
+      {/* ── Duplicates sub-tab (row-level — task-level was retired) ─── */}
+      {subtab === "duplicates" ? (
+        <RowDuplicatesSubTab
+          projectId={projectId}
+          storeKey={storeKey}
+          onSelectTask={onSelectTask}
+          onClusterCountChange={setRowDedupClusterCount}
+        />
       ) : null}
 
-      {cachedExists ? (
-        <>
-          {/* ── Sub-tab nav ─────────────────────────────────────────────── */}
-          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginTop: "0.5rem" }}>
-            <nav className="view-tabs" aria-label="Distribution sections" style={{ margin: 0 }}>
-              <button
-                className={subtab === "duplicates" ? "view-tab selected" : "view-tab"}
-                type="button"
-                onClick={() => setSubtab("duplicates")}
-              >
-                Duplicates ({rowDedupClusterCount})
-              </button>
-              <button
-                className={subtab === "scatter" ? "view-tab selected" : "view-tab"}
-                type="button"
-                onClick={() => setSubtab("scatter")}
-              >
-                Scatter plot
-              </button>
-            </nav>
-          </div>
-
-          {/* ── Duplicates sub-tab (row-level — task-level was retired) ─── */}
-          {subtab === "duplicates" ? (
-            <RowDuplicatesSubTab
-              projectId={projectId}
-              storeKey={storeKey}
+      {/* ── Scatter plot sub-tab (lazy: plotly only loads on demand) ─── */}
+      {subtab === "scatter" ? (
+        cachedExists ? (
+          <Suspense
+            fallback={
+              <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
+                Loading scatter plot…
+              </div>
+            }
+          >
+            <ScatterSubTab
+              coords={payload?.coords ?? []}
               onSelectTask={onSelectTask}
-              onClusterCountChange={setRowDedupClusterCount}
             />
-          ) : null}
-
-          {/* ── Scatter plot sub-tab (lazy: plotly only loads on demand) ─── */}
-          {subtab === "scatter" ? (
-            <Suspense
-              fallback={
-                <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
-                  Loading scatter plot…
-                </div>
-              }
-            >
-              <ScatterSubTab
-                coords={payload?.coords ?? []}
-                onSelectTask={onSelectTask}
-              />
-            </Suspense>
-          ) : null}
-        </>
+          </Suspense>
+        ) : (
+          <div className="runtime-muted" style={{ padding: "2rem", textAlign: "center" }}>
+            {loading
+              ? "Loading…"
+              : <>No scan yet. Click <strong>Scan</strong> above to embed all tasks (UMAP + HDBSCAN, may take minutes the first time).</>}
+          </div>
+        )
       ) : null}
     </section>
   );
