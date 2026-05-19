@@ -115,6 +115,50 @@ CREATE TABLE IF NOT EXISTS task_embeddings (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (task_id, profile_name)
 );
+
+-- Row-level mask: per (task_id, row_index), a row that downstream consumers
+-- (export, entity_statistics, posterior audit, scatter) treat AS IF it didn't
+-- exist. The task itself stays ACCEPTED — only the marked rows disappear at
+-- the read boundary. Mostly populated by RowDedupService when it finds rows
+-- that duplicate other rows across tasks.
+CREATE TABLE IF NOT EXISTS row_masks (
+    task_id     TEXT NOT NULL,
+    row_index   INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    masked_by   TEXT NOT NULL,
+    masked_at   TEXT NOT NULL,
+    metadata_json TEXT,
+    PRIMARY KEY (task_id, row_index)
+);
+
+-- Per-row embedding cache, parallel to task_embeddings but keyed by row.
+-- Same float32 BLOB layout; content_hash is sha256 of the row's input
+-- text salted with provider-specific params (model name, or shingle_size
+-- / num_perm for MinHash).
+CREATE TABLE IF NOT EXISTS row_embeddings (
+    task_id       TEXT NOT NULL,
+    row_index     INTEGER NOT NULL,
+    profile_name  TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    dim           INTEGER NOT NULL,
+    content_hash  TEXT NOT NULL,
+    vector        BLOB NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (task_id, row_index, profile_name)
+);
+
+-- Cached per-(project, profile) row-level dedup scan, mirrors
+-- distribution_cache for task-level. Payload shape:
+--   {"params": {...}, "clusters": [...], "row_count": int}
+-- One row per (project_id, profile_name).
+CREATE TABLE IF NOT EXISTS row_dedup_cache (
+    project_id    TEXT NOT NULL,
+    profile_name  TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    content_hash  TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (project_id, profile_name)
+);
 """
 
 
