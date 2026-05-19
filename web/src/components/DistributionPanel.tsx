@@ -84,7 +84,13 @@ export type RowDedupCacheResponse = {
   available_profiles: string[];
 };
 
-type Subtab = "duplicates" | "row-duplicates" | "scatter";
+// "duplicates" used to mean task-level (concat all rows, embed once, cluster
+// tasks) — but in practice the rows of a single task vary enough by IDs /
+// dates / numbers that real templates land in 0.05-0.10 Jaccard territory
+// and aren't found. Row-level dedup catches the real cases, so the
+// task-level UI was deleted; "duplicates" now IS row-level. The
+// /api/distribution endpoints are still wired for the Scatter plot.
+type Subtab = "duplicates" | "scatter";
 
 export type DistributionPanelProps = {
   projectId: string | null;
@@ -93,16 +99,6 @@ export type DistributionPanelProps = {
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-// Map known profile names to their embedding model identifier for audit metadata.
-const PROFILE_TO_MODEL: Record<string, string> = {
-  jina_small: "jinaai/jina-embeddings-v5-text-small",
-  random_baseline: "random_baseline",
-};
-
-function getEmbeddingModel(profile: string): string {
-  return PROFILE_TO_MODEL[profile] ?? profile;
-}
 
 function buildDistributionUrl(
   projectId: string,
@@ -138,11 +134,6 @@ function fmtTime(iso: string | null): string {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}${tz ? " " + tz : ""}`;
 }
 
-/** Pick the representative task for a cluster: lowest task_id lexicographically. */
-function pickRepresentative(taskIds: string[]): string {
-  return [...taskIds].sort()[0] ?? taskIds[0];
-}
-
 /**
  * Pick the representative row member for a row-dedup cluster.
  * Mirrors backend RowDedupService.mask_duplicates sort key:
@@ -171,16 +162,6 @@ export function DistributionPanel({
   // Default to "jina_small"; synced to available_profiles[0] after first GET.
   const [profile, setProfile] = useState<string>("jina_small");
   const [minClusterSize, setMinClusterSize] = useState<number>(5);
-  // Client-side similarity threshold filter (does NOT affect scan params).
-  // Semantics differ by provider — cosine for jina (~0.85 baseline) vs
-  // Jaccard for MinHash (~0.10 is already a real duplicate). useEffect
-  // below resets the default whenever the cache reports a new provider.
-  const [cosineThreshold, setCosineThreshold] = useState<number>(0.85);
-
-  // task_id → true for batch reject selection (non-rep tasks only)
-  const [selected, setSelected] = useState<Record<string, true>>({});
-  const [rejecting, setRejecting] = useState(false);
-  const [rejectStatus, setRejectStatus] = useState<string | null>(null);
 
   // ── Auto-load cache on mount / when deps change ──────────────────────────
   useEffect(() => {
@@ -201,28 +182,11 @@ export function DistributionPanel({
         if (d.available_profiles.length > 0 && !d.available_profiles.includes(profile)) {
           setProfile(d.available_profiles[0]);
         }
-        // Reset similarity-threshold default based on whichever provider
-        // the cached payload is from — jina cosine and MinHash Jaccard
-        // live on very different scales.
-        const providerKey = (d.payload?.params as { provider?: string } | undefined)?.provider;
-        if (providerKey === "minhash") {
-          setCosineThreshold((cur) => (cur > 0.5 ? 0.10 : cur));
-        } else if (providerKey === "jina_http") {
-          setCosineThreshold((cur) => (cur < 0.5 ? 0.85 : cur));
-        }
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, storeKey, profile]);
-
-  function reloadCache() {
-    if (!projectId) return;
-    fetch(buildDistributionUrl(projectId, storeKey, profile))
-      .then((r) => (r.ok ? (r.json() as Promise<CacheResponse>) : null))
-      .then((d) => { if (d) setCache(d); })
-      .catch(() => {});
-  }
 
   // ── Scan (POST) ───────────────────────────────────────────────────────────
   async function handleScan() {
@@ -232,7 +196,6 @@ export function DistributionPanel({
     }
     setLoading(true);
     setError(null);
-    setRejectStatus(null);
     try {
       const storeQs = buildStoreQs(storeKey);
       const scanUrl = `/api/distribution/scan?project=${encodeURIComponent(projectId)}${storeQs ? "&" + storeQs.slice(1) : ""}`;
@@ -252,7 +215,6 @@ export function DistributionPanel({
       const job = launch?.job;
       if (!job?.job_id) {
         setCache(launch as CacheResponse);
-        setSelected({});
         return;
       }
       // Distribution scans can take minutes (UMAP + HDBSCAN on
@@ -266,7 +228,6 @@ export function DistributionPanel({
         if (jdata.status === "done") {
           const fresh = await fetch(buildDistributionUrl(projectId, storeKey, profile));
           if (fresh.ok) setCache((await fresh.json()) as CacheResponse);
-          setSelected({});
           return;
         }
         if (jdata.status === "error") {
@@ -281,56 +242,6 @@ export function DistributionPanel({
     }
   }
 
-  // ── Reject (per-cluster POST) ─────────────────────────────────────────────
-  async function handleReject(filteredClusters: ClusterEntry[]) {
-    if (!projectId) return;
-    setRejecting(true);
-    setRejectStatus(null);
-    setError(null);
-    let totalMoved = 0;
-    let totalSkipped = 0;
-    try {
-      const storeQs = buildStoreQs(storeKey);
-      for (const cluster of filteredClusters) {
-        const rep = pickRepresentative(cluster.task_ids);
-        const toReject = cluster.task_ids.filter(
-          (id) => id !== rep && selected[id] === true,
-        );
-        if (toReject.length === 0) continue;
-        const r = await fetch(
-          `/api/distribution/reject?project=${encodeURIComponent(projectId)}${storeQs ? "&" + storeQs.slice(1) : ""}`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              task_ids: toReject,
-              cluster_id: cluster.cluster_id,
-              representative_task_id: rep,
-              cluster_similarity: cluster.similarity,
-              embedding_profile: profile,
-              embedding_model: getEmbeddingModel(profile),
-              actor: "operator",
-            }),
-          },
-        );
-        if (!r.ok) {
-          const txt = await r.text();
-          throw new Error(`HTTP ${r.status}: ${txt.slice(0, 200)}`);
-        }
-        const result = (await r.json()) as { moved: number; skipped: number; skipped_task_ids: string[] };
-        totalMoved += result.moved;
-        totalSkipped += result.skipped;
-      }
-      setRejectStatus(`Rejected ${totalMoved} task(s)${totalSkipped > 0 ? `, skipped ${totalSkipped}` : ""}.`);
-      setSelected({});
-      reloadCache();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRejecting(false);
-    }
-  }
-
   // ── Derived state ─────────────────────────────────────────────────────────
   const payload = cache?.payload ?? null;
   const stale = cache?.stale ?? false;
@@ -341,47 +252,6 @@ export function DistributionPanel({
   // Row-dedup cluster count for the tab label — populated by RowDuplicatesSubTab
   // via a setState callback so the tab button can reflect live data.
   const [rowDedupClusterCount, setRowDedupClusterCount] = useState<number>(0);
-
-  // Filter clusters for Duplicates sub-tab.
-  const filteredClusters: ClusterEntry[] = (payload?.clusters ?? []).filter(
-    (c) =>
-      c.method === "embedding" &&
-      c.task_ids.length >= 2 &&
-      c.similarity >= cosineThreshold,
-  );
-
-  // Build task_id → CoordEntry lookup for text previews.
-  const coordMap = new Map<string, CoordEntry>();
-  for (const coord of payload?.coords ?? []) {
-    coordMap.set(coord.task_id, coord);
-  }
-
-  // All selectable task_ids (non-reps in filtered clusters).
-  const allSelectableIds: string[] = [];
-  for (const cluster of filteredClusters) {
-    const rep = pickRepresentative(cluster.task_ids);
-    for (const id of cluster.task_ids) {
-      if (id !== rep) allSelectableIds.push(id);
-    }
-  }
-
-  const selectedCount = Object.keys(selected).length;
-  const affectedClusters = filteredClusters.filter((c) => {
-    const rep = pickRepresentative(c.task_ids);
-    return c.task_ids.some((id) => id !== rep && selected[id] === true);
-  });
-
-  function handleSelectAll() {
-    const next: Record<string, true> = {};
-    for (const id of allSelectableIds) {
-      next[id] = true;
-    }
-    setSelected(next);
-  }
-
-  function handleClearAll() {
-    setSelected({});
-  }
 
   return (
     <section className="runtime-panel distribution-panel" aria-label="Distribution">
@@ -429,10 +299,7 @@ export function DistributionPanel({
             Profile
             <select
               value={profile}
-              onChange={(e) => {
-                setProfile(e.target.value);
-                setSelected({});
-              }}
+              onChange={(e) => setProfile(e.target.value)}
               style={{ fontSize: "0.85rem" }}
               disabled={loading}
             >
@@ -470,11 +337,6 @@ export function DistributionPanel({
       </div>
 
       {error ? <div className="notice compact">{error}</div> : null}
-      {rejectStatus ? (
-        <div className="notice compact" style={{ color: "var(--success, #047857)" }}>
-          {rejectStatus}
-        </div>
-      ) : null}
 
       {!cachedExists && !loading ? (
         <p className="runtime-muted">
@@ -492,14 +354,7 @@ export function DistributionPanel({
                 type="button"
                 onClick={() => setSubtab("duplicates")}
               >
-                Duplicates ({filteredClusters.length} clusters)
-              </button>
-              <button
-                className={subtab === "row-duplicates" ? "view-tab selected" : "view-tab"}
-                type="button"
-                onClick={() => setSubtab("row-duplicates")}
-              >
-                Row duplicates ({rowDedupClusterCount})
+                Duplicates ({rowDedupClusterCount})
               </button>
               <button
                 className={subtab === "scatter" ? "view-tab selected" : "view-tab"}
@@ -511,30 +366,8 @@ export function DistributionPanel({
             </nav>
           </div>
 
-          {/* ── Duplicates sub-tab ────────────────────────────────────── */}
+          {/* ── Duplicates sub-tab (row-level — task-level was retired) ─── */}
           {subtab === "duplicates" ? (
-            <DuplicatesSubTab
-              filteredClusters={filteredClusters}
-              coordMap={coordMap}
-              cosineThreshold={cosineThreshold}
-              setCosineThreshold={setCosineThreshold}
-              minClusterSize={minClusterSize}
-              setMinClusterSize={setMinClusterSize}
-              selected={selected}
-              setSelected={setSelected}
-              selectedCount={selectedCount}
-              affectedClusters={affectedClusters}
-              allSelectableIds={allSelectableIds}
-              rejecting={rejecting}
-              onSelectAll={handleSelectAll}
-              onClearAll={handleClearAll}
-              onReject={() => handleReject(filteredClusters)}
-              onSelectTask={onSelectTask}
-            />
-          ) : null}
-
-          {/* ── Row duplicates sub-tab ───────────────────────────────── */}
-          {subtab === "row-duplicates" ? (
             <RowDuplicatesSubTab
               projectId={projectId}
               storeKey={storeKey}
@@ -564,279 +397,6 @@ export function DistributionPanel({
   );
 }
 
-// ── DuplicatesSubTab ─────────────────────────────────────────────────────────
-
-type DuplicatesSubTabProps = {
-  filteredClusters: ClusterEntry[];
-  coordMap: Map<string, CoordEntry>;
-  cosineThreshold: number;
-  setCosineThreshold: (v: number) => void;
-  minClusterSize: number;
-  setMinClusterSize: (v: number) => void;
-  selected: Record<string, true>;
-  setSelected: React.Dispatch<React.SetStateAction<Record<string, true>>>;
-  selectedCount: number;
-  affectedClusters: ClusterEntry[];
-  allSelectableIds: string[];
-  rejecting: boolean;
-  onSelectAll: () => void;
-  onClearAll: () => void;
-  onReject: () => void;
-  onSelectTask?: (taskId: string) => void;
-};
-
-function DuplicatesSubTab({
-  filteredClusters,
-  coordMap,
-  cosineThreshold,
-  setCosineThreshold,
-  selected,
-  setSelected,
-  selectedCount,
-  affectedClusters,
-  allSelectableIds,
-  rejecting,
-  onSelectAll,
-  onClearAll,
-  onReject,
-  onSelectTask,
-}: DuplicatesSubTabProps): React.ReactElement {
-  function toggleTask(taskId: string, checked: boolean) {
-    setSelected((prev) => {
-      const next = { ...prev };
-      if (checked) {
-        next[taskId] = true;
-      } else {
-        delete next[taskId];
-      }
-      return next;
-    });
-  }
-
-  return (
-    <div style={{ marginTop: "0.75rem" }}>
-      {/* ── Filter controls ──────────────────────────────────────────── */}
-      <div
-        style={{
-          display: "flex",
-          gap: "1rem",
-          alignItems: "center",
-          flexWrap: "wrap",
-          marginBottom: "0.75rem",
-          padding: "0.6rem 0.75rem",
-          background: "var(--surface2, #f8fafc)",
-          borderRadius: "6px",
-          border: "1px solid var(--border, #e5e7eb)",
-        }}
-      >
-        <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.4rem" }}>
-          <span>Similarity ≥</span>
-          {/* Slider range covers both regimes: 0.01-0.99 so MinHash (Jaccard,
-              real duplicates around 0.10-0.30) and jina (cosine, real
-              duplicates around 0.85+) both have headroom. */}
-          <input
-            type="range"
-            min={0.01}
-            max={0.99}
-            step={0.01}
-            value={cosineThreshold}
-            onChange={(e) => setCosineThreshold(parseFloat(e.target.value))}
-            style={{ width: "160px" }}
-          />
-          <code style={{ fontFamily: "monospace", minWidth: "3rem" }}>
-            {cosineThreshold.toFixed(2)}
-          </code>
-        </label>
-
-        <div style={{ marginLeft: "auto", display: "flex", gap: "0.4rem" }}>
-          <button
-            type="button"
-            onClick={onSelectAll}
-            disabled={allSelectableIds.length === 0}
-            style={{ fontSize: "0.8rem" }}
-            title="Select all non-representative tasks in visible clusters"
-          >
-            Select all ({allSelectableIds.length})
-          </button>
-          <button
-            type="button"
-            onClick={onClearAll}
-            disabled={selectedCount === 0}
-            style={{ fontSize: "0.8rem" }}
-          >
-            Clear
-          </button>
-        </div>
-      </div>
-
-      {/* ── Empty state ───────────────────────────────────────────────── */}
-      {filteredClusters.length === 0 ? (
-        <p className="runtime-muted">
-          No duplicate clusters at cosine ≥ {cosineThreshold.toFixed(2)}. Lower the threshold or re-scan.
-        </p>
-      ) : null}
-
-      {/* ── Cluster cards ─────────────────────────────────────────────── */}
-      <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-        {filteredClusters.map((cluster) => {
-          const rep = pickRepresentative(cluster.task_ids);
-          const members = cluster.task_ids.filter((id) => id !== rep);
-          const preview5 = members.slice(0, 5);
-          return (
-            <div
-              key={cluster.cluster_id}
-              className="runtime-card"
-              style={{ padding: "0.75rem 1rem" }}
-            >
-              {/* ── Cluster header ────────────────────────────────────── */}
-              <div
-                style={{
-                  display: "flex",
-                  gap: "0.75rem",
-                  alignItems: "baseline",
-                  marginBottom: "0.4rem",
-                  flexWrap: "wrap",
-                }}
-              >
-                <code style={{ fontFamily: "monospace", fontWeight: 600, fontSize: "0.85rem" }}>
-                  {cluster.cluster_id}
-                </code>
-                <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
-                  size={cluster.task_ids.length}
-                </span>
-                <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
-                  cos={cluster.similarity.toFixed(3)}
-                </span>
-                <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
-                  rep=
-                  <button
-                    type="button"
-                    onClick={() => onSelectTask?.(rep)}
-                    title="Open task drawer"
-                    style={{
-                      fontFamily: "monospace", fontSize: "0.8rem",
-                      background: "transparent", border: "none", padding: 0,
-                      color: "inherit", textDecoration: "underline",
-                      textUnderlineOffset: "2px", cursor: "pointer",
-                    }}
-                  >
-                    {rep}
-                  </button>
-                </span>
-              </div>
-
-              {/* ── Member rows ──────────────────────────────────────── */}
-              {/* Each row: checkbox toggles batch-reject selection (independent);
-                  the task-id button + preview opens the drawer for inspection. */}
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-                {preview5.map((taskId) => {
-                  const coord = coordMap.get(taskId);
-                  const preview = coord?.text_preview ?? "";
-                  const isChecked = selected[taskId] === true;
-                  return (
-                    <div
-                      key={taskId}
-                      style={{
-                        display: "flex",
-                        alignItems: "flex-start",
-                        gap: "0.5rem",
-                        fontSize: "0.82rem",
-                        padding: "0.2rem 0",
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        onChange={(e) => toggleTask(taskId, e.target.checked)}
-                        title="Include in batch reject"
-                        style={{ marginTop: "2px", flexShrink: 0, cursor: "pointer" }}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => onSelectTask?.(taskId)}
-                        title="Open task drawer"
-                        style={{
-                          flex: 1, textAlign: "left",
-                          background: "transparent", border: "none", padding: 0,
-                          color: "inherit", cursor: "pointer", font: "inherit",
-                        }}
-                      >
-                        <code
-                          style={{
-                            fontFamily: "monospace", fontSize: "0.8rem",
-                            textDecoration: "underline", textUnderlineOffset: "2px",
-                          }}
-                        >
-                          {taskId}
-                        </code>
-                        {preview ? (
-                          <span className="runtime-muted" style={{ marginLeft: "0.4rem" }}>
-                            — {preview.slice(0, 80)}
-                            {preview.length > 80 ? "…" : ""}
-                          </span>
-                        ) : null}
-                      </button>
-                    </div>
-                  );
-                })}
-                {members.length > 5 ? (
-                  <span className="runtime-muted" style={{ fontSize: "0.78rem", paddingLeft: "1.6rem" }}>
-                    … and {members.length - 5} more member(s)
-                  </span>
-                ) : null}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* ── Batch reject footer ───────────────────────────────────────── */}
-      {filteredClusters.length > 0 ? (
-        <div
-          style={{
-            marginTop: "1rem",
-            padding: "0.6rem 0.75rem",
-            background: "var(--surface2, #f8fafc)",
-            borderRadius: "6px",
-            border: "1px solid var(--border, #e5e7eb)",
-            display: "flex",
-            alignItems: "center",
-            gap: "1rem",
-            flexWrap: "wrap",
-          }}
-        >
-          <span style={{ fontSize: "0.85rem" }}>
-            {selectedCount > 0 ? (
-              <>
-                <strong>{selectedCount}</strong> task{selectedCount !== 1 ? "s" : ""} across{" "}
-                <strong>{affectedClusters.length}</strong> cluster{affectedClusters.length !== 1 ? "s" : ""} will be rejected
-              </>
-            ) : (
-              <span className="runtime-muted">No tasks selected — check boxes above to select duplicates to reject</span>
-            )}
-          </span>
-          <button
-            type="button"
-            disabled={selectedCount === 0 || rejecting}
-            onClick={onReject}
-            style={{
-              fontSize: "0.85rem",
-              background:
-                selectedCount > 0 && !rejecting
-                  ? "var(--danger, #b91c1c)"
-                  : undefined,
-              color: selectedCount > 0 && !rejecting ? "white" : undefined,
-              borderColor: selectedCount > 0 && !rejecting ? "var(--danger, #b91c1c)" : undefined,
-              opacity: selectedCount === 0 || rejecting ? 0.6 : 1,
-            }}
-          >
-            {rejecting ? "Rejecting…" : `Reject ${selectedCount > 0 ? selectedCount + " task" + (selectedCount !== 1 ? "s" : "") : ""}`}
-          </button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 // ── RowDuplicatesSubTab ──────────────────────────────────────────────────────
 
