@@ -454,7 +454,33 @@ export function OriginalTextCell({
   }
 
   if (!loaded && loading) return <span className="runtime-muted">…</span>;
-  if (!example) return <span className="runtime-muted">—</span>;
+  if (!example) {
+    // No example found this round. Could be: empty stats / transient
+    // load failure / cycled past examples and reset. Surface a click-
+    // to-retry so the operator can recover without remounting the row.
+    return (
+      <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+        <span className="runtime-muted">—</span>
+        <button
+          type="button"
+          onClick={() => load([])}
+          disabled={loading}
+          title="Retry — search for a sample annotation that mentions this span"
+          style={{
+            fontSize: "0.7rem",
+            background: "transparent",
+            border: "1px solid var(--border, #d1d5db)",
+            padding: "0 5px",
+            borderRadius: "3px",
+            cursor: "pointer",
+            color: "var(--muted, #6b7280)",
+          }}
+        >
+          {loading ? "…" : "↻"}
+        </button>
+      </span>
+    );
+  }
 
   const ctx = spanContext(example.text, span, 8);
   return (

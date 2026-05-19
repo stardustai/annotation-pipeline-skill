@@ -421,7 +421,16 @@ function DeviationsTable({
           d.prior_dominant_type.toLowerCase().includes(lower),
       )
     : deduped;
-  useEffect(() => { setPage(0); }, [filter, items]);
+  // Filter change resets to page 0 (the new filter might yield fewer
+  // rows than the current page covers). Items-only changes (after a
+  // fix, Apply-to-all, Unset, etc.) clamp instead — preserve scroll
+  // position by staying on the same page if it's still in range.
+  useEffect(() => { setPage(0); }, [filter]);
+  useEffect(() => {
+    const maxPage = Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1);
+    if (page > maxPage) setPage(maxPage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered.length]);
   const visible = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
   async function submitFix(d: DedupedDeviation, newType: string | null) {
@@ -995,7 +1004,14 @@ function ContestedTable({
           Object.keys(c.prior_distribution).some((t) => t.toLowerCase().includes(lower)),
       )
     : items;
-  useEffect(() => { setPage(0); }, [filter, items]);
+  // Filter change resets to page 0; items-only changes (after Unset
+  // or Apply-to-all) clamp to stay on the same page when possible.
+  useEffect(() => { setPage(0); }, [filter]);
+  useEffect(() => {
+    const maxPage = Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1);
+    if (page > maxPage) setPage(maxPage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered.length]);
   const visible = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
   async function handleConfirm(span: string, type: string) {
