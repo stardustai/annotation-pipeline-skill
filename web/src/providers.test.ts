@@ -7,19 +7,17 @@ const snapshot: ProviderConfigSnapshot = {
   profiles: [
     {
       name: "local_codex",
-      provider: "local_cli",
-      provider_flavor: null,
-      cli_kind: "codex",
-      cli_binary: "codex",
+      runtime: "codex_cli",
       model: "gpt-5.4-mini",
-      api_key_env: null,
-      base_url: null,
+      base_url: "https://api.openai.com",
+      api_key_env: "OPENAI_API_KEY",
       reasoning_effort: "none",
       permission_mode: null,
       timeout_seconds: 900,
       max_retries: null,
       concurrency_limit: null,
       no_progress_timeout_seconds: 30,
+      disable_continuity: null,
     },
   ],
   targets: { annotation: "local_codex", qc: "local_codex" },
@@ -33,13 +31,13 @@ const snapshot: ProviderConfigSnapshot = {
 };
 
 describe("provider config helpers", () => {
-  it("creates explicit provider profiles for selected provider kinds", () => {
-    expect(createProviderProfile("openai_compatible", 2)).toMatchObject({
-      name: "openai_compatible_2",
-      provider: "openai_compatible",
-      provider_flavor: "deepseek",
-      model: "deepseek-chat",
-      api_key_env: "DEEPSEEK_API_KEY",
+  it("creates explicit provider profiles for selected runtime kinds", () => {
+    expect(createProviderProfile("codex_cli", 2)).toMatchObject({
+      name: "profile_2",
+      runtime: "codex_cli",
+      model: "gpt-5.5",
+      base_url: "https://api.openai.com",
+      api_key_env: "OPENAI_API_KEY",
     });
   });
 
@@ -52,6 +50,6 @@ describe("provider config helpers", () => {
   });
 
   it("formats profile titles for operator scanning", () => {
-    expect(profileTitle(snapshot.profiles[0])).toBe("local_codex · local_cli/codex · gpt-5.4-mini");
+    expect(profileTitle(snapshot.profiles[0])).toBe("local_codex · codex_cli · gpt-5.4-mini");
   });
 });

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchProviderConfig, saveProviderConfig } from "../api";
 import { createProviderProfile, profileStatusLabel, profileTitle, providerConfigPayload } from "../providers";
-import type { ProviderConfigSnapshot, ProviderName, ProviderProfileConfig } from "../types";
+import type { ProviderConfigSnapshot, Runtime, ProviderProfileConfig } from "../types";
 
 // Stages the runtime resolves via `client_factory(target_name)`. Order
 // matters for layout (top row = the most-edited two; second row =
@@ -20,7 +20,7 @@ export function ProvidersPanel() {
   // resolves to the workspace-level file (with project-local fallback).
   const [snapshot, setSnapshot] = useState<ProviderConfigSnapshot | null>(null);
   const [selectedProfile, setSelectedProfile] = useState<string | null>(null);
-  const [newProviderKind, setNewProviderKind] = useState<ProviderName>("local_cli");
+  const [newRuntime, setNewRuntime] = useState<Runtime>("claude_cli");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -68,7 +68,7 @@ export function ProvidersPanel() {
 
   function addProfile() {
     if (!snapshot) return;
-    const profile = createProviderProfile(newProviderKind, snapshot.profiles.length + 1);
+    const profile = createProviderProfile(newRuntime, snapshot.profiles.length + 1);
     setSnapshot({ ...snapshot, profiles: [...snapshot.profiles, profile] });
     setSelectedProfile(profile.name);
   }
@@ -175,10 +175,9 @@ export function ProvidersPanel() {
       <div className="providers-layout">
         <aside className="provider-list">
           <div className="provider-add-row">
-            <select value={newProviderKind} onChange={(event) => setNewProviderKind(event.target.value as ProviderName)}>
-              <option value="local_cli">Local CLI</option>
-              <option value="openai_responses">OpenAI Responses</option>
-              <option value="openai_compatible">OpenAI Compatible</option>
+            <select value={newRuntime} onChange={(event) => setNewRuntime(event.target.value as Runtime)}>
+              <option value="claude_cli">claude_cli</option>
+              <option value="codex_cli">codex_cli</option>
             </select>
             <button className="view-tab" type="button" onClick={addProfile}>
               Add
@@ -211,41 +210,23 @@ export function ProvidersPanel() {
               <div className="provider-form-grid">
                 <TextField label="Name" value={selected.name} onChange={(value) => updateSelected({ name: value })} />
                 <SelectField
-                  label="Provider"
-                  value={selected.provider}
-                  options={["local_cli", "openai_responses", "openai_compatible"]}
-                  onChange={(value) => updateSelected(providerDefaultsFor(value as ProviderName))}
+                  label="Runtime"
+                  value={selected.runtime}
+                  options={["claude_cli", "codex_cli"]}
+                  onChange={(value) => updateSelected({ runtime: value as Runtime })}
                 />
-                {selected.provider === "local_cli" ? (
-                  <>
-                    <SelectField label="CLI Kind" value={selected.cli_kind ?? "codex"} options={["codex", "claude"]} onChange={(value) => updateSelected({ cli_kind: value as ProviderProfileConfig["cli_kind"] })} />
-                    <TextField label="CLI Binary" value={selected.cli_binary ?? ""} onChange={(value) => updateSelected({ cli_binary: value })} />
-                    <TextField label="Permission Mode" value={selected.permission_mode ?? ""} onChange={(value) => updateSelected({ permission_mode: value || null })} />
-                  </>
-                ) : null}
-                {selected.provider === "openai_compatible" ? (
-                  <SelectField
-                    label="Provider Flavor"
-                    value={selected.provider_flavor ?? "deepseek"}
-                    options={["deepseek", "glm", "minimax"]}
-                    onChange={(value) => updateSelected({ provider_flavor: value as ProviderProfileConfig["provider_flavor"] })}
-                  />
-                ) : null}
-                {selected.provider !== "local_cli" ? (
-                  <>
-                    <PasswordField
-                      label="API Key (inline)"
-                      value={selected.api_key ?? ""}
-                      placeholder={selected.api_key_set ? "set" : "not set"}
-                      hint={selected.api_key_set ? "Leave blank to keep current key" : undefined}
-                      onChange={(value) => updateSelected({ api_key: value })}
-                    />
-                    <TextField label="API Key Env" value={selected.api_key_env ?? ""} onChange={(value) => updateSelected({ api_key_env: value })} />
-                    <TextField label="Base URL" value={selected.base_url ?? ""} onChange={(value) => updateSelected({ base_url: value })} />
-                  </>
-                ) : null}
                 <TextField label="Model" value={selected.model} onChange={(value) => updateSelected({ model: value })} />
+                <TextField label="Base URL" value={selected.base_url ?? ""} onChange={(value) => updateSelected({ base_url: value })} />
+                <TextField label="API Key Env" value={typeof selected.api_key_env === "string" ? selected.api_key_env : (selected.api_key_env ?? []).join(", ")} onChange={(value) => updateSelected({ api_key_env: value })} />
+                <PasswordField
+                  label="API Key (inline)"
+                  value={selected.api_key ?? ""}
+                  placeholder={selected.api_key_set ? "set" : "not set"}
+                  hint={selected.api_key_set ? "Leave blank to keep current key" : undefined}
+                  onChange={(value) => updateSelected({ api_key: value })}
+                />
                 <TextField label="Reasoning Effort" value={selected.reasoning_effort ?? ""} onChange={(value) => updateSelected({ reasoning_effort: value || null })} />
+                <TextField label="Permission Mode" value={selected.permission_mode ?? ""} onChange={(value) => updateSelected({ permission_mode: value || null })} />
                 <NumberField label="Timeout Seconds" value={selected.timeout_seconds} onChange={(value) => updateSelected({ timeout_seconds: value })} />
                 <NumberField label="Max Retries" value={selected.max_retries} onChange={(value) => updateSelected({ max_retries: value })} />
                 <NumberField label="Concurrency Limit" value={selected.concurrency_limit} onChange={(value) => updateSelected({ concurrency_limit: value })} />
@@ -273,29 +254,8 @@ export function ProvidersPanel() {
   );
 }
 
-function providerDefaultsFor(provider: ProviderName): Partial<ProviderProfileConfig> {
-  const defaults = createProviderProfile(provider, 1);
-  return {
-    provider,
-    provider_flavor: defaults.provider_flavor,
-    cli_kind: defaults.cli_kind,
-    cli_binary: defaults.cli_binary,
-    api_key_env: defaults.api_key_env,
-    base_url: defaults.base_url,
-    model: defaults.model,
-    reasoning_effort: defaults.reasoning_effort,
-    permission_mode: defaults.permission_mode,
-  };
-}
-
 function normalizeProfile(profile: ProviderProfileConfig): ProviderProfileConfig {
-  if (profile.provider === "local_cli") {
-    return { ...profile, provider_flavor: null, api_key_env: null, base_url: null };
-  }
-  if (profile.provider === "openai_responses") {
-    return { ...profile, provider_flavor: null, cli_kind: null, cli_binary: null, permission_mode: null };
-  }
-  return { ...profile, cli_kind: null, cli_binary: null, permission_mode: null };
+  return { ...profile };
 }
 
 function TextField(props: { label: string; value: string; onChange: (value: string) => void }) {
