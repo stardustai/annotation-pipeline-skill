@@ -192,17 +192,19 @@ def _profile_diagnostics(profile: LLMProfile, *, env: Mapping[str, str]) -> dict
         },
     ]
     key_present = bool(profile.api_key) or bool(profile.resolve_api_key(env))
-    env_label = (
-        profile.api_key_env
-        if isinstance(profile.api_key_env, str)
-        else ", ".join(profile.api_key_env)
-    )
-    if key_present:
-        key_status, key_message = "ok", f"{env_label} is set"
+    if profile.api_key_env is None:
+        env_label = None
+    elif isinstance(profile.api_key_env, str):
+        env_label = profile.api_key_env
     else:
-        # Both codex and claude CLIs manage their own auth locally; key not required in env
-        key_status, key_message = "ok", f"{env_label} not set — CLI uses stored auth"
-    checks.append({"id": "api_key_env_present", "status": key_status, "message": key_message})
+        env_label = ", ".join(profile.api_key_env)
+    if key_present:
+        key_message = f"{env_label} is set"
+    elif env_label is None:
+        key_message = "no api_key_env configured — CLI uses stored auth"
+    else:
+        key_message = f"{env_label} not set — CLI uses stored auth"
+    checks.append({"id": "api_key_env_present", "status": "ok", "message": key_message})
     status = "ok" if all(c["status"] == "ok" for c in checks) else "error"
     return {"status": status, "checks": checks}
 

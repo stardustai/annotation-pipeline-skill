@@ -84,18 +84,19 @@ targets:
         load_llm_registry(p)
 
 
-def test_missing_api_key_env_raises(tmp_path: Path):
+def test_missing_api_key_env_is_allowed(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
-  bad:
+  minimal:
     runtime: claude_cli
-    model: gpt-4
-    base_url: https://api.example.com
+    model: claude-sonnet-4-5
+    base_url: https://api.anthropic.com
 targets:
-  annotation: bad
+  annotation: minimal
 """)
-    with pytest.raises(ProfileValidationError, match="api_key_env"):
-        load_llm_registry(p)
+    profile = load_llm_registry(p).resolve("annotation")
+    assert profile.api_key_env is None
+    assert profile.resolve_api_key({}) == ""
 
 
 def test_invalid_runtime_raises(tmp_path: Path):

@@ -39,7 +39,7 @@ class LLMProfile:
     runtime: Runtime
     model: str
     base_url: str
-    api_key_env: str | list[str]
+    api_key_env: str | list[str] | None = None
     api_key: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
@@ -52,6 +52,8 @@ class LLMProfile:
     def resolve_api_key(self, env: Mapping[str, str] = os.environ) -> str:
         if self.api_key:
             return self.api_key
+        if not self.api_key_env:
+            return ""
         candidates = [self.api_key_env] if isinstance(self.api_key_env, str) else list(self.api_key_env)
         for name in candidates:
             value = env.get(name, "")
@@ -109,7 +111,7 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
         raise ProfileValidationError(f"profile {name} runtime must be 'claude_cli' or 'codex_cli', got: {runtime!r}")
     model = _required_string(raw.get("model"), f"profile {name} model")
     base_url = _required_string(raw.get("base_url"), f"profile {name} base_url")
-    api_key_env = _required_api_key_env(raw.get("api_key_env"), f"profile {name} api_key_env")
+    api_key_env = _optional_api_key_env(raw.get("api_key_env"), f"profile {name} api_key_env")
     return LLMProfile(
         name=name,
         runtime=runtime,
@@ -141,9 +143,9 @@ def _optional_string(value: object, label: str) -> str | None:
     return value
 
 
-def _required_api_key_env(value: object, label: str) -> str | list[str]:
+def _optional_api_key_env(value: object, label: str) -> str | list[str] | None:
     if value is None:
-        raise ProfileValidationError(f"missing {label}")
+        return None
     if isinstance(value, str):
         if not value.strip():
             raise ProfileValidationError(f"invalid {label}")
