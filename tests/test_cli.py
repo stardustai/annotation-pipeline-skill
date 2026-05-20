@@ -68,7 +68,7 @@ def test_cli_init_seeds_workspace_llm_profiles_when_absent(tmp_path):
     content = (tmp_path / "llm_profiles.yaml").read_text(encoding="utf-8")
     assert "profiles:" in content
     assert "targets:" in content
-    assert "deepseek_flash" in content
+    assert "local_claude" in content
 
 
 def test_cli_init_accepts_explicit_workspace_flag(tmp_path):
@@ -732,28 +732,17 @@ def test_cli_human_review_correct_returns_nonzero_on_schema_fail(tmp_path):
 
 
 def test_default_llm_profiles_template_covers_memory_ner_models():
-    """The init template should include profiles for all models in memory-ner/providers.yaml."""
+    """The init template should include a claude_cli profile."""
     import yaml
     from annotation_pipeline_skill.interfaces.cli import CONFIG_FILES
 
     template = yaml.safe_load(CONFIG_FILES["llm_profiles.yaml"])
     profile_models = {p["model"] for p in template["profiles"].values()}
-    # codex
-    assert "gpt-5.4" in profile_models
-    assert "gpt-5.4-mini" in profile_models
-    # claude (CLI shortnames matching memory-ner)
-    assert "sonnet" in profile_models or "claude-sonnet-4-6" in profile_models
-    # deepseek
-    assert "deepseek-v4-flash" in profile_models
-    assert "deepseek-v4-pro" in profile_models
-    assert "deepseek-chat" in profile_models
-    # glm
-    assert "glm-4-flash" in profile_models
-    assert "glm-4.5-air" in profile_models
-    assert "glm-4.6" in profile_models
-    assert "glm-5.1" in profile_models
-    # minimax
-    assert "MiniMax-M2.7" in profile_models
+    profile_runtimes = {p.get("runtime") for p in template["profiles"].values()}
+    # flat schema: claude_cli runtime
+    assert "claude_cli" in profile_runtimes
+    # claude-sonnet-4-6 is the default model
+    assert "claude-sonnet-4-6" in profile_models
 
 
 def test_default_llm_profiles_glm_coding_models_use_coding_endpoint_with_fallback_key():
@@ -776,6 +765,10 @@ def test_default_llm_profiles_glm_coding_models_use_coding_endpoint_with_fallbac
 
 
 def test_default_llm_profiles_glm_non_coding_models_use_public_endpoint():
+    """If a glm-4-flash profile exists in the template it must use the public endpoint.
+    The simplified default template no longer includes GLM profiles, so this test
+    passes vacuously; individual project llm_profiles.yaml files with GLM profiles
+    are validated by test_llm_profiles.py."""
     import yaml
     from annotation_pipeline_skill.interfaces.cli import CONFIG_FILES
 
@@ -784,7 +777,7 @@ def test_default_llm_profiles_glm_non_coding_models_use_public_endpoint():
         if profile.get("model") == "glm-4-flash":
             assert profile["base_url"] == "https://open.bigmodel.cn/api/paas/v4"
             return
-    raise AssertionError("template missing glm-4-flash profile")
+    # No glm-4-flash in the simplified template — that's fine.
 
 
 def test_default_llm_profiles_template_is_valid_yaml_and_registry():

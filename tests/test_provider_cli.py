@@ -13,10 +13,10 @@ def test_provider_doctor_validates_llm_profiles(tmp_path):
         """
 profiles:
   local_codex:
-    provider: local_cli
-    cli_kind: codex
-    cli_binary: codex
+    runtime: codex_cli
     model: gpt-5.4-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
 targets:
   annotation: local_codex
 """,
@@ -55,18 +55,14 @@ def test_provider_targets_exposes_ui_relevant_profile_fields(tmp_path, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["annotation"] == {
-        "base_url": "https://api.deepseek.com",
-        "cli_kind": None,
-        "model": "deepseek-v4-flash",
-        "profile": "deepseek_flash",
-        "provider": "openai_compatible",
-        "provider_flavor": "deepseek",
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-sonnet-4-6",
+        "profile": "local_claude",
+        "runtime": "claude_cli",
     }
     assert payload["qc"] == {
-        "base_url": "https://api.deepseek.com",
-        "cli_kind": None,
-        "model": "deepseek-v4-flash",
-        "profile": "deepseek_flash",
-        "provider": "openai_compatible",
-        "provider_flavor": "deepseek",
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-sonnet-4-6",
+        "profile": "local_claude",
+        "runtime": "claude_cli",
     }

@@ -27,8 +27,6 @@ from annotation_pipeline_skill.core.states import AttemptStatus, TaskStatus
 from annotation_pipeline_skill.core.transitions import transition_task
 from annotation_pipeline_skill.interfaces.api import serve_dashboard_api
 from annotation_pipeline_skill.llm.local_cli import LocalCLIClient
-from annotation_pipeline_skill.llm.openai_compatible import OpenAICompatibleClient
-from annotation_pipeline_skill.llm.openai_responses import OpenAIResponsesClient
 from annotation_pipeline_skill.llm.profiles import (
     ProfileValidationError,
     load_llm_registry,
@@ -77,7 +75,7 @@ runtime:
   text_annotator:
     display_name: Text Annotator
     modalities: [text]
-    annotation_types: [entity_span, classification, relation, structured_json]
+    annotation_types: [entity_span, structured_json]
     input_artifact_kinds: [raw_slice]
     output_artifact_kinds: [annotation_result]
     provider_target: annotation
@@ -118,113 +116,18 @@ runtime:
     secret_env: null
 """,
     "llm_profiles.yaml": """profiles:
-  local_codex:
-    provider: local_cli
-    cli_kind: codex
-    cli_binary: codex
-    model: gpt-5.4-mini
-    reasoning_effort: medium
-    timeout_seconds: 900
-    no_progress_timeout_seconds: 30
-  local_codex_full:
-    provider: local_cli
-    cli_kind: codex
-    cli_binary: codex
-    model: gpt-5.4
-    reasoning_effort: medium
-    timeout_seconds: 900
-    no_progress_timeout_seconds: 30
-  local_claude_sonnet:
-    provider: local_cli
-    cli_kind: claude
-    cli_binary: claude
-    model: sonnet
-    permission_mode: dontAsk
-    timeout_seconds: 900
-    no_progress_timeout_seconds: 30
-  local_claude_haiku:
-    provider: local_cli
-    cli_kind: claude
-    cli_binary: claude
-    model: haiku
-    permission_mode: dontAsk
-    timeout_seconds: 900
-    no_progress_timeout_seconds: 30
-  openai_default:
-    provider: openai_responses
-    model: gpt-5.4-mini
-    api_key_env: OPENAI_API_KEY
-    base_url: https://api.openai.com/v1
-    reasoning_effort: medium
-    timeout_seconds: 300
-  deepseek_flash:
-    provider: openai_compatible
-    provider_flavor: deepseek
-    model: deepseek-v4-flash
-    api_key_env: DEEPSEEK_API_KEY
-    base_url: https://api.deepseek.com
+  local_claude:
+    runtime: claude_cli
+    model: claude-sonnet-4-6
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
     timeout_seconds: 120
-  deepseek_pro:
-    provider: openai_compatible
-    provider_flavor: deepseek
-    model: deepseek-v4-pro
-    api_key_env: DEEPSEEK_API_KEY
-    base_url: https://api.deepseek.com
-    timeout_seconds: 300
-  deepseek_chat:
-    provider: openai_compatible
-    provider_flavor: deepseek
-    model: deepseek-chat
-    api_key_env: DEEPSEEK_API_KEY
-    base_url: https://api.deepseek.com
-    timeout_seconds: 300
-  glm_flash:
-    provider: openai_compatible
-    provider_flavor: glm
-    model: glm-4-flash
-    api_key_env:
-      - BIGMODEL_MCP_API_KEY
-      - ZHIPUAI_API_KEY
-    base_url: https://open.bigmodel.cn/api/paas/v4
-    timeout_seconds: 120
-  glm_air:
-    provider: openai_compatible
-    provider_flavor: glm
-    model: glm-4.5-air
-    api_key_env:
-      - GLM_CODING_API_KEY
-      - BIGMODEL_MCP_API_KEY
-    base_url: https://open.bigmodel.cn/api/coding/paas/v4
-    timeout_seconds: 300
-  glm_46:
-    provider: openai_compatible
-    provider_flavor: glm
-    model: glm-4.6
-    api_key_env:
-      - GLM_CODING_API_KEY
-      - BIGMODEL_MCP_API_KEY
-    base_url: https://open.bigmodel.cn/api/coding/paas/v4
-    timeout_seconds: 300
-  glm_51:
-    provider: openai_compatible
-    provider_flavor: glm
-    model: glm-5.1
-    api_key_env:
-      - GLM_CODING_API_KEY
-      - BIGMODEL_MCP_API_KEY
-    base_url: https://open.bigmodel.cn/api/coding/paas/v4
-    timeout_seconds: 300
-  minimax_default:
-    provider: openai_compatible
-    provider_flavor: minimax
-    model: MiniMax-M2.7
-    api_key_env: MINIMAX_API_KEY
-    base_url: https://api.minimaxi.com/v1
-    timeout_seconds: 300
+
 targets:
-  annotation: deepseek_flash
-  qc: deepseek_flash
-  coordinator: deepseek_flash
+  annotation: local_claude
+  qc: local_claude
+  coordinator: local_claude
+
 limits:
   local_cli_global_concurrency: 4
 """,
@@ -940,9 +843,7 @@ def handle_import_jsonl_prelabeled(args: argparse.Namespace) -> int:
     )
     annotation_types = args.annotation_types or [
         "entity_span",
-        "classification",
         "json_structure",
-        "relation",
     ]
     imported = 0
     skipped = 0
@@ -1384,9 +1285,7 @@ def handle_provider_targets(args: argparse.Namespace) -> int:
         profile = registry.resolve(target)
         payload[target] = {
             "profile": profile.name,
-            "provider": profile.provider,
-            "provider_flavor": profile.provider_flavor,
-            "cli_kind": profile.cli_kind,
+            "runtime": profile.runtime,
             "model": profile.model,
             "base_url": profile.base_url,
         }
@@ -1686,13 +1585,7 @@ def _build_runtime_scheduler(
 
 
 def _build_llm_client(profile):
-    if profile.provider == "openai_responses":
-        return OpenAIResponsesClient(profile)
-    if profile.provider == "openai_compatible":
-        return OpenAICompatibleClient(profile)
-    if profile.provider == "local_cli":
-        return LocalCLIClient(profile)
-    raise ProfileValidationError(f"unsupported provider: {profile.provider}")
+    return LocalCLIClient(profile)
 
 
 if __name__ == "__main__":
