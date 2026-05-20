@@ -32,9 +32,6 @@ PROFILE_FIELDS = (
     "disable_continuity",
 )
 
-_PRESERVE_API_KEY_FIELDS: frozenset[str] = frozenset()
-
-
 def build_provider_config_snapshot(
     config_root: Path,
     *,
