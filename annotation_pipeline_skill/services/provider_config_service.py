@@ -18,10 +18,7 @@ from annotation_pipeline_skill.llm.profiles import (
 
 
 PROFILE_FIELDS = (
-    "provider",
-    "provider_flavor",
-    "cli_kind",
-    "cli_binary",
+    "runtime",
     "model",
     "api_key_env",
     "api_key",
@@ -32,7 +29,10 @@ PROFILE_FIELDS = (
     "max_retries",
     "concurrency_limit",
     "no_progress_timeout_seconds",
+    "disable_continuity",
 )
+
+_PRESERVE_API_KEY_FIELDS: frozenset[str] = frozenset()
 
 
 def build_provider_config_snapshot(
@@ -162,70 +162,56 @@ def _payload_to_yaml_data(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _profile_to_dict(profile: LLMProfile) -> dict[str, Any]:
-    # api_key_set is a read-only echo for the UI; the raw key is NEVER
-    # included in API responses. Saves preserve the stored key when the
-    # incoming payload's api_key is empty or missing.
     return {
         "name": profile.name,
-        "provider": profile.provider,
-        "provider_flavor": profile.provider_flavor,
-        "cli_kind": profile.cli_kind,
-        "cli_binary": profile.cli_binary,
+        "runtime": profile.runtime,
         "model": profile.model,
+        "base_url": profile.base_url,
         "api_key_env": profile.api_key_env,
         "api_key_set": bool(profile.api_key),
-        "base_url": profile.base_url,
         "reasoning_effort": profile.reasoning_effort,
         "permission_mode": profile.permission_mode,
         "timeout_seconds": profile.timeout_seconds,
         "max_retries": profile.max_retries,
         "concurrency_limit": profile.concurrency_limit,
         "no_progress_timeout_seconds": profile.no_progress_timeout_seconds,
+        "disable_continuity": profile.disable_continuity,
     }
 
 
 def _profile_diagnostics(profile: LLMProfile, *, env: Mapping[str, str]) -> dict[str, Any]:
-    checks = []
-    if profile.provider == "local_cli":
-        found = _cli_binary_found(profile.cli_binary)
-        checks.append(
-            {
-                "id": "cli_binary_found",
-                "status": "ok" if found else "error",
-                "message": f"{profile.cli_binary} is available" if found else f"{profile.cli_binary} was not found on PATH",
-            }
-        )
-    else:
-        key_present = bool(profile.api_key) or bool(profile.api_key_env and profile.resolve_api_key(env))
-        env_label: str | None
-        if profile.api_key_env is None:
-            env_label = None
-        elif isinstance(profile.api_key_env, str):
-            env_label = profile.api_key_env
-        else:
-            env_label = ", ".join(profile.api_key_env)
-        checks.append(
-            {
-                "id": "api_key_env_present",
-                "status": "ok" if key_present else "error",
-                "message": (
-                    f"{env_label} is available"
-                    if key_present and env_label
-                    else "inline api_key configured"
-                    if key_present
-                    else f"{env_label} is missing"
-                ),
-            }
-        )
-        checks.append(
-            {
-                "id": "api_base_url_configured",
-                "status": "ok",
-                "message": f"{profile.base_url} configured",
-            }
-        )
-
-    status = "ok" if all(check["status"] == "ok" for check in checks) else "error"
+    binary = "claude" if profile.runtime == "claude_cli" else "codex"
+    found = _cli_binary_found(binary)
+    checks = [
+        {
+            "id": "cli_binary_found",
+            "status": "ok" if found else "error",
+            "message": f"{binary} is available" if found else f"{binary} was not found on PATH",
+        },
+        {
+            "id": "base_url_configured",
+            "status": "ok",
+            "message": f"{profile.base_url} configured",
+        },
+    ]
+    key_present = bool(profile.api_key) or bool(profile.resolve_api_key(env))
+    env_label = (
+        profile.api_key_env
+        if isinstance(profile.api_key_env, str)
+        else ", ".join(profile.api_key_env)
+    )
+    checks.append(
+        {
+            "id": "api_key_env_present",
+            "status": "ok" if key_present else "error",
+            "message": (
+                f"{env_label} is set"
+                if key_present
+                else f"{env_label} is not set"
+            ),
+        }
+    )
+    status = "ok" if all(c["status"] == "ok" for c in checks) else "error"
     return {"status": status, "checks": checks}
 
 
