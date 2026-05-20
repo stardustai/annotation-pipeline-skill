@@ -1,0 +1,67 @@
+profiles:
+  deepseek_flash:
+    runtime: claude_cli
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 120
+  minimax_default:
+    runtime: claude_cli
+    model: MiniMax-M2.7
+    base_url: https://api.minimaxi.com/anthropic
+    api_key_env: MINIMAX_API_KEY
+    timeout_seconds: 300
+  glm_46:
+    runtime: claude_cli
+    model: glm-4.6
+    base_url: https://open.bigmodel.cn/api/anthropic
+    api_key_env:
+    - GLM_CODING_API_KEY
+    - BIGMODEL_MCP_API_KEY
+    timeout_seconds: 300
+  deepseek_codex:
+    runtime: codex_cli
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 120
+  minimax_codex:
+    runtime: codex_cli
+    model: MiniMax-M2.7
+    base_url: https://api.minimaxi.com/v1
+    api_key_env: MINIMAX_API_KEY
+    timeout_seconds: 300
+  glm_codex:
+    runtime: codex_cli
+    model: glm-4.6
+    base_url: https://open.bigmodel.cn/api/coding/paas/v4
+    api_key_env:
+    - GLM_CODING_API_KEY
+    - BIGMODEL_MCP_API_KEY
+    timeout_seconds: 300
+  deepseek_claude:
+    runtime: claude_cli
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 120
+  minimax_claude:
+    runtime: claude_cli
+    model: MiniMax-M2.7
+    base_url: https://api.minimaxi.com/anthropic
+    api_key_env: MINIMAX_API_KEY
+    timeout_seconds: 300
+  glm_claude:
+    runtime: claude_cli
+    model: glm-5
+    base_url: https://open.bigmodel.cn/api/anthropic
+    api_key_env:
+    - GLM_API_KEY
+    - BIGMODEL_MCP_API_KEY
+    timeout_seconds: 300
+targets:
+  annotation: minimax_claude
+  qc: deepseek_claude
+  coordinator: glm_claude
+limits:
+  local_cli_global_concurrency: 8
