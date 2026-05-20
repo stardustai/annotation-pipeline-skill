@@ -191,9 +191,18 @@ class RowDedupService:
         mask_svc = RowMaskService(self._store)
         masked_by_task = mask_svc.masked_indices_by_task(task_ids)
 
-        # Collect (task_id, row_index, row_text) triplets
+        # Collect (task_id, row_index, row_text) triplets — INCLUDING
+        # masked rows. They still participate in clustering so the
+        # operator can see them in their original cluster (marked with
+        # ``masked: true``), but they are barred from being the rep via
+        # ``rep_exclude`` and are tagged in the output so the UI can
+        # render them with a "masked" badge instead of a checkbox.
         triplets: list[tuple[str, int, str]] = []  # (task_id, row_index, row_text)
         contributing_task_ids: set[str] = set()
+        # Set of "task_id:row_index" keys (matching the MinHashLSHFinder
+        # key format) for masked rows — passed as ``rep_exclude`` so a
+        # masked row never gets chosen as the cluster representative.
+        masked_member_keys: set[str] = set()
 
         for task in all_tasks:
             rows = (
@@ -211,13 +220,13 @@ class RowDedupService:
                 row_index = row.get("row_index")
                 if not isinstance(row_index, int):
                     continue
-                if row_index in masked:
-                    continue
                 input_val = row.get("input")
                 if not isinstance(input_val, str):
                     continue
                 triplets.append((task.task_id, row_index, input_val))
                 contributing_task_ids.add(task.task_id)
+                if row_index in masked:
+                    masked_member_keys.add(f"{task.task_id}:{row_index}")
 
         # Compute content hashes for each row
         content_hashes = [
@@ -291,28 +300,62 @@ class RowDedupService:
                 for tid, idx, text in triplets:
                     finder.add(f"{tid}:{idx}", text)
 
-                raw_clusters = finder.clusters(include_singletons=False)
+                # Pass masked_member_keys as rep_exclude so the finder
+                # picks an UN-masked row as each cluster's representative
+                # AND uses that rep for the step-2 verification. Masked
+                # rows still survive verification (J(masked, rep) ≥ t)
+                # and remain as cluster members — they're just tagged
+                # ``masked: true`` below so the UI renders a badge.
+                raw_clusters = finder.clusters(
+                    include_singletons=False,
+                    rep_exclude=masked_member_keys,
+                )
+
+                # Build text preview and word count lookups once
+                preview_by_key: dict[str, str] = {}
+                word_count_by_key: dict[str, int] = {}
+                for t2, i2, txt2 in triplets:
+                    preview_by_key[f"{t2}:{i2}"] = truncate_to_words(txt2, 100)
+                    word_count_by_key[f"{t2}:{i2}"] = len(txt2.split())
 
                 for ci, cluster in enumerate(sorted(raw_clusters, key=lambda c: len(c.task_ids), reverse=True)):
+                    # Re-derive the rep (lex-smallest UN-masked) so we can
+                    # compute per-member similarity-to-rep. This must match
+                    # the rep the finder used in step-2 verification: same
+                    # rule (lex-smallest, excluding masked) so members stay
+                    # consistent. We record ``sim_to_rep`` on every member
+                    # so the UI slider can filter members in real time
+                    # without re-scanning — drag the slider up, members
+                    # with sim_to_rep < new_threshold disappear.
+                    keys_sorted = sorted(cluster.task_ids)
+                    eligible = [k for k in keys_sorted if k not in masked_member_keys]
+                    rep_key = eligible[0] if eligible else keys_sorted[0]
+                    rep_mh = finder._minhashes.get(rep_key)
+
                     members = []
                     for member_key in cluster.task_ids:
-                        # Parse back "task_id:row_index"
-                        # task_id may contain colons, so split from the right
                         last_colon = member_key.rfind(":")
                         if last_colon < 0:
                             continue
                         m_tid = member_key[:last_colon]
                         m_idx = int(member_key[last_colon + 1:])
-                        # Find text preview
-                        preview = ""
-                        for t2, i2, txt2 in triplets:
-                            if t2 == m_tid and i2 == m_idx:
-                                preview = truncate_to_words(txt2, 100)
-                                break
+                        # Member's direct MinHash-estimated Jaccard with
+                        # the rep. Rep itself gets 1.0. Used for real-time
+                        # slider filtering on the frontend.
+                        if member_key == rep_key:
+                            sim_to_rep = 1.0
+                        elif rep_mh is None:
+                            sim_to_rep = 0.0
+                        else:
+                            mh = finder._minhashes.get(member_key)
+                            sim_to_rep = float(mh.jaccard(rep_mh)) if mh is not None else 0.0
                         members.append({
                             "task_id": m_tid,
                             "row_index": m_idx,
-                            "text_preview": preview,
+                            "text_preview": preview_by_key.get(member_key, ""),
+                            "masked": member_key in masked_member_keys,
+                            "sim_to_rep": sim_to_rep,
+                            "word_count": word_count_by_key.get(member_key, 0),
                         })
                     clusters_out.append({
                         "cluster_id": f"row-{ci}",
@@ -344,17 +387,59 @@ class RowDedupService:
 
                     raw_components = _brute_force_neighbors(all_vecs, jaccard_threshold)
 
+                    def _is_masked_pos(pos: int) -> bool:
+                        tid, idx, _ = triplets[pos]
+                        return f"{tid}:{idx}" in masked_member_keys
+
                     for ci, component in enumerate(
                         sorted(raw_components, key=len, reverse=True)
                     ):
+                        # Step 2: rep-anchored verification. The rep is
+                        # the lex-smallest UN-masked member (so masked
+                        # rows can stay in the cluster as members but
+                        # never serve as rep). Members are kept iff
+                        # their direct cosine with the rep ≥ threshold.
+                        rep_pos: int | None = None
+                        if len(component) >= 2:
+                            sorted_by_key = sorted(
+                                component,
+                                key=lambda p: (str(triplets[p][0]), int(triplets[p][1])),
+                            )
+                            eligible_reps = [p for p in sorted_by_key if not _is_masked_pos(p)]
+                            rep_pos = eligible_reps[0] if eligible_reps else sorted_by_key[0]
+                            rep_vec = all_vecs[rep_pos]
+                            kept = [rep_pos]
+                            for pos in sorted_by_key:
+                                if pos == rep_pos:
+                                    continue
+                                if _compute_cosine_similarity(all_vecs[pos], rep_vec) >= jaccard_threshold:
+                                    kept.append(pos)
+                            component = kept
+
+                        if len(component) < 2:
+                            continue
+
+                        # Per-member similarity to rep (= cosine in this
+                        # path) so the UI slider can filter members in
+                        # real-time without re-scanning.
+                        rep_vec = all_vecs[rep_pos] if rep_pos is not None else None
                         members = []
                         component_vecs = []
                         for pos in component:
                             tid, idx, text = triplets[pos]
+                            if pos == rep_pos:
+                                sim_to_rep = 1.0
+                            elif rep_vec is None:
+                                sim_to_rep = 0.0
+                            else:
+                                sim_to_rep = _compute_cosine_similarity(all_vecs[pos], rep_vec)
                             members.append({
                                 "task_id": tid,
                                 "row_index": idx,
                                 "text_preview": truncate_to_words(text, 100),
+                                "masked": _is_masked_pos(pos),
+                                "sim_to_rep": float(sim_to_rep),
+                                "word_count": len(text.split()),
                             })
                             component_vecs.append(all_vecs[pos])
 
@@ -437,6 +522,33 @@ class RowDedupService:
             statuses=cached_statuses,
         )
         cached_hash = row["content_hash"]
+
+        # Overlay the current row_masks state on the cached cluster
+        # members. The scan that produced this cache filtered out
+        # already-masked rows, but masks applied AFTER the scan
+        # (typical workflow: scan once, then apply masks) won't show
+        # up in the cached payload. We surface them here so the UI
+        # can visibly tag those members without paying for a re-scan.
+        cached_keys: set[tuple[str, int]] = set()
+        for cluster in cached_payload.get("clusters", []) or []:
+            for m in cluster.get("members", []) or []:
+                if not isinstance(m, dict):
+                    continue
+                tid = m.get("task_id")
+                ridx = m.get("row_index")
+                if isinstance(tid, str) and isinstance(ridx, int):
+                    cached_keys.add((tid, ridx))
+
+        currently_masked: list[list] = []
+        if cached_keys:
+            mask_rows = self._store._conn.execute(
+                "SELECT task_id, row_index FROM row_masks"
+            ).fetchall()
+            for mr in mask_rows:
+                key = (mr["task_id"], int(mr["row_index"]))
+                if key in cached_keys:
+                    currently_masked.append([mr["task_id"], int(mr["row_index"])])
+
         return {
             "cached": True,
             "payload": cached_payload,
@@ -444,6 +556,7 @@ class RowDedupService:
             "cached_content_hash": cached_hash,
             "current_content_hash": current_hash,
             "stale": current_hash != cached_hash,
+            "currently_masked": currently_masked,
         }
 
     def mask_duplicates(

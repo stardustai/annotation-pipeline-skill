@@ -259,3 +259,63 @@ def test_row_dedup_delete_unknown_route_returns_404(tmp_path):
         "/api/nonexistent", b"{}",
     )
     assert status == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /api/tasks/<id> — masked rows must be invisible at the read boundary
+# ---------------------------------------------------------------------------
+
+def test_task_detail_filters_masked_rows(tmp_path):
+    """The annotator-facing task-detail response must not expose any row
+    whose row_index is in row_masks. The mask state is the single source
+    of truth for "this row no longer exists" at every read boundary.
+    """
+    from annotation_pipeline_skill.services.row_mask_service import RowMaskService
+
+    store, workspace = _seed_workspace(tmp_path)
+    # Build a task with 4 rows
+    task = Task.new(
+        task_id="t-multi",
+        pipeline_id="proj",
+        source_ref={
+            "kind": "jsonl",
+            "payload": {
+                "rows": [
+                    {"row_index": 0, "input": "row zero text"},
+                    {"row_index": 1, "input": "row one text"},
+                    {"row_index": 2, "input": "row two text"},
+                    {"row_index": 3, "input": "row three text"},
+                ],
+            },
+        },
+    )
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+
+    # Mask rows 1 and 3
+    mask_svc = RowMaskService(store)
+    mask_svc.apply(task_id="t-multi", row_index=1, reason="dup", masked_by="test")
+    mask_svc.apply(task_id="t-multi", row_index=3, reason="dup", masked_by="test")
+
+    api = DashboardApi(store, workspace_root=workspace)
+    status, _headers, body = api.handle_get("/api/tasks/t-multi")
+    assert status == 200
+    payload = json.loads(body.decode("utf-8"))
+
+    # The visible rows must be rows 0 and 2 ONLY — masked rows are gone
+    visible_rows = payload["task"]["source_ref"]["payload"]["rows"]
+    visible_indices = sorted(r["row_index"] for r in visible_rows)
+    assert visible_indices == [0, 2], (
+        f"masked rows leaked through task-detail API: got indices {visible_indices}"
+    )
+
+    # The response surfaces which indices were filtered (UI hint)
+    assert payload["masked_row_indices"] == [1, 3]
+
+    # And the masked rows' text is nowhere in the response body
+    raw = body.decode("utf-8")
+    assert "row one text" not in raw, "masked row 1 text leaked"
+    assert "row three text" not in raw, "masked row 3 text leaked"
+    # Sanity: unmasked rows ARE present
+    assert "row zero text" in raw
+    assert "row two text" in raw

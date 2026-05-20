@@ -8,6 +8,7 @@ from annotation_pipeline_skill.core.states import TaskStatus
 from annotation_pipeline_skill.services.row_mask_service import (
     RowMask,
     RowMaskService,
+    apply_masks_to_task,
     filter_masked_rows,
 )
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
@@ -193,3 +194,51 @@ def test_filter_masked_rows_works_on_annotation_output_shape():
     result = filter_masked_rows(payload, {0})
     assert len(result["rows"]) == 1
     assert result["rows"][0]["row_index"] == 1
+
+
+def test_apply_masks_to_task_filters_source_ref_rows(tmp_path):
+    """apply_masks_to_task returns a Task whose source_ref.payload.rows
+    omits rows present in row_masks. The original task object is left
+    untouched (shallow copy semantics) so other readers that want the
+    full payload are unaffected.
+    """
+    store = SqliteStore.open(tmp_path)
+    task = Task.new(
+        task_id="t-1",
+        pipeline_id="proj",
+        source_ref={
+            "kind": "jsonl",
+            "payload": {
+                "rows": [
+                    {"row_index": 0, "input": "alpha"},
+                    {"row_index": 1, "input": "bravo"},
+                    {"row_index": 2, "input": "charlie"},
+                ],
+            },
+        },
+    )
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+
+    svc = RowMaskService(store)
+    svc.apply(task_id="t-1", row_index=1, reason="dup", masked_by="test")
+
+    masked_task = apply_masks_to_task(store, task)
+    indices = [r["row_index"] for r in masked_task.source_ref["payload"]["rows"]]
+    assert indices == [0, 2]
+    # Original task unchanged
+    assert [r["row_index"] for r in task.source_ref["payload"]["rows"]] == [0, 1, 2]
+
+
+def test_apply_masks_to_task_noop_when_no_masks(tmp_path):
+    store = SqliteStore.open(tmp_path)
+    task = Task.new(
+        task_id="t-2",
+        pipeline_id="proj",
+        source_ref={"kind": "jsonl", "payload": {"rows": [{"row_index": 0, "input": "x"}]}},
+    )
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    # No masks applied; helper returns the input task unchanged
+    result = apply_masks_to_task(store, task)
+    assert result is task

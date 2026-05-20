@@ -68,7 +68,34 @@ class MinHashLSHFinder:
             pass
         self._lsh.insert(task_id, m)
 
-    def clusters(self, *, include_singletons: bool = False) -> list[Cluster]:
+    def clusters(
+        self,
+        *,
+        include_singletons: bool = False,
+        verify_against_rep: bool = True,
+        rep_exclude: set[str] | None = None,
+    ) -> list[Cluster]:
+        """Return clusters from the accumulated MinHash index.
+
+        With ``verify_against_rep=True`` (default), each connected
+        component is *trimmed* so that every non-rep member has a
+        direct MinHash Jaccard ≥ ``jaccard_threshold`` against the
+        cluster's representative (lex-smallest key). This eliminates
+        chain-linking false positives — pairs that landed in the same
+        component only because they share a common intermediate node,
+        not because they are directly similar.
+
+        Why this matters: on short texts (1-bigram, 2-trigram rows),
+        LSH can transit through "lucky" hash collisions and connect
+        rows whose pairwise Jaccard is 0. Rep-anchored verification
+        keeps the cluster "centered" on its rep with a guarantee
+        ``J(member, rep) ≥ threshold`` for every kept member.
+
+        Trade-off: J(a, b) for two non-rep members can still be below
+        threshold (mathematically ≥ 2t − 1 for t = threshold). For
+        most practical t (0.3–0.7) this is acceptable. All-pairs
+        verification would be N² and prohibitive on large clusters.
+        """
         # Build an undirected graph: edge between task A and task B if
         # they collide in LSH (likely Jaccard >= threshold).
         edges: dict[str, set[str]] = {tid: set() for tid in self._minhashes}
@@ -103,6 +130,36 @@ class MinHashLSHFinder:
             components.append(comp)
         out: list[Cluster] = []
         for i, comp in enumerate(sorted(components, key=len, reverse=True)):
+            # Step 2: rep-anchored verification. Drop members whose
+            # direct MinHash Jaccard with the rep is below threshold —
+            # they got swept in via chain-linking through intermediate
+            # nodes, not because they actually resemble the rep.
+            #
+            # ``rep_exclude`` lets the caller mark certain keys as
+            # ineligible to be the rep (e.g. already-masked rows that
+            # still belong in the cluster for display but shouldn't
+            # anchor verification). We pick the lex-smallest key NOT in
+            # ``rep_exclude``; if every member is excluded, fall back
+            # to the lex-smallest of the whole component (so the
+            # cluster doesn't disappear silently).
+            if verify_against_rep and len(comp) >= 2:
+                comp_sorted = sorted(comp)
+                rep_key: str
+                if rep_exclude:
+                    eligible = [k for k in comp_sorted if k not in rep_exclude]
+                    rep_key = eligible[0] if eligible else comp_sorted[0]
+                else:
+                    rep_key = comp_sorted[0]
+                rep_mh = self._minhashes[rep_key]
+                verified = [rep_key]
+                for member in comp_sorted:
+                    if member == rep_key:
+                        continue
+                    mh = self._minhashes[member]
+                    if mh.jaccard(rep_mh) >= self.jaccard_threshold:
+                        verified.append(member)
+                comp = verified
+
             if len(comp) < 2 and not include_singletons:
                 continue
             out.append(

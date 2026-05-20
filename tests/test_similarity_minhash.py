@@ -50,6 +50,44 @@ def test_finder_emits_singletons_when_requested():
     assert any(c.task_ids == ["alone"] for c in clusters)
 
 
+def test_finder_rep_verification_drops_chain_linked_outliers():
+    """A chain A↔B↔C where A-C have ~0 direct Jaccard should not survive
+    rep-anchored verification: only B (and the rep A) remain in the cluster.
+
+    We craft three texts so that:
+      • J(A,B) >= 0.30 — share a middle block
+      • J(B,C) >= 0.30 — share a different middle block from B↔A
+      • J(A,C) ≈ 0     — endpoints don't share trigrams
+
+    Without verification, connected-components would put all three in one
+    cluster (LSH adds A-B and B-C edges). With verify_against_rep=True, the
+    rep (lex-smallest = "A") is the anchor; B passes (J(A,B)>=0.3), C fails
+    (J(A,C)≈0) and is dropped.
+    """
+    # 20-word rows. A's head and B's head overlap (10 shared words ⇒ strong rep
+    # Jaccard); B's tail and C's tail overlap (10 shared words ⇒ chain through B);
+    # A and C share NO trigrams (head vs tail of B). So with verification we
+    # expect only {A,B}; without, {A,B,C} via the chain.
+    A = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo1 lima1 mike1 nov1 osc1 pap1 que1 rom1 sie1 tan1"
+    B = "alpha bravo charlie delta echo foxtrot golf hotel india juliet uniform victor whiskey xray yankee zulu aaaa bbbb cccc dddd"
+    C = "fff1 ggg1 hhh1 iii1 jjj1 kkk1 lll1 mmm1 nnn1 ooo1 uniform victor whiskey xray yankee zulu aaaa bbbb cccc dddd"
+
+    finder = MinHashLSHFinder(shingle_size=3, num_perm=256, jaccard_threshold=0.20)
+    finder.add("A", A); finder.add("B", B); finder.add("C", C)
+
+    # With verification (default): the chain-linked C drops out of the cluster.
+    verified = finder.clusters()
+    assert len(verified) == 1
+    assert set(verified[0].task_ids) == {"A", "B"}, (
+        f"expected rep-anchored cluster to keep only A,B but got {verified[0].task_ids}"
+    )
+
+    # Without verification: legacy behavior keeps the full chain A,B,C.
+    legacy = finder.clusters(verify_against_rep=False)
+    assert len(legacy) == 1
+    assert set(legacy[0].task_ids) == {"A", "B", "C"}
+
+
 def test_finder_skips_empty_text():
     finder = MinHashLSHFinder(shingle_size=3, num_perm=128, jaccard_threshold=0.7)
     finder.add("empty", "")

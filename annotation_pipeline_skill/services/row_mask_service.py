@@ -160,6 +160,36 @@ class RowMaskService:
         )
 
 
+def apply_masks_to_task(store, task) -> "object":
+    """Return a Task whose ``source_ref.payload.rows`` has masked entries
+    removed. Convenience wrapper around ``filter_masked_rows`` that hides
+    the mask-lookup + dict-copy plumbing from every read-boundary site
+    (task-detail API, subagent prompt builders, etc.).
+
+    Returns the input task unchanged when there are no active masks or
+    the source_ref shape doesn't carry a row list — never raises.
+    """
+    from dataclasses import replace as _dc_replace
+
+    try:
+        svc = RowMaskService(store)
+        masked = svc.masked_indices_for_task(task.task_id)
+    except Exception:  # noqa: BLE001 — never let mask lookup break a read
+        return task
+    if not masked or not isinstance(task.source_ref, dict):
+        return task
+    payload = task.source_ref.get("payload")
+    if not isinstance(payload, dict):
+        return task
+    filtered = filter_masked_rows(payload, masked)
+    if filtered is payload:  # no rows actually dropped
+        return task
+    return _dc_replace(
+        task,
+        source_ref={**task.source_ref, "payload": filtered},
+    )
+
+
 def filter_masked_rows(payload: dict | None, masked_indices: set[int]) -> dict | None:
     """Return a SHALLOW copy of ``payload`` with rows whose ``row_index``
     is in ``masked_indices`` removed.

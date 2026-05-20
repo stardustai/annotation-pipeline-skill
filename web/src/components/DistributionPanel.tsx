@@ -1,4 +1,4 @@
-import React, { lazy, Suspense, useEffect, useState } from "react";
+import React, { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
 // Lazy-loaded: ScatterSubTab brings in plotly.js-dist-min (~3 MB / 1.47 MB
 // gzip). Off the critical path of the Distribution tab so opening the
@@ -47,6 +47,21 @@ export type RowMember = {
   task_id: string;
   row_index: number;
   text_preview: string;
+  // New: rows that are already masked in row_masks are kept in the
+  // cluster output (so the operator sees what they've already
+  // handled) but tagged with masked=true so the UI can render a
+  // "masked" badge and disable per-row actions.
+  // Optional for backward-compat with older cached payloads — those
+  // had no masked field and use the `currently_masked` overlay below.
+  masked?: boolean;
+  // Per-member direct similarity (Jaccard for MinHash, cosine for
+  // embedding) to the cluster's rep. The frontend slider filters
+  // members in real time on this field: drag up to hide loosely-
+  // related members; drag down (within scan-time threshold) to
+  // reveal them again. Backward-compat: missing field is treated
+  // as 1.0 so old caches render every member.
+  sim_to_rep?: number;
+  word_count?: number;
 };
 
 export type RowCluster = {
@@ -80,6 +95,12 @@ export type RowDedupCacheResponse = {
   current_content_hash: string;
   stale: boolean;
   available_profiles: string[];
+  // Tuples of [task_id, row_index] for rows that currently have an active
+  // mask AND appear in the cached cluster payload. The scan filters out
+  // pre-masked rows, but masks applied *after* the scan still show up in
+  // the cached clusters as un-masked — we use this overlay to tag them
+  // visually without forcing an expensive re-scan.
+  currently_masked?: [string, number][];
 };
 
 // "duplicates" used to mean task-level (concat all rows, embed once, cluster
@@ -134,15 +155,21 @@ function fmtTime(iso: string | null): string {
 
 /**
  * Pick the representative row member for a row-dedup cluster.
- * Mirrors backend RowDedupService.mask_duplicates sort key:
- * (str(task_id), int(row_index)) — string compare on task_id, then numeric on row_index.
+ *
+ * Sort key matches the backend: (str(task_id), int(row_index)).
+ * We prefer the lex-smallest UN-MASKED member as the rep so a
+ * masked row doesn't end up with the "rep" badge. If every member
+ * is masked (rare — a fully-already-handled cluster), fall back to
+ * the absolute lex-smallest.
  */
 function pickRowRep(members: RowMember[]): RowMember {
-  return [...members].sort((a, b) => {
+  const sorted = [...members].sort((a, b) => {
     if (a.task_id < b.task_id) return -1;
     if (a.task_id > b.task_id) return 1;
     return a.row_index - b.row_index;
-  })[0] ?? members[0];
+  });
+  const firstUnmasked = sorted.find((m) => !m.masked);
+  return firstUnmasked ?? sorted[0] ?? members[0];
 }
 
 // Word-aware truncation matching backend util.text.truncate_to_words.
@@ -347,18 +374,30 @@ export function DistributionPanel({
                 disabled={loading}
               />
             </label>
+            {/* Re-Scan is disabled when a fresh cache exists (cache hash
+                matches current dataset hash). UMAP+HDBSCAN is deterministic
+                given the same inputs, so re-running with unchanged data just
+                burns minutes. Stale → button re-enables with a warning color.
+                Mouse-over the disabled button explains why. */}
             <button
               className="primary-button"
               type="button"
               onClick={handleScan}
-              disabled={loading || !projectId}
+              disabled={loading || !projectId || (cachedExists && !stale)}
+              title={
+                cachedExists && !stale
+                  ? "Dataset hash unchanged since last scan — result would be identical. Disabled."
+                  : stale
+                    ? "Dataset changed since last scan; click to recompute"
+                    : "Compute distribution"
+              }
               style={
                 stale
                   ? { background: "var(--warning, #d97706)", borderColor: "var(--warning, #d97706)" }
                   : undefined
               }
             >
-              {loading ? "Scanning…" : stale ? "Re-Scan (stale)" : cachedExists ? "Re-Scan" : "Scan"}
+              {loading ? "Scanning…" : stale ? "Re-Scan (stale)" : cachedExists ? "Up to date" : "Scan"}
             </button>
             {cachedExists ? (
               <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
@@ -426,12 +465,24 @@ function RowDuplicatesSubTab({
 }: RowDuplicatesSubTabProps): React.ReactElement {
   const [rowCache, setRowCache] = useState<RowDedupCacheResponse | null>(null);
   const [rowProfile, setRowProfile] = useState<string>("MinHash");
-  const [jaccardThreshold, setJaccardThreshold] = useState<number>(0.5);
+  // Default to a low scan threshold so "scan once, drag freely" works:
+  // the LSH/cluster step captures everything down to 0.10 Jaccard, and
+  // the slider is a real-time member-level filter from there upward.
+  // Operators who want a tighter scan can lower the slider before
+  // clicking Scan; LSH at lower thresholds is slower but step-2
+  // rep-anchored verification keeps the cluster shapes clean.
+  const [jaccardThreshold, setJaccardThreshold] = useState<number>(0.4);
   const [selectedRows, setSelectedRows] = useState<Record<string, true>>({});
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Controls visibility of the metric-explainer popover next to the ?
+  // icon. We use React state instead of native `title` (which has a
+  // ~700ms delay and renders as plain browser chrome) so the bubble
+  // appears instantly on hover or focus.
+  const [metricHelpOpen, setMetricHelpOpen] = useState(false);
+  const [showMasked, setShowMasked] = useState<boolean>(true);
 
   // ── URL helpers ────────────────────────────────────────────────────────────
   function buildRowDedupGetUrl(pid: string, profile: string): string {
@@ -440,29 +491,61 @@ function RowDuplicatesSubTab({
   }
 
   // ── Auto-load on mount and when profile changes ────────────────────────────
+  // We use an AbortController + ignore flag to cancel stale fetches when
+  // (projectId, storeKey, rowProfile) flip rapidly during initial mount —
+  // e.g. URL state resolves the store key on the second render. Also
+  // retries once on transient network failure, which can happen when the
+  // dev server's --reload watcher restarts mid-request.
   useEffect(() => {
     if (!projectId) {
       setRowCache(null);
       onClusterCountChange(0);
       return;
     }
+    let cancelled = false;
+    const ctrl = new AbortController();
     setLoading(true);
     setError(null);
-    fetch(buildRowDedupGetUrl(projectId, rowProfile))
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json() as Promise<RowDedupCacheResponse>;
-      })
-      .then((d) => {
-        setRowCache(d);
-        // Sync profile to first available if current isn't offered.
-        if (d.available_profiles.length > 0 && !d.available_profiles.includes(rowProfile)) {
-          setRowProfile(d.available_profiles[0]);
+    const url = buildRowDedupGetUrl(projectId, rowProfile);
+
+    async function fetchOnce(): Promise<RowDedupCacheResponse> {
+      const r = await fetch(url, { signal: ctrl.signal });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return (await r.json()) as RowDedupCacheResponse;
+    }
+
+    (async () => {
+      let d: RowDedupCacheResponse;
+      try {
+        d = await fetchOnce();
+      } catch (e: unknown) {
+        if (cancelled || ctrl.signal.aborted) return;
+        // One retry after 500ms for transient failures (e.g. server reload).
+        try {
+          await new Promise((res) => setTimeout(res, 500));
+          if (cancelled || ctrl.signal.aborted) return;
+          d = await fetchOnce();
+        } catch (e2: unknown) {
+          if (cancelled || ctrl.signal.aborted) return;
+          setError(e2 instanceof Error ? e2.message : String(e2));
+          setLoading(false);
+          return;
         }
-        onClusterCountChange(d.payload?.clusters?.length ?? 0);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
+      }
+      if (cancelled || ctrl.signal.aborted) return;
+      setRowCache(d);
+      setError(null);
+      if (d.available_profiles.length > 0 && !d.available_profiles.includes(rowProfile)) {
+        setRowProfile(d.available_profiles[0]);
+      }
+      onClusterCountChange(d.payload?.clusters?.length ?? 0);
+      setLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, storeKey, rowProfile]);
 
@@ -501,7 +584,16 @@ function RowDuplicatesSubTab({
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
       const result = await r.json() as RowDedupCacheResponse;
       setRowCache(result);
-      setSelectedRows({});
+      // DO NOT clear `selectedRows` here. Keep selections are keyed by
+      // (task_id, row_index) — those identities are stable across scans
+      // at any threshold. Wiping them on re-scan silently discarded the
+      // operator's intent and caused "all rows masked" after lowering
+      // the threshold. Now: keeps you set at threshold A survive a
+      // re-scan at threshold B. To clear them explicitly, use the
+      // "Clear" bulk-action button.
+      // Note: orphan keys (rows the new scan didn't put in any cluster)
+      // are harmless — handleMask only consults keys for the clusters
+      // it's currently iterating, so unused entries do nothing.
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -523,20 +615,34 @@ function RowDuplicatesSubTab({
     let clustersAffected = 0;
 
     try {
-      for (const cluster of rowCache.payload.clusters) {
+      // CRITICAL: iterate the slider-FILTERED `clusters` (with member-
+      // level sim_to_rep filtering applied), NOT the raw cache. The
+      // user's expectation is "Mask only what I see". Previously
+      // iterating ``rowCache.payload.clusters`` masked rows in
+      // clusters the slider had hidden — a footgun that produced
+      // unexpected mass-masks (e.g. slider at 0.7 showed 30 rows but
+      // Mask actually hit 1798 rows across clusters below 0.7).
+      for (const cluster of clusters) {
         const rep = pickRowRep(cluster.members);
         const repKey = `${rep.task_id}::${rep.row_index}`;
 
-        // Collect selected non-rep members.
-        const selectedNonReps = cluster.members.filter((m) => {
+        // Inverted semantics: checkbox = "Keep". Mask the UN-checked
+        // non-rep members (default action). Checked members are
+        // explicitly preserved alongside the rep. Skip rows already
+        // masked — re-sending them is wasted and would clutter logs.
+        const uncheckedNonReps = cluster.members.filter((m) => {
           const key = `${m.task_id}::${m.row_index}`;
-          return key !== repKey && selectedRows[key] === true;
+          return key !== repKey
+            && selectedRows[key] !== true
+            && !maskedKeySet.has(key);
         });
 
-        if (selectedNonReps.length === 0) continue;
+        if (uncheckedNonReps.length === 0) continue;
 
-        // Send rep + selected non-reps. Backend drops rep, masks the rest.
-        const membersToSend = [rep, ...selectedNonReps];
+        // Send rep + unchecked non-reps. Backend drops rep (smallest
+        // key), masks the rest of what we sent. Checked "keep" rows
+        // are simply omitted from the request → never masked.
+        const membersToSend = [rep, ...uncheckedNonReps];
 
         const r = await fetch(maskUrl, {
           method: "POST",
@@ -572,32 +678,135 @@ function RowDuplicatesSubTab({
   }
 
   // ── Derived state ──────────────────────────────────────────────────────────
-  const clusters = rowCache?.payload?.clusters ?? [];
+  // The slider is a real-time client-side filter over the cached scan
+  // result. Two-level filtering:
+  //   1) MEMBER level — drop any member whose ``sim_to_rep`` falls below
+  //      the current slider value. The rep itself stays (it has
+  //      sim_to_rep = 1.0). Older cached payloads with no ``sim_to_rep``
+  //      field treat every member as 1.0 so they still render.
+  //   2) CLUSTER level — after member filtering, drop the cluster if
+  //      fewer than 2 members survive (no longer a duplicate group).
+  // To see members or clusters below the scan-time threshold, re-scan
+  // at a looser threshold — the slider can't conjure new members below
+  // what the LSH bucketed at scan time.
+  const allClusters = rowCache?.payload?.clusters ?? [];
+  const scanThreshold = rowCache?.payload?.params?.jaccard_threshold ?? jaccardThreshold;
   const rowStale = rowCache?.stale ?? false;
   const rowGeneratedAt = rowCache?.generated_at ?? null;
   const rowCached = rowCache?.cached ?? false;
   const availableRowProfiles = rowCache?.available_profiles ?? ["MinHash"];
 
-  const selectedRowCount = Object.keys(selectedRows).length;
+  // Set of "task_id::row_index" keys for cluster members that are
+  // currently masked. Two sources are merged:
+  //
+  // 1. ``member.masked === true`` on members from the new scan
+  //    output (scan now includes masked rows tagged inline).
+  // 2. The legacy ``currently_masked`` overlay for caches built
+  //    before the scan change — those payloads have NO per-member
+  //    flag, so we still need the overlay as a fallback.
+  const maskedKeySet = useMemo(() => {
+    const s = new Set<string>();
+    for (const c of rowCache?.payload?.clusters ?? []) {
+      for (const m of c.members) {
+        if (m.masked) s.add(`${m.task_id}::${m.row_index}`);
+      }
+    }
+    for (const [tid, ridx] of rowCache?.currently_masked ?? []) {
+      s.add(`${tid}::${ridx}`);
+    }
+    return s;
+  }, [rowCache?.payload?.clusters, rowCache?.currently_masked]);
 
-  const selectedClusterCount = clusters.filter((cluster) => {
-    const rep = pickRowRep(cluster.members);
-    const repKey = `${rep.task_id}::${rep.row_index}`;
-    return cluster.members.some((m) => {
-      const key = `${m.task_id}::${m.row_index}`;
-      return key !== repKey && selectedRows[key] === true;
-    });
-  }).length;
+  // Two-pass filtering so the "−N hidden" UI can attribute hides to
+  // the right cause:
+  //   Pass 1 (adj-threshold): drop members whose length-adjusted
+  //     similarity to rep falls below the slider; rep always survives.
+  //   Pass 2 (show-masked): if the operator unchecked "Show masked",
+  //     drop members already in row_masks.
+  // After each pass we drop clusters that no longer have ≥2 members.
+  // ``hiddenByThreshold`` counts clusters lost to pass 1; ``hiddenByMaskHide``
+  // counts the ADDITIONAL clusters lost to pass 2, so the two never
+  // double-count.
+  const clustersAfterThreshold = allClusters
+    .map((c) => ({
+      ...c,
+      members: c.members.filter((m) => {
+        if ((m.sim_to_rep ?? 1) >= 1 - 1e-9) return true; // rep always survives
+        const wc = m.word_count ?? 10;
+        const score = (m.sim_to_rep ?? 1) / Math.log(wc / 10 + Math.E);
+        return score >= jaccardThreshold;
+      }),
+    }))
+    .filter((c) => c.members.length >= 2);
+  const clusters = showMasked
+    ? clustersAfterThreshold
+    : clustersAfterThreshold
+        .map((c) => ({
+          ...c,
+          members: c.members.filter(
+            (m) => !maskedKeySet.has(`${m.task_id}::${m.row_index}`),
+          ),
+        }))
+        .filter((c) => c.members.length >= 2);
+  const hiddenByThreshold = allClusters.length - clustersAfterThreshold.length;
+  const hiddenByMaskHide = clustersAfterThreshold.length - clusters.length;
+  const sliderBelowScan = jaccardThreshold < scanThreshold - 1e-9;
 
+  // Inverted semantics: checkbox = Keep. `selectedRows` is the set of
+  // explicitly-kept rows. Everything else (every non-rep without a check)
+  // is queued to be masked when the user clicks "Mask".
+  //
+  // `keepRowCount` reflects ONLY keeps that map to currently-displayed
+  // non-rep, non-masked rows. Orphan keeps (set at threshold A, but the
+  // row dropped out at threshold B, or was masked since) are excluded
+  // here so the "K kept" UI matches what's actually visible. The full
+  // `selectedRows` is still preserved across re-scans — orphans become
+  // effective again if the row reappears in a future cluster.
+  const totalSelectedRows = Object.keys(selectedRows).length;
+
+  // Total non-rep rows that AREN'T already masked across all clusters —
+  // these are the candidates for masking. The rep of each cluster is
+  // always kept implicitly. Already-masked rows are excluded so the
+  // counts and bulk actions don't double-charge them.
   const allSelectableRowKeys: string[] = [];
   for (const cluster of clusters) {
     const rep = pickRowRep(cluster.members);
     const repKey = `${rep.task_id}::${rep.row_index}`;
     for (const m of cluster.members) {
       const key = `${m.task_id}::${m.row_index}`;
-      if (key !== repKey) allSelectableRowKeys.push(key);
+      if (key !== repKey && !maskedKeySet.has(key)) {
+        allSelectableRowKeys.push(key);
+      }
     }
   }
+  const totalNonReps = allSelectableRowKeys.length;
+  // Count keeps that actually map to a currently-displayed non-rep, non-masked row.
+  const allSelectableRowKeySet = new Set(allSelectableRowKeys);
+  const keepRowCount = Object.keys(selectedRows).filter(
+    (k) => allSelectableRowKeySet.has(k),
+  ).length;
+  const orphanKeepCount = totalSelectedRows - keepRowCount;
+  const rowsToMask = Math.max(0, totalNonReps - keepRowCount);
+
+  // Count of clusters with at least one unchecked, not-yet-masked non-rep.
+  const clustersToMask = clusters.filter((cluster) => {
+    const rep = pickRowRep(cluster.members);
+    const repKey = `${rep.task_id}::${rep.row_index}`;
+    return cluster.members.some((m) => {
+      const key = `${m.task_id}::${m.row_index}`;
+      return key !== repKey && !maskedKeySet.has(key) && selectedRows[key] !== true;
+    });
+  }).length;
+
+  // Total already-masked rows visible across the displayed clusters — shown
+  // as a header summary so the operator sees the impact of past masks at a glance.
+  const alreadyMaskedInView = clusters.reduce((sum, c) => {
+    let n = 0;
+    for (const m of c.members) {
+      if (maskedKeySet.has(`${m.task_id}::${m.row_index}`)) n++;
+    }
+    return sum + n;
+  }, 0);
 
   function handleSelectAll() {
     const next: Record<string, true> = {};
@@ -645,7 +854,9 @@ function RowDuplicatesSubTab({
             value={rowProfile}
             onChange={(e) => {
               setRowProfile(e.target.value);
-              setSelectedRows({});
+              // Keep selections survive profile changes — the (task_id,
+              // row_index) keys still identify the same physical rows.
+              // Use the explicit "Clear" bulk-action button to reset.
             }}
             style={{ fontSize: "0.85rem" }}
             disabled={loading}
@@ -656,36 +867,155 @@ function RowDuplicatesSubTab({
           </select>
         </label>
 
-        <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.4rem" }}>
-          <span>Jaccard ≥</span>
-          <input
-            type="range"
-            min={0.01}
-            max={0.99}
-            step={0.01}
-            value={jaccardThreshold}
-            onChange={(e) => setJaccardThreshold(parseFloat(e.target.value))}
-            style={{ width: "120px" }}
-            disabled={loading}
-          />
-          <code style={{ fontFamily: "monospace", minWidth: "3rem" }}>
-            {jaccardThreshold.toFixed(2)}
-          </code>
-        </label>
+        {(() => {
+          // Threshold semantics depend on the active profile's metric:
+          //   - MinHash → Jaccard similarity of word shingles
+          //   - embedding provider (e.g. jina) → cosine similarity
+          // The slider label, the help tooltip, and the units in the
+          // value pill all switch to match. The single `jaccardThreshold`
+          // state variable holds the value regardless of metric.
+          const scanMetric = rowCache?.payload?.params?.metric;
+          const isJaccard = scanMetric ? scanMetric === "jaccard" : rowProfile === "MinHash";
+          const metricLabel = isJaccard ? "Adj Jaccard" : "Cosine";
+          const helpText = isJaccard
+            ? "Length-adjusted Jaccard = J / ln(words/10 + e). " +
+              "Raw Jaccard alone is biased toward long sentences: same proportional overlap, " +
+              "longer sentence → lower score (still has many unique words → keep). " +
+              "Short sentence → higher score (fewer unique words → mask sooner). " +
+              "The cluster representative always survives regardless of score. " +
+              "Typical threshold: 0.35–0.50."
+            : "Cosine similarity of the row's embedding vector, in [−1, 1]. Two rows with " +
+              "near-identical meaning sit at ~1.0; unrelated rows cluster around 0. " +
+              "Higher threshold = stricter semantic match. Typical sweet spot: 0.80–0.92.";
+          return (
+            <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.4rem" }}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}>
+                {metricLabel} ≥
+                <span
+                  style={{ position: "relative", display: "inline-flex" }}
+                  onMouseEnter={() => setMetricHelpOpen(true)}
+                  onMouseLeave={() => setMetricHelpOpen(false)}
+                  onFocus={() => setMetricHelpOpen(true)}
+                  onBlur={() => setMetricHelpOpen(false)}
+                >
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setMetricHelpOpen((v) => !v)}
+                    aria-label={`What is ${metricLabel} similarity?`}
+                    aria-expanded={metricHelpOpen}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "16px",
+                      height: "16px",
+                      borderRadius: "50%",
+                      background: metricHelpOpen
+                        ? "var(--accent, #3b82f6)"
+                        : "var(--surface3, #e5e7eb)",
+                      color: metricHelpOpen ? "#fff" : "var(--muted, #6b7280)",
+                      fontSize: "0.7rem",
+                      fontWeight: 700,
+                      cursor: "help",
+                      userSelect: "none",
+                      transition: "background 0.1s, color 0.1s",
+                    }}
+                  >
+                    ?
+                  </span>
+                  {metricHelpOpen ? (
+                    <div
+                      role="tooltip"
+                      style={{
+                        position: "absolute",
+                        top: "calc(100% + 6px)",
+                        left: "-8px",
+                        zIndex: 50,
+                        width: "360px",
+                        padding: "0.6rem 0.75rem",
+                        background: "var(--surface, #ffffff)",
+                        color: "var(--fg, #111827)",
+                        border: "1px solid var(--border, #d1d5db)",
+                        borderRadius: "6px",
+                        boxShadow: "0 6px 18px rgba(0,0,0,0.12)",
+                        fontSize: "0.78rem",
+                        lineHeight: 1.5,
+                        fontWeight: 400,
+                        whiteSpace: "normal",
+                      }}
+                    >
+                      <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
+                        {metricLabel} similarity
+                      </div>
+                      {helpText}
+                    </div>
+                  ) : null}
+                </span>
+              </span>
+              <input
+                type="range"
+                min={0.01}
+                max={0.99}
+                step={0.01}
+                value={jaccardThreshold}
+                onChange={(e) => setJaccardThreshold(parseFloat(e.target.value))}
+                style={{ width: "120px" }}
+                disabled={loading}
+                title={helpText}
+              />
+              <code style={{ fontFamily: "monospace", minWidth: "3rem" }}>
+                {jaccardThreshold.toFixed(2)}
+              </code>
+              {/* Hint: the slider is a client-side filter on cached cluster
+                  similarities. Raising it hides clusters; lowering it past the
+                  scan-time threshold cannot reveal new ones — re-scan for that. */}
+              {rowCached && hiddenByThreshold > 0 ? (
+                <span
+                  className="runtime-muted"
+                  style={{ fontSize: "0.75rem" }}
+                  title={`Hiding ${hiddenByThreshold} cluster(s) below the slider threshold. Scan threshold: ${scanThreshold.toFixed(2)}`}
+                >
+                  −{hiddenByThreshold} below threshold
+                </span>
+              ) : null}
+              {rowCached && hiddenByMaskHide > 0 ? (
+                <span
+                  className="runtime-muted"
+                  style={{ fontSize: "0.75rem" }}
+                  title={`Hiding ${hiddenByMaskHide} additional cluster(s) because "Show masked" is off — every remaining non-rep member in these clusters is already masked.`}
+                >
+                  −{hiddenByMaskHide} all masked
+                </span>
+              ) : null}
+              {rowCached && sliderBelowScan ? (
+                <span
+                  style={{
+                    fontSize: "0.72rem",
+                    background: "var(--warning, #d97706)",
+                    color: "#fff",
+                    borderRadius: "3px",
+                    padding: "1px 5px",
+                    fontWeight: 600,
+                  }}
+                  title={`Slider is below scan-time threshold (${scanThreshold.toFixed(2)}). Re-scan to recompute clusters at this threshold.`}
+                >
+                  re-scan to expand
+                </span>
+              ) : null}
+            </label>
+          );
+        })()}
 
-        <button
-          className="primary-button"
-          type="button"
-          onClick={handleScan}
-          disabled={loading || !projectId}
-          style={
-            rowStale
-              ? { background: "var(--warning, #d97706)", borderColor: "var(--warning, #d97706)" }
-              : undefined
-          }
-        >
-          {loading ? "Scanning…" : rowStale ? "Re-scan (stale)" : rowCached ? "Re-scan" : "Scan rows"}
-        </button>
+        <label style={{ fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "0.35rem", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={showMasked}
+            onChange={(e) => setShowMasked(e.target.checked)}
+            style={{ cursor: "pointer" }}
+          />
+          Show masked
+        </label>
 
         {/* ── Bulk actions: live next to Re-scan so the operator's scan +
             select + mask flow stays on one row. Buttons are inert (disabled
@@ -698,38 +1028,40 @@ function RowDuplicatesSubTab({
               onClick={handleSelectAll}
               disabled={allSelectableRowKeys.length === 0}
               style={{ fontSize: "0.8rem" }}
-              title="Select all non-representative rows in all clusters"
+              title="Mark every non-representative row as Keep — nothing will be masked"
             >
-              Select all ({allSelectableRowKeys.length})
+              Keep all ({allSelectableRowKeys.length})
             </button>
             <button
               type="button"
               onClick={handleClearAll}
-              disabled={selectedRowCount === 0}
+              disabled={totalSelectedRows === 0}
               style={{ fontSize: "0.8rem" }}
+              title="Unkeep all (including any keeps on rows no longer in any cluster)"
             >
-              Clear
+              Clear{orphanKeepCount > 0 ? ` (${keepRowCount}+${orphanKeepCount} orphan)` : ""}
             </button>
             <button
               type="button"
-              disabled={selectedRowCount === 0 || applying}
+              disabled={rowsToMask === 0 || applying}
               onClick={handleMask}
               style={{
                 fontSize: "0.85rem",
                 background:
-                  selectedRowCount > 0 && !applying
+                  rowsToMask > 0 && !applying
                     ? "var(--danger, #b91c1c)"
                     : undefined,
-                color: selectedRowCount > 0 && !applying ? "white" : undefined,
+                color: rowsToMask > 0 && !applying ? "white" : undefined,
                 borderColor:
-                  selectedRowCount > 0 && !applying ? "var(--danger, #b91c1c)" : undefined,
-                opacity: selectedRowCount === 0 || applying ? 0.6 : 1,
+                  rowsToMask > 0 && !applying ? "var(--danger, #b91c1c)" : undefined,
+                opacity: rowsToMask === 0 || applying ? 0.6 : 1,
               }}
+              title="Mask every non-representative row that is NOT checked as Keep"
             >
               {applying
                 ? "Masking…"
-                : selectedRowCount > 0
-                  ? `Mask ${selectedRowCount} row${selectedRowCount !== 1 ? "s" : ""}`
+                : rowsToMask > 0
+                  ? `Mask ${rowsToMask} row${rowsToMask !== 1 ? "s" : ""}`
                   : "Mask"}
             </button>
           </>
@@ -757,6 +1089,35 @@ function RowDuplicatesSubTab({
             ) : null}
           </span>
         ) : null}
+
+        {/* Re-scan lives on the far right of the controls row. Disabled when
+            a fresh cache exists (content-hash unchanged) — re-running on the
+            same dataset would just rebuild the same clusters. Stale → button
+            re-enables with a warning color so the operator knows to act. */}
+        <button
+          className="primary-button"
+          type="button"
+          onClick={handleScan}
+          disabled={loading || !projectId || (rowCached && !rowStale)}
+          title={
+            rowCached && !rowStale
+              ? "Dataset hash unchanged since last scan — would produce identical clusters. Disabled."
+              : rowStale
+                ? "Dataset (or masks) changed since last scan; click to recompute"
+                : "Scan rows for near-duplicates"
+          }
+          style={
+            rowStale
+              ? {
+                  background: "var(--warning, #d97706)",
+                  borderColor: "var(--warning, #d97706)",
+                  marginLeft: rowCached ? "0.5rem" : "auto",
+                }
+              : { marginLeft: rowCached ? "0.5rem" : "auto" }
+          }
+        >
+          {loading ? "Scanning…" : rowStale ? "Re-scan (stale)" : rowCached ? "Up to date" : "Scan rows"}
+        </button>
       </div>
 
       {error ? <div className="notice compact">{error}</div> : null}
@@ -781,13 +1142,25 @@ function RowDuplicatesSubTab({
 
       {clusters.length > 0 ? (
         <>
-          {/* Selection summary line (only shown when there's something selected;
-              empty state is silent now). Bulk action buttons live in the scan
-              bar above so the whole control row is on one line. */}
-          {selectedRowCount > 0 ? (
+          {/* Already-masked summary: shows past-mask impact so the operator
+              isn't confused why some rows are no longer actionable. */}
+          {alreadyMaskedInView > 0 ? (
+            <div style={{ fontSize: "0.8rem", marginBottom: "0.35rem", color: "var(--muted, #6b7280)" }}>
+              <strong>{alreadyMaskedInView}</strong> row{alreadyMaskedInView !== 1 ? "s" : ""} already masked in displayed clusters
+              {rowStale ? " · re-scan to recompute clusters without them" : ""}
+            </div>
+          ) : null}
+
+          {/* Pending-mask summary: shows how many rows in how many clusters
+              will be masked if the operator clicks "Mask". Inverted-keep
+              semantics: every non-rep without a check is queued for masking. */}
+          {rowsToMask > 0 ? (
             <div style={{ fontSize: "0.85rem", marginBottom: "0.5rem" }}>
-              <strong>{selectedRowCount}</strong> row{selectedRowCount !== 1 ? "s" : ""} across{" "}
-              <strong>{selectedClusterCount}</strong> cluster{selectedClusterCount !== 1 ? "s" : ""} selected
+              <strong>{rowsToMask}</strong> row{rowsToMask !== 1 ? "s" : ""} across{" "}
+              <strong>{clustersToMask}</strong> cluster{clustersToMask !== 1 ? "s" : ""} will be masked
+              {keepRowCount > 0 ? (
+                <> · <strong>{keepRowCount}</strong> kept</>
+              ) : null}
             </div>
           ) : null}
 
@@ -818,11 +1191,43 @@ function RowDuplicatesSubTab({
                     <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
                       size={cluster.members.length}
                     </span>
-                    <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
-                      {cluster.method === "minhash" ? "jaccard" : "cos"}={cluster.similarity.toFixed(3)}
+                    <span
+                      className="runtime-muted"
+                      style={{ fontSize: "0.8rem", cursor: "help" }}
+                      title={
+                        cluster.method === "minhash"
+                          ? "Average pairwise MinHash-estimated Jaccard across all member pairs (not the minimum). " +
+                            "Connected-components clustering means some chain-linked pairs may have actual Jaccard < this average."
+                          : "Average pairwise cosine similarity across all member pairs."
+                      }
+                    >
+                      avg {cluster.method === "minhash" ? "jaccard" : "cos"}={cluster.similarity.toFixed(3)}
                     </span>
                     <span className="runtime-muted" style={{ fontSize: "0.8rem" }}>
                       method={cluster.method}
+                    </span>
+                    {/* "Keep" column header — clarifies that the checkbox on each
+                        non-rep row marks it for keeping. Unchecked rows below
+                        carry a "masked" badge so the pending action is obvious. */}
+                    <span
+                      style={{
+                        marginLeft: "auto",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        padding: "0 6px",
+                        height: "18px",
+                        background: "var(--surface3, #e5e7eb)",
+                        borderRadius: "3px",
+                        fontSize: "0.72rem",
+                        fontWeight: 600,
+                        color: "var(--muted, #6b7280)",
+                        textTransform: "uppercase",
+                        letterSpacing: "0.04em",
+                        userSelect: "none",
+                      }}
+                      title="Check a row below to Keep it (exempt from masking). Unchecked non-rep rows show as 'masked' and will be masked when you click Mask."
+                    >
+                      Keep
                     </span>
                   </div>
 
@@ -832,6 +1237,7 @@ function RowDuplicatesSubTab({
                       const key = `${member.task_id}::${member.row_index}`;
                       const isRep = key === repKey;
                       const isChecked = selectedRows[key] === true;
+                      const isMasked = maskedKeySet.has(key);
                       return (
                         <div
                           key={key}
@@ -841,6 +1247,7 @@ function RowDuplicatesSubTab({
                             gap: "0.5rem",
                             fontSize: "0.82rem",
                             padding: "0.2rem 0",
+                            opacity: isMasked ? 0.55 : 1,
                           }}
                         >
                           {isRep ? (
@@ -863,12 +1270,32 @@ function RowDuplicatesSubTab({
                             >
                               rep
                             </span>
+                          ) : isMasked ? (
+                            <span
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                padding: "0 5px",
+                                height: "16px",
+                                background: "var(--danger, #b91c1c)",
+                                color: "#fff",
+                                borderRadius: "3px",
+                                fontSize: "0.7rem",
+                                fontWeight: 600,
+                                flexShrink: 0,
+                                marginTop: "2px",
+                                userSelect: "none",
+                              }}
+                              title="This row is currently masked in row_masks. Re-scan to drop it from the cluster."
+                            >
+                              masked
+                            </span>
                           ) : (
                             <input
                               type="checkbox"
                               checked={isChecked}
                               onChange={(e) => toggleRow(key, e.target.checked)}
-                              title="Include in batch mask"
+                              title="Check to Keep this row (exempt from masking)"
                               style={{ marginTop: "2px", flexShrink: 0, cursor: "pointer" }}
                             />
                           )}
@@ -879,8 +1306,9 @@ function RowDuplicatesSubTab({
                             style={{
                               flex: 1, textAlign: "left",
                               background: "transparent", border: "none", padding: 0,
-                              color: isRep ? "var(--muted, #6b7280)" : "inherit",
+                              color: isRep || isMasked ? "var(--muted, #6b7280)" : "inherit",
                               cursor: "pointer", font: "inherit",
+                              textDecoration: isMasked ? "line-through" : undefined,
                             }}
                           >
                             <code

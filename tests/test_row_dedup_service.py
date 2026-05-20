@@ -111,13 +111,22 @@ def test_scan_rows_with_minhash_finds_template_groups(tmp_path):
     assert 0.0 <= largest["similarity"] <= 1.0
 
 
-def test_scan_rows_skips_already_masked_rows(tmp_path):
-    """Rows that are already masked should not participate in dedup."""
+def test_scan_rows_includes_already_masked_rows_tagged(tmp_path):
+    """Masked rows MUST appear in the scan output, tagged ``masked: true``.
+
+    Why this matters: after an operator masks part of a cluster, the
+    next ``Re-scan`` should still show those rows so the operator
+    keeps context of "what I've already handled" — they just render
+    with a red ``masked`` badge instead of an active checkbox. The
+    only behavioural difference from an unmasked row is that masked
+    rows are barred from being the cluster representative
+    (``rep_exclude`` passed to MinHashLSHFinder).
+    """
     store = _open_store(tmp_path)
     tasks = _seed_tasks(store, "proj")
     svc = _make_service(store)
 
-    # Mask row 0 of all 6 tasks (the template rows)
+    # Mask row 0 of all 6 tasks (the template rows that will form the cluster)
     mask_svc = RowMaskService(store)
     for t in tasks:
         mask_svc.apply(
@@ -133,16 +142,36 @@ def test_scan_rows_skips_already_masked_rows(tmp_path):
         jaccard_threshold=0.3,
     )
 
-    # 18 total rows - 6 masked = 12 scanned
-    assert result["row_count"] == 12
+    # All 18 rows still scanned (6 tasks × 3 rows). Masked rows are
+    # NOT excluded — they participate in clustering with a tag.
+    assert result["row_count"] == 18
 
-    # The cluster of template rows should be absent now
-    cluster_row_indices = [
-        m["row_index"]
-        for c in result["clusters"]
+    # The template cluster still forms, and contains the 6 masked
+    # row-0 entries — all tagged masked=True.
+    masked_in_cluster = [
+        m for c in result["clusters"]
         for m in c["members"]
+        if m["row_index"] == 0
     ]
-    assert 0 not in cluster_row_indices
+    assert len(masked_in_cluster) >= 1, (
+        "template row-0 cluster should still appear in scan output"
+    )
+    # Every row-0 member that's there must be tagged masked=True
+    assert all(m["masked"] is True for m in masked_in_cluster), (
+        f"row-0 members not tagged masked: {masked_in_cluster}"
+    )
+
+    # And no masked row should be the rep (rep is conventionally the
+    # lex-smallest member; the finder excludes masked from rep choice).
+    for c in result["clusters"]:
+        if not c["members"]:
+            continue
+        rep = min(c["members"], key=lambda m: (str(m["task_id"]), int(m["row_index"])))
+        # If the cluster has any unmasked member, the rep must be unmasked
+        if any(not m["masked"] for m in c["members"]):
+            assert not rep.get("masked", False) or any(
+                not m["masked"] for m in c["members"] if (str(m["task_id"]), int(m["row_index"])) <= (str(rep["task_id"]), int(rep["row_index"]))
+            ), f"masked row chosen as cluster rep: {rep}"
 
 
 def test_mask_duplicates_keeps_representative(tmp_path):
