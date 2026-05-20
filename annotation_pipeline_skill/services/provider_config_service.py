@@ -197,17 +197,14 @@ def _profile_diagnostics(profile: LLMProfile, *, env: Mapping[str, str]) -> dict
         if isinstance(profile.api_key_env, str)
         else ", ".join(profile.api_key_env)
     )
-    checks.append(
-        {
-            "id": "api_key_env_present",
-            "status": "ok" if key_present else "error",
-            "message": (
-                f"{env_label} is set"
-                if key_present
-                else f"{env_label} is not set"
-            ),
-        }
-    )
+    if key_present:
+        key_status, key_message = "ok", f"{env_label} is set"
+    elif profile.runtime == "codex_cli":
+        # codex manages its own auth via stored credentials; key not required in env
+        key_status, key_message = "ok", f"{env_label} not set — codex uses stored auth"
+    else:
+        key_status, key_message = "error", f"{env_label} is not set"
+    checks.append({"id": "api_key_env_present", "status": key_status, "message": key_message})
     status = "ok" if all(c["status"] == "ok" for c in checks) else "error"
     return {"status": status, "checks": checks}
 
