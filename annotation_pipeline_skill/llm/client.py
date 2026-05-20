@@ -20,9 +20,9 @@ class LLMGenerateRequest:
     # OpenAI-compatible chat-completions ``response_format`` payload — e.g.
     # ``{"type": "json_object"}`` for forced-JSON or
     # ``{"type": "json_schema", "json_schema": {...}}`` for strict schema
-    # enforcement. Only clients that route through chat.completions
-    # (OpenAICompatibleClient) honor this; codex/claude CLI and
-    # OpenAIResponsesClient.generate ignore it.
+    # enforcement. Currently ignored by both codex_cli and claude_cli runtimes,
+    # but preserved on the request for callers that already populate it and
+    # for future runtimes that may honor it.
     response_format: dict[str, Any] | None = None
 
 

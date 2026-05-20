@@ -213,7 +213,7 @@ def parse_codex_json_events(
             usage = event_usage
 
     return LLMGenerateResult(
-        runtime="local_cli",
+        runtime="codex_cli",
         provider=provider,
         model=model,
         continuity_handle=thread_id,
