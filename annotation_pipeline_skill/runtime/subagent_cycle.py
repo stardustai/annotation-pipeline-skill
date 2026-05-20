@@ -196,18 +196,6 @@ class SubagentRuntime:
                     break
         except Exception:
             pass
-        # Fallback: project-level annotation_rules.yaml under the store
-        # root. This is what the dashboard's "Annotation Rules" tab
-        # edits, and it's the single source of truth for projects that
-        # haven't migrated to per-task AnnotationDocument linkage.
-        rules_path = self.store.root / "annotation_rules.yaml"
-        if rules_path.exists():
-            try:
-                content = rules_path.read_text(encoding="utf-8").strip()
-            except OSError:
-                return None
-            if content:
-                return f"Annotation rules (project):\n{content}"
         return None
 
     async def _run_task(self, task: Task, stage_target: str) -> None:
@@ -282,6 +270,7 @@ class SubagentRuntime:
                 ),
                 prompt=self._annotation_prompt(task),
                 continuity_handle=self._read_pinned_handle(task, "continuity_handle", stage_target),
+                response_format={"type": "json_object"},
             ),
         )
         annotation_finished_at = utc_now()
@@ -597,6 +586,7 @@ class SubagentRuntime:
                 instructions=self._qc_instructions(task, guideline=guideline),
                 prompt=self._qc_prompt(task, annotation_artifact),
                 continuity_handle=self._read_pinned_handle(task, "qc_continuity_handle", "qc"),
+                response_format={"type": "json_object"},
             ),
         )
         qc_finished_at = utc_now()
@@ -2428,7 +2418,7 @@ class SubagentRuntime:
             "  - If ALL verdicts are 'annotator' (the annotation stands as-is), set corrected_annotation = null.\n"
             "There is no 'rejected' outcome.\n\n"
             "Shape of corrected_annotation when non-null: a {\"rows\": [{\"row_index\": int, "
-            "\"output\": {entities, classifications, relations, json_structures}}, ...]} object that "
+            "\"output\": {entities, json_structures}}, ...]} object that "
             "preserves every row from current_annotation.\n"
             "MUST CONFORM TO output_schema (provided in the prompt). In particular: entity types are "
             "limited to the enum in $defs.entityType — do NOT invent new entity types like 'attribute' "
@@ -2941,8 +2931,8 @@ def _annotation_instructions(
     base = (
         "You are an annotation subagent. Return raw JSON only, with no markdown fences or commentary. "
         "Follow the output_schema in this prompt: it is the JSON Schema your response must conform to, and its "
-        "$defs section enumerates every allowed entity type (entityType enum), classification task "
-        "(classificationTask enum), and json_structures phrase type (jsonStructureType enum or equivalent). "
+        "$defs section enumerates every allowed entity type (entityType enum) and json_structures "
+        "phrase type (jsonStructureType enum or equivalent). "
         "Use ONLY those values — labels outside the schema's enums will be rejected by the validator. "
         "For text entity spans, copy exact contiguous text spans from task.source_ref.payload.text. "
         "For json_structures: on every row, scan the input text for instances of every phrase type the schema "

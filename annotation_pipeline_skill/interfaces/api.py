@@ -1055,6 +1055,8 @@ class DashboardApi:
             return self._update_provider_config_response(store, body)
         if route == "/api/annotators":
             return self._update_annotators_response(store, body)
+        if route == "/api/schema":
+            return self._update_project_schema_response(store, body)
         return self._json_response(404, {"error": "not_found"})
 
     def handle_post(self, path: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
@@ -1538,6 +1540,32 @@ class DashboardApi:
             return self._json_response(400, {"error": "invalid_provider_config", "detail": str(exc)})
         return self._json_response(200, snapshot)
 
+    def _update_project_schema_response(self, store: SqliteStore, body: bytes) -> tuple[int, dict[str, str], bytes]:
+        """PUT /api/schema — persist edited output_schema.json after JSON-Schema metaschema validation."""
+        from annotation_pipeline_skill.core.schema_validation import PROJECT_SCHEMA_FILENAME
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+        # Accept either {"schema": {...}} or the raw schema object.
+        schema = payload.get("schema") if isinstance(payload, dict) and "schema" in payload else payload
+        if not isinstance(schema, dict):
+            return self._json_response(400, {"error": "invalid_payload", "detail": "schema must be an object"})
+        # Validate that the supplied document is itself a valid JSON Schema.
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as exc:
+            return self._json_response(400, {"error": "invalid_schema", "detail": str(exc)})
+        path = store.root / PROJECT_SCHEMA_FILENAME
+        try:
+            path.write_text(json.dumps(schema, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError as exc:
+            return self._json_response(500, {"error": "write_failed", "detail": str(exc)})
+        return self._json_response(200, {"schema": schema, "path": str(path.relative_to(store.root))})
+
     def handle_delete(self, path: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
         parsed_path = urlparse(path)
         route = parsed_path.path
@@ -1624,14 +1652,8 @@ class DashboardApi:
     _ANNOTATION_RULES_ROLE = "annotation_rules"
 
     def _find_or_create_annotation_rules_doc(self, store: SqliteStore):
-        """Return the singleton AnnotationDocument that represents the
-        project's annotation rules. Seeded from `annotation_rules.yaml`
-        on first access if no such document exists yet.
-        """
-        from annotation_pipeline_skill.core.models import (
-            AnnotationDocument,
-            AnnotationDocumentVersion,
-        )
+        """Return the singleton AnnotationDocument that holds annotation rules."""
+        from annotation_pipeline_skill.core.models import AnnotationDocument
 
         for d in store.list_documents():
             if d.metadata.get("role") == self._ANNOTATION_RULES_ROLE:
@@ -1643,24 +1665,6 @@ class DashboardApi:
             metadata={"role": self._ANNOTATION_RULES_ROLE},
         )
         store.save_document(doc)
-        # Auto-seed v1 from existing annotation_rules.yaml if present.
-        seed_path = store.root / "annotation_rules.yaml"
-        seed_content = ""
-        if seed_path.exists():
-            try:
-                seed_content = seed_path.read_text(encoding="utf-8")
-            except OSError:
-                seed_content = ""
-        if seed_content.strip():
-            ver = AnnotationDocumentVersion.new(
-                document_id=doc.document_id,
-                version="v1",
-                content=seed_content,
-                changelog="Initial seed from annotation_rules.yaml.",
-                created_by="system",
-                metadata={},
-            )
-            store.save_document_version(ver)
         return doc
 
     def _annotation_rules_document_response(
@@ -1704,13 +1708,6 @@ class DashboardApi:
             metadata=dict(payload.get("metadata") or {}),
         )
         store.save_document_version(ver)
-        # Also mirror the latest content to annotation_rules.yaml so the
-        # filesystem fallback in _load_guideline stays in sync for any
-        # task that lacks a stamped document_version_id.
-        try:
-            (store.root / "annotation_rules.yaml").write_text(ver.content, encoding="utf-8")
-        except OSError:
-            pass
         return self._json_response(200, ver.to_dict())
 
     def _task_deviations_response(self, store: SqliteStore, task_id: str) -> tuple[int, dict[str, str], bytes]:
