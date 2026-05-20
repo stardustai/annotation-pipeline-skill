@@ -448,6 +448,22 @@ export async function fetchProjectSchema(storeKey: string | null = null): Promis
   return response.json() as Promise<{ schema: Record<string, unknown> | null }>;
 }
 
+export async function saveProjectSchema(
+  schema: Record<string, unknown>,
+  storeKey: string | null = null,
+): Promise<{ schema: Record<string, unknown>; path: string }> {
+  const response = await fetch(withStore("/api/schema", storeKey), {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ schema }),
+  });
+  if (!response.ok) {
+    const errorPayload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+    throw new Error(errorPayload?.detail ?? errorPayload?.error ?? `Schema save returned ${response.status}`);
+  }
+  return response.json() as Promise<{ schema: Record<string, unknown>; path: string }>;
+}
+
 export interface Guideline {
   label: string;
   path: string;

@@ -1191,6 +1191,73 @@ button {
   gap: 6px;
 }
 
+.json-viewer-embedded .json-block {
+  max-height: calc(100vh - 260px);
+  min-height: 480px;
+}
+
+/* Output Schema editor (Monaco) */
+.schema-panel .runtime-header {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.schema-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.schema-status {
+  font-size: 12px;
+  color: #5a6b76;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: #eef4fb;
+  border: 1px solid #d4e1ec;
+}
+
+.schema-status.dirty {
+  color: #8a5a00;
+  background: #fff5da;
+  border-color: #f0d68a;
+}
+
+.schema-status.error {
+  color: #a3231d;
+  background: #fde9e7;
+  border-color: #f0b6b1;
+}
+
+.schema-editor {
+  border: 1px solid #2a3138;
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.primary-button {
+  background: #2a6db1;
+  color: #fff;
+  border: 1px solid #25609c;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 12px;
+  font-weight: 500;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: #25609c;
+}
+
+.primary-button:disabled {
+  background: #b8c5cf;
+  border-color: #b8c5cf;
+  cursor: not-allowed;
+}
+
 .json-viewer-toolbar {
   display: flex;
   gap: 10px;

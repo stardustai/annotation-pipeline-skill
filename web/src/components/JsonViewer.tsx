@@ -137,9 +137,11 @@ export function truncateTokens(tokens: Token[]): { tokens: Token[]; truncated: b
 
 interface JsonViewerProps {
   value: unknown;
+  /** When true, render full JSON inline with no popup button and no truncation. */
+  embedded?: boolean;
 }
 
-export function JsonViewer({ value }: JsonViewerProps) {
+export function JsonViewer({ value, embedded = false }: JsonViewerProps) {
   const [popupOpen, setPopupOpen] = useState(false);
   const [showFullInline, setShowFullInline] = useState(false);
 
@@ -147,9 +149,9 @@ export function JsonViewer({ value }: JsonViewerProps) {
   const tokens = useMemo(() => tokenize(unwrapped), [unwrapped]);
   const fullText = useMemo(() => tokensToString(tokens), [tokens]);
   const { tokens: inlineTokens, truncated } = useMemo(() => {
-    if (showFullInline) return { tokens, truncated: false };
+    if (embedded || showFullInline) return { tokens, truncated: false };
     return truncateTokens(tokens);
-  }, [tokens, showFullInline]);
+  }, [tokens, showFullInline, embedded]);
 
   // ESC closes popup; only attach listener while open.
   useEffect(() => {
@@ -161,6 +163,14 @@ export function JsonViewer({ value }: JsonViewerProps) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [popupOpen]);
+
+  if (embedded) {
+    return (
+      <div className="json-viewer json-viewer-embedded">
+        <pre className="json-block">{renderTokens(inlineTokens)}</pre>
+      </div>
+    );
+  }
 
   return (
     <>
