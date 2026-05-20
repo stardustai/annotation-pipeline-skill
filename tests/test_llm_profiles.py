@@ -148,7 +148,6 @@ targets:
   coordinator: glm
 """)
     profile = load_llm_registry(p).resolve("coordinator")
-    import os
     env = {"BIGMODEL_MCP_API_KEY": "secret"}
     assert profile.resolve_api_key(env) == "secret"
 
