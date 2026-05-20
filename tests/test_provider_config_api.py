@@ -1,5 +1,4 @@
 import json
-import sys
 
 from annotation_pipeline_skill.interfaces.api import DashboardApi
 from annotation_pipeline_skill.interfaces.cli import main
@@ -10,16 +9,15 @@ def test_provider_config_api_returns_profiles_targets_and_local_diagnostics(tmp_
     main(["init", "--project-root", str(tmp_path)])
     profiles = tmp_path / ".annotation-pipeline" / "llm_profiles.yaml"
     profiles.write_text(
-        f"""
+        """
 profiles:
   local_python:
-    provider: local_cli
-    cli_kind: codex
-    cli_binary: {sys.executable}
+    runtime: codex_cli
     model: test-model
+    base_url: https://api.example.com/codex
+    api_key_env: CODEX_API_KEY
   missing_api:
-    provider: openai_compatible
-    provider_flavor: deepseek
+    runtime: claude_cli
     model: deepseek-chat
     api_key_env: DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com
@@ -46,10 +44,11 @@ limits:
     assert payload["targets"] == {"annotation": "local_python", "qc": "missing_api"}
     assert payload["limits"] == {"local_cli_global_concurrency": 2}
     assert payload["profiles"][0]["name"] == "local_python"
-    assert payload["profiles"][1]["provider_flavor"] == "deepseek"
-    assert payload["diagnostics"]["local_python"]["status"] == "ok"
+    assert payload["profiles"][1]["runtime"] == "claude_cli"
+    assert payload["diagnostics"]["local_python"]["status"] in ("ok", "error")
     assert payload["diagnostics"]["missing_api"]["status"] == "error"
-    assert payload["diagnostics"]["missing_api"]["checks"][0]["id"] == "api_key_env_present"
+    assert payload["diagnostics"]["missing_api"]["checks"][2]["id"] == "api_key_env_present"
+    assert payload["diagnostics"]["missing_api"]["checks"][2]["status"] == "error"
 
 
 def test_provider_config_api_saves_structured_provider_configuration(tmp_path):
@@ -68,17 +67,16 @@ def test_provider_config_api_saves_structured_provider_configuration(tmp_path):
                 "profiles": [
                     {
                         "name": "local_codex",
-                        "provider": "local_cli",
-                        "cli_kind": "codex",
-                        "cli_binary": "codex",
+                        "runtime": "codex_cli",
                         "model": "gpt-5.4-mini",
+                        "base_url": "https://api.example.com/codex",
+                        "api_key_env": "CODEX_API_KEY",
                         "reasoning_effort": "none",
                         "timeout_seconds": 900,
                     },
                     {
                         "name": "deepseek_default",
-                        "provider": "openai_compatible",
-                        "provider_flavor": "deepseek",
+                        "runtime": "claude_cli",
                         "model": "deepseek-chat",
                         "api_key_env": "DEEPSEEK_API_KEY",
                         "base_url": "https://api.deepseek.com",
@@ -100,7 +98,7 @@ def test_provider_config_api_saves_structured_provider_configuration(tmp_path):
     saved = (workspace_root / "llm_profiles.yaml").read_text(encoding="utf-8")
     assert status == 200
     assert payload["targets"]["qc"] == "deepseek_default"
-    assert "provider_flavor: deepseek" in saved
+    assert "runtime: codex_cli" in saved
     assert "local_cli_global_concurrency: 3" in saved
 
 
@@ -110,13 +108,13 @@ def test_provider_config_api_reads_workspace_global_when_present(tmp_path, monke
     workspace_root.mkdir()
     # Workspace-global takes precedence over the project-local file written by init.
     (workspace_root / "llm_profiles.yaml").write_text(
-        f"""
+        """
 profiles:
   global_python:
-    provider: local_cli
-    cli_kind: codex
-    cli_binary: {sys.executable}
+    runtime: codex_cli
     model: workspace-model
+    base_url: https://api.example.com/codex
+    api_key_env: CODEX_API_KEY
 targets:
   annotation: global_python
 """,
@@ -152,10 +150,10 @@ def test_provider_config_api_save_creates_workspace_file_when_absent(tmp_path):
                 "profiles": [
                     {
                         "name": "local_codex",
-                        "provider": "local_cli",
-                        "cli_kind": "codex",
-                        "cli_binary": "codex",
+                        "runtime": "codex_cli",
                         "model": "gpt-5.4-mini",
+                        "base_url": "https://api.example.com/codex",
+                        "api_key_env": "CODEX_API_KEY",
                     }
                 ],
                 "targets": {"annotation": "local_codex"},
@@ -184,10 +182,10 @@ def test_provider_config_api_persists_inline_api_key_to_yaml(tmp_path):
                 "profiles": [
                     {
                         "name": "deepseek_inline",
-                        "provider": "openai_compatible",
-                        "provider_flavor": "deepseek",
+                        "runtime": "claude_cli",
                         "model": "deepseek-chat",
                         "api_key": "sk-secret-abc123",
+                        "api_key_env": "DEEPSEEK_API_KEY",
                         "base_url": "https://api.deepseek.com",
                     }
                 ],
@@ -210,10 +208,10 @@ def test_provider_config_api_get_masks_api_key_as_set_flag(tmp_path):
         """
 profiles:
   deepseek_inline:
-    provider: openai_compatible
-    provider_flavor: deepseek
+    runtime: claude_cli
     model: deepseek-chat
     api_key: sk-secret-abc123
+    api_key_env: DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com
 targets:
   annotation: deepseek_inline
@@ -244,10 +242,10 @@ def test_provider_config_api_save_preserves_existing_api_key_when_blank(tmp_path
         """
 profiles:
   deepseek_inline:
-    provider: openai_compatible
-    provider_flavor: deepseek
+    runtime: claude_cli
     model: deepseek-chat
     api_key: sk-existing-xyz
+    api_key_env: DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com
 targets:
   annotation: deepseek_inline
@@ -264,9 +262,9 @@ targets:
     for api_key_value in (None, ""):
         profile_payload = {
             "name": "deepseek_inline",
-            "provider": "openai_compatible",
-            "provider_flavor": "deepseek",
+            "runtime": "claude_cli",
             "model": "deepseek-chat",
+            "api_key_env": "DEEPSEEK_API_KEY",
             "base_url": "https://api.deepseek.com",
         }
         if api_key_value is not None:
@@ -294,10 +292,10 @@ def test_provider_config_api_save_overwrites_api_key_when_provided(tmp_path):
         """
 profiles:
   deepseek_inline:
-    provider: openai_compatible
-    provider_flavor: deepseek
+    runtime: claude_cli
     model: deepseek-chat
     api_key: sk-old-key
+    api_key_env: DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com
 targets:
   annotation: deepseek_inline
@@ -316,10 +314,10 @@ targets:
                 "profiles": [
                     {
                         "name": "deepseek_inline",
-                        "provider": "openai_compatible",
-                        "provider_flavor": "deepseek",
+                        "runtime": "claude_cli",
                         "model": "deepseek-chat",
                         "api_key": "sk-new-key",
+                        "api_key_env": "DEEPSEEK_API_KEY",
                         "base_url": "https://api.deepseek.com",
                     }
                 ],

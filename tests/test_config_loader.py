@@ -10,10 +10,10 @@ def write_config(root):
         """
 profiles:
   local_codex:
-    provider: local_cli
-    cli_kind: codex
-    cli_binary: codex
+    runtime: codex_cli
     model: gpt-5.4-mini
+    base_url: https://api.example.com/codex
+    api_key_env: CODEX_API_KEY
 targets:
   annotation: local_codex
 """,
