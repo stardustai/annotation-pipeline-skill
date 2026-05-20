@@ -42,7 +42,7 @@ def test_build_codex_command_includes_json_resume_and_model():
         binary="codex",
         prompt="Annotate this",
         developer_instructions="Return JSON",
-        continuity_handle="thread-1",
+        thread_id="thread-1",
         model="gpt-5.4-mini",
         reasoning_effort="none",
     )
@@ -50,7 +50,7 @@ def test_build_codex_command_includes_json_resume_and_model():
     assert command[:3] == ["codex", "exec", "resume"]
     assert "--json" in command
     assert "--ignore-user-config" in command
-    assert "--ephemeral" in command
+    assert "--ephemeral" not in command
     assert command[command.index("--disable") + 1] == "apps"
     assert command[command.index("--disable", command.index("--disable") + 1) + 1] == "plugins"
     assert "--model" in command
@@ -77,8 +77,9 @@ def test_isolated_codex_home_strips_desktop_context_and_preserves_auth(tmp_path:
         },
         model="gpt-5.4-mini",
         reasoning_effort="none",
-        continuity_handle=None,
-    ) as (isolated_env, isolated_home):
+        home_id=None,
+        thread_id=None,
+    ) as (isolated_env, isolated_home, _home_id):
         assert isolated_env["CODEX_HOME"] == str(isolated_home)
         assert isolated_env["HOME"] == str(isolated_home)
         assert "CODEX_THREAD_ID" not in isolated_env
@@ -102,8 +103,9 @@ def test_isolated_codex_home_does_not_copy_user_tui_state(tmp_path: Path):
         {"CODEX_HOME": str(source_home), "ANNOTATION_CODEX_HOME_ROOT": str(tmp_path / "runtime")},
         model="gpt-5.4-mini",
         reasoning_effort="none",
-        continuity_handle=None,
-    ) as (_isolated_env, isolated_home):
+        home_id=None,
+        thread_id=None,
+    ) as (_isolated_env, isolated_home, _home_id):
         config = (isolated_home / "config.toml").read_text(encoding="utf-8")
         assert "[tui]" not in config
         assert "model_availability_nux" not in config
@@ -118,10 +120,12 @@ def test_isolated_codex_home_can_use_non_tmp_runtime_root(tmp_path: Path):
         {"CODEX_HOME": str(source_home), "ANNOTATION_CODEX_HOME_ROOT": str(runtime_root)},
         model="gpt-5.4-mini",
         reasoning_effort="none",
-        continuity_handle=None,
-    ) as (isolated_env, isolated_home):
+        home_id=None,
+        thread_id=None,
+    ) as (isolated_env, isolated_home, home_id):
         assert isolated_home.is_relative_to(runtime_root)
         assert isolated_env["CODEX_HOME"] == str(isolated_home)
+        assert home_id is not None and len(home_id) > 0
 
 
 def test_parse_codex_json_events_extracts_thread_and_final_text():
@@ -149,10 +153,24 @@ def test_build_claude_command_uses_stream_json_and_stdin_prompt():
 
     assert command[:2] == ["claude", "-p"]
     assert "--no-session-persistence" in command
+    assert "--resume" not in command
     assert "--output-format" in command
     assert "stream-json" in command
     assert command[command.index("--model") + 1] == "claude-sonnet-4-5"
     assert command[command.index("--permission-mode") + 1] == "dontAsk"
+    assert command[-1] == "-"
+
+
+def test_build_claude_command_uses_resume_when_session_id_provided():
+    command = build_claude_command(
+        binary="claude",
+        model="claude-sonnet-4-5",
+        permission_mode=None,
+        session_id="abcd-1234",
+    )
+
+    assert "--no-session-persistence" not in command
+    assert command[command.index("--resume") + 1] == "abcd-1234"
     assert command[-1] == "-"
 
 
@@ -176,29 +194,31 @@ def test_parse_claude_stream_events_extracts_text_and_usage():
 def test_local_cli_profile_import_contract():
     profile = LLMProfile(
         name="codex",
-        provider="local_cli",
+        runtime="codex_cli",
         model="gpt-5.4-mini",
-        cli_kind="codex",
-        cli_binary="codex",
+        base_url="https://api.openai.com",
+        api_key_env="OPENAI_API_KEY",
     )
 
-    assert profile.cli_kind == "codex"
+    assert profile.runtime == "codex_cli"
 
 
 @pytest.mark.asyncio
-async def test_local_codex_client_does_not_resume_inside_disposable_home(tmp_path: Path, monkeypatch):
+async def test_local_codex_client_propagates_continuity_handle(tmp_path: Path, monkeypatch):
     captured: dict[str, object] = {}
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("prompt", encoding="utf-8")
 
     def fake_build_codex_command(**kwargs):
-        captured["continuity_handle"] = kwargs["continuity_handle"]
+        captured["thread_id"] = kwargs["thread_id"]
         return ["codex", "exec", "--json", "prompt"], prompt_file
 
     @contextmanager
-    def fake_isolated_codex_home(env, *, model, reasoning_effort, continuity_handle):
-        captured["home_continuity_handle"] = continuity_handle
-        yield {"PATH": env.get("PATH", "")}, tmp_path
+    def fake_isolated_codex_home(env, *, model, reasoning_effort, home_id, thread_id, provider_api_key=None, provider_base_url=None):
+        captured["home_id"] = home_id
+        captured["iso_thread_id"] = thread_id
+        resolved = home_id or "fake-home-id"
+        yield {"PATH": env.get("PATH", "")}, tmp_path, resolved
 
     class FakeProcess:
         returncode = 0
@@ -222,15 +242,24 @@ async def test_local_codex_client_does_not_resume_inside_disposable_home(tmp_pat
     client = LocalCLIClient(
         LLMProfile(
             name="local_codex",
-            provider="local_cli",
+            runtime="codex_cli",
             model="gpt-5.4-mini",
-            cli_kind="codex",
-            cli_binary="codex",
+            base_url="https://api.openai.com",
+            api_key_env="OPENAI_API_KEY",
         )
     )
 
-    result = await client.generate(LLMGenerateRequest(prompt="prompt", continuity_handle="thread-old"))
+    # First call: no prior handle → thread_id=None passed down, result gets home::thread
+    result = await client.generate(LLMGenerateRequest(prompt="prompt"))
+    assert result.continuity_handle == "fake-home-id::thread-new"
+    assert captured["thread_id"] is None
+    assert captured["home_id"] is None
 
-    assert result.continuity_handle == "thread-new"
-    assert captured["continuity_handle"] is None
-    assert captured["home_continuity_handle"] is None
+    # Resume call: handle parsed into home_id + thread_id
+    result2 = await client.generate(
+        LLMGenerateRequest(prompt="prompt", continuity_handle="my-home::thread-old")
+    )
+    assert captured["home_id"] == "my-home"
+    assert captured["thread_id"] == "thread-old"
+    assert captured["iso_thread_id"] == "thread-old"
+    assert result2.continuity_handle == "my-home::thread-new"

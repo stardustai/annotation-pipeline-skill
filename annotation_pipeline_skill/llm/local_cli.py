@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import shutil
-import tempfile
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -40,15 +40,26 @@ def codex_shell_environment(env: Mapping[str, str] = os.environ) -> dict[str, st
     return safe
 
 
+def _parse_codex_handle(handle: str | None) -> tuple[str | None, str | None]:
+    """Split 'home_id::thread_id' into components. Returns (None, None) if no handle."""
+    if not handle:
+        return None, None
+    if "::" in handle:
+        home_id, thread_id = handle.split("::", 1)
+        return home_id, thread_id
+    return None, handle  # legacy bare thread_id
+
+
 def build_codex_command(
     *,
     binary: str,
     prompt: str,
     developer_instructions: str | None,
-    continuity_handle: str | None,
+    thread_id: str | None,
     model: str,
     reasoning_effort: str | None,
 ) -> tuple[list[str], Path]:
+    import tempfile
     prompt_file = Path(tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False).name)
     full_prompt = prompt
     if developer_instructions:
@@ -56,13 +67,12 @@ def build_codex_command(
     prompt_file.write_text(full_prompt, encoding="utf-8")
 
     command = [binary, "exec"]
-    if continuity_handle:
+    if thread_id:
         command.append("resume")
     command.extend(
         [
             "--ignore-user-config",
             "--ignore-rules",
-            "--ephemeral",
             "--disable",
             "apps",
             "--disable",
@@ -78,8 +88,8 @@ def build_codex_command(
     )
     if reasoning_effort:
         command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
-    if continuity_handle:
-        command.append(continuity_handle)
+    if thread_id:
+        command.append(thread_id)
     command.append(prompt_file.read_text(encoding="utf-8"))
     return command, prompt_file
 
@@ -89,17 +99,20 @@ def build_claude_command(
     binary: str,
     model: str,
     permission_mode: str | None,
+    session_id: str | None = None,
 ) -> list[str]:
-    command = [
-        binary,
-        "-p",
-        "--no-session-persistence",
+    command = [binary, "-p"]
+    if session_id:
+        command.extend(["--resume", session_id])
+    else:
+        command.append("--no-session-persistence")
+    command.extend([
         "--verbose",
         "--output-format",
         "stream-json",
         "--model",
         model,
-    ]
+    ])
     if permission_mode:
         command.extend(["--permission-mode", permission_mode])
     command.append("-")
@@ -112,31 +125,53 @@ def isolated_codex_home(
     *,
     model: str,
     reasoning_effort: str | None,
-    continuity_handle: str | None,
-) -> Iterator[tuple[dict[str, str], Path]]:
+    home_id: str | None,
+    thread_id: str | None,
+    provider_api_key: str | None = None,
+    provider_base_url: str | None = None,
+) -> Iterator[tuple[dict[str, str], Path, str]]:
     source_home = Path(env.get("CODEX_HOME") or Path(env.get("HOME", "~")).expanduser() / ".codex")
     runtime_root = Path(env.get("ANNOTATION_CODEX_HOME_ROOT") or Path.cwd() / ".annotation-pipeline-codex-homes")
     runtime_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="annotation-codex-home-", dir=runtime_root) as temp_dir:
-        isolated_home = Path(temp_dir)
-        for filename in ("auth.json", "config.toml", "credentials.json"):
-            source_file = source_home / filename
-            if source_file.exists():
-                shutil.copy2(source_file, isolated_home / filename)
 
-        _write_isolated_codex_config(
-            isolated_home / "config.toml",
-            model=model,
-            reasoning_effort=reasoning_effort,
-        )
+    if home_id:
+        isolated_home = runtime_root / home_id
+        isolated_home.mkdir(parents=True, exist_ok=True)
+    else:
+        home_id = str(uuid.uuid4())
+        isolated_home = runtime_root / home_id
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        if provider_api_key:
+            # Provider-specific home: write minimal auth with provider key only
+            (isolated_home / "auth.json").write_text(
+                json.dumps({"OPENAI_API_KEY": provider_api_key}),
+                encoding="utf-8",
+            )
+        else:
+            # Default path: copy user's codex auth
+            for filename in ("auth.json", "config.toml", "credentials.json"):
+                source_file = source_home / filename
+                if source_file.exists():
+                    shutil.copy2(source_file, isolated_home / filename)
 
-        isolated_env = codex_shell_environment(env)
-        isolated_env["CODEX_HOME"] = str(isolated_home)
-        isolated_env["HOME"] = str(isolated_home)
-        isolated_env.pop("CODEX_THREAD_ID", None)
-        if continuity_handle:
-            isolated_env["CODEX_RESUME_THREAD_ID"] = continuity_handle
-        yield isolated_env, isolated_home
+    _write_isolated_codex_config(
+        isolated_home / "config.toml",
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+    isolated_env = codex_shell_environment(env)
+    isolated_env["CODEX_HOME"] = str(isolated_home)
+    isolated_env["HOME"] = str(isolated_home)
+    isolated_env.pop("CODEX_THREAD_ID", None)
+    if thread_id:
+        isolated_env["CODEX_RESUME_THREAD_ID"] = thread_id
+    if provider_api_key:
+        isolated_env["OPENAI_API_KEY"] = provider_api_key
+    if provider_base_url:
+        isolated_env["OPENAI_BASE_URL"] = provider_base_url
+
+    yield isolated_env, isolated_home, home_id
 
 
 def parse_codex_json_events(
@@ -240,19 +275,20 @@ class LocalCLIClient:
         self.profile = profile
 
     async def generate(self, request: LLMGenerateRequest) -> LLMGenerateResult:
-        if self.profile.cli_kind == "codex":
+        if self.profile.runtime == "codex_cli":
             return await self._generate_codex(request)
-        if self.profile.cli_kind == "claude":
+        if self.profile.runtime == "claude_cli":
             return await self._generate_claude(request)
-        raise ValueError(f"unsupported local cli kind: {self.profile.cli_kind}")
+        raise ValueError(f"unsupported runtime: {self.profile.runtime}")
 
     async def _generate_codex(self, request: LLMGenerateRequest) -> LLMGenerateResult:
-        codex_continuity_handle = None
+        home_id, thread_id = _parse_codex_handle(request.continuity_handle)
+        api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
         command, prompt_file = build_codex_command(
-            binary=self.profile.cli_binary or "codex",
+            binary="codex",
             prompt=request.prompt or _messages_to_prompt(request.input_items),
             developer_instructions=request.instructions,
-            continuity_handle=codex_continuity_handle,
+            thread_id=thread_id,
             model=self.profile.model,
             reasoning_effort=self.profile.reasoning_effort,
         )
@@ -261,8 +297,11 @@ class LocalCLIClient:
                 {**os.environ, **request.env},
                 model=self.profile.model,
                 reasoning_effort=self.profile.reasoning_effort,
-                continuity_handle=codex_continuity_handle,
-            ) as (env, _home):
+                home_id=home_id,
+                thread_id=thread_id,
+                provider_api_key=api_key,
+                provider_base_url=self.profile.base_url,
+            ) as (env, _home, resolved_home_id):
                 process = await asyncio.create_subprocess_exec(
                     *command,
                     cwd=str(request.cwd) if request.cwd else None,
@@ -292,17 +331,17 @@ class LocalCLIClient:
             result = parse_codex_json_events(lines, provider=self.profile.name, model=self.profile.model)
             diagnostics = dict(result.diagnostics or {})
             diagnostics["returncode"] = process.returncode
-            if request.continuity_handle:
-                diagnostics["continuity_resume_disabled"] = True
             if stderr:
                 diagnostics["stderr"] = stderr.decode("utf-8", errors="replace")[-4000:]
             if process.returncode != 0:
                 raise LocalCLIExecutionError("local CLI provider failed", diagnostics)
+            new_thread_id = result.continuity_handle
+            new_handle = f"{resolved_home_id}::{new_thread_id}" if new_thread_id else None
             return LLMGenerateResult(
                 runtime=result.runtime,
                 provider=result.provider,
                 model=result.model,
-                continuity_handle=result.continuity_handle,
+                continuity_handle=new_handle,
                 final_text=result.final_text,
                 usage=result.usage,
                 raw_response=result.raw_response,
@@ -313,14 +352,20 @@ class LocalCLIClient:
 
     async def _generate_claude(self, request: LLMGenerateRequest) -> LLMGenerateResult:
         command = build_claude_command(
-            binary=self.profile.cli_binary or "claude",
+            binary="claude",
             model=self.profile.model,
             permission_mode=self.profile.permission_mode,
+            session_id=request.continuity_handle,
         )
         prompt = request.prompt or _messages_to_prompt(request.input_items)
         if request.instructions:
             prompt = f"{request.instructions}\n\n{prompt}"
         env = {**os.environ, **request.env}
+        api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
+        if self.profile.base_url:
+            env["ANTHROPIC_BASE_URL"] = self.profile.base_url
+        if api_key:
+            env["ANTHROPIC_AUTH_TOKEN"] = api_key
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(request.cwd) if request.cwd else None,
