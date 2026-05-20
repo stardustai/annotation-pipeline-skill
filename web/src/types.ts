@@ -251,30 +251,23 @@ export interface OutboxSummary {
   records: OutboxRecord[];
 }
 
-export type ProviderName = "openai_responses" | "openai_compatible" | "local_cli";
-export type ProviderFlavor = "deepseek" | "glm" | "minimax";
-export type CliKind = "codex" | "claude";
+export type Runtime = "claude_cli" | "codex_cli";
 
 export interface ProviderProfileConfig {
   name: string;
-  provider: ProviderName;
-  provider_flavor: ProviderFlavor | null;
-  cli_kind: CliKind | null;
-  cli_binary: string | null;
+  runtime: Runtime;
   model: string;
-  api_key_env: string | null;
-  // Write-only: when non-empty, the server stores it as inline api_key.
-  // The GET response never includes the raw value (api_key_set echoes it).
-  api_key?: string | null;
-  // Read-only echo: true when the stored profile has an inline api_key.
-  api_key_set?: boolean;
-  base_url: string | null;
+  base_url: string;
+  api_key_env: string | string[] | null;
+  api_key?: string | null;       // write-only
+  api_key_set?: boolean;         // read-only echo
   reasoning_effort: string | null;
   permission_mode: string | null;
   timeout_seconds: number | null;
   max_retries: number | null;
   concurrency_limit: number | null;
   no_progress_timeout_seconds: number | null;
+  disable_continuity: boolean | null;
 }
 
 export interface ProviderCheck {

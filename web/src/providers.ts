@@ -1,57 +1,19 @@
-import type { ProviderConfigSnapshot, ProviderName, ProviderProfileConfig } from "./types";
+import type { ProviderConfigSnapshot, Runtime, ProviderProfileConfig } from "./types";
 
-export function createProviderProfile(provider: ProviderName, index: number): ProviderProfileConfig {
-  if (provider === "local_cli") {
-    return {
-      name: `local_cli_${index}`,
-      provider,
-      provider_flavor: null,
-      cli_kind: "codex",
-      cli_binary: "codex",
-      model: "gpt-5.4-mini",
-      api_key_env: null,
-      base_url: null,
-      reasoning_effort: "none",
-      permission_mode: null,
-      timeout_seconds: 900,
-      max_retries: null,
-      concurrency_limit: null,
-      no_progress_timeout_seconds: 30,
-    };
-  }
-  if (provider === "openai_compatible") {
-    return {
-      name: `openai_compatible_${index}`,
-      provider,
-      provider_flavor: "deepseek",
-      cli_kind: null,
-      cli_binary: null,
-      model: "deepseek-chat",
-      api_key_env: "DEEPSEEK_API_KEY",
-      base_url: "https://api.deepseek.com",
-      reasoning_effort: null,
-      permission_mode: null,
-      timeout_seconds: 300,
-      max_retries: null,
-      concurrency_limit: null,
-      no_progress_timeout_seconds: null,
-    };
-  }
+export function createProviderProfile(runtime: Runtime, index: number): ProviderProfileConfig {
   return {
-    name: `openai_responses_${index}`,
-    provider,
-    provider_flavor: null,
-    cli_kind: null,
-    cli_binary: null,
-    model: "gpt-5.4-mini",
-    api_key_env: "OPENAI_API_KEY",
-    base_url: "https://api.openai.com/v1",
-    reasoning_effort: "medium",
+    name: `profile_${index}`,
+    runtime,
+    model: runtime === "codex_cli" ? "gpt-5.5" : "deepseek-v4-flash",
+    base_url: runtime === "codex_cli" ? "https://api.openai.com" : "https://api.deepseek.com/anthropic",
+    api_key_env: runtime === "codex_cli" ? "OPENAI_API_KEY" : "DEEPSEEK_API_KEY",
+    reasoning_effort: null,
     permission_mode: null,
-    timeout_seconds: 300,
+    timeout_seconds: null,
     max_retries: null,
     concurrency_limit: null,
     no_progress_timeout_seconds: null,
+    disable_continuity: null,
   };
 }
 
@@ -64,10 +26,11 @@ export function providerConfigPayload(snapshot: ProviderConfigSnapshot) {
 }
 
 export function profileTitle(profile: ProviderProfileConfig): string {
-  const providerDetail = profile.provider === "local_cli" ? profile.cli_kind : profile.provider_flavor;
-  return `${profile.name} · ${profile.provider}${providerDetail ? `/${providerDetail}` : ""} · ${profile.model}`;
+  return `${profile.name} · ${profile.runtime} · ${profile.model}`;
 }
 
-export function profileStatusLabel(snapshot: ProviderConfigSnapshot, profileName: string): string {
-  return snapshot.diagnostics[profileName]?.status ?? "unknown";
+export function profileStatusLabel(snapshot: ProviderConfigSnapshot, name: string): string {
+  const diag = snapshot.diagnostics[name];
+  if (!diag) return "unknown";
+  return diag.status === "ok" ? "ok" : "error";
 }
