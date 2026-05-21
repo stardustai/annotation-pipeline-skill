@@ -128,12 +128,23 @@ def _is_provider_permanent_error(exc: BaseException) -> bool:
     # forever instead of escalating.
     diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(diagnostics, dict):
+        # claude/codex stream-json `result.is_error=true` event carries
+        # the HTTP status in api_error_status. Operator-actionable codes
+        # (401/402/403/404/422) classify as permanent so the worker
+        # short-circuits to the alert + fallback path instead of bailing
+        # in a tight 1-second-per-request retry loop (~3600 wasted calls/h).
+        err_ev = diagnostics.get("error_event")
+        if isinstance(err_ev, dict):
+            status = err_ev.get("api_error_status")
+            if isinstance(status, int) and status in {400, 401, 402, 403, 404, 422}:
+                return True
         stderr_text = str(diagnostics.get("stderr") or "").lower()
         if any(s in stderr_text for s in (
             "unauthorized", "invalid api key", "invalid_api_key",
             "authentication failed", "auth failed", "auth error",
             "permission denied", "forbidden", "not authenticated",
-            "missing api key", " 401 ", " 403 ", " 404 ", " 422 ",
+            "missing api key", " 401 ", " 402 ", " 403 ", " 404 ", " 422 ",
+            "insufficient balance", "insufficient_quota", "payment required",
         )):
             return True
     return False
@@ -1120,13 +1131,77 @@ class SubagentRuntime:
         """Sync wrapper retained for any external callers; the runtime uses _generate_async."""
         return asyncio.run(self._generate_async(target, request))
 
+    # Class-level cooldown for provider alerts: dedup (target, status) within
+    # ALERT_COOLDOWN_SECONDS so a 1000-task 402 storm doesn't write 1000 log
+    # lines. We keep one alert per (target, status) per cooldown window.
+    _provider_alert_cooldown: dict[tuple[str, Any], float] = {}
+    ALERT_COOLDOWN_SECONDS: float = 300.0
+
+    def _emit_provider_alert(self, target: str, exc: BaseException) -> None:
+        """Surface a user-actionable provider error (401/402/403/404/422/etc)
+        to stderr + the project's alerts.jsonl file. Deduplicated by
+        (target, api_error_status) within a 5-min cooldown.
+
+        Triggered when ``_is_provider_permanent_error(exc)`` is True. The
+        operator needs to act (refill balance, fix API key, swap model) —
+        the runtime cannot self-heal these, so it should fall back AND
+        loudly tell whoever is watching.
+        """
+        import sys, time
+        diag = getattr(exc, "diagnostics", None) or {}
+        err_ev = diag.get("error_event") if isinstance(diag, dict) else None
+        status: Any = None
+        message = str(exc)[:200]
+        if isinstance(err_ev, dict):
+            status = err_ev.get("api_error_status")
+            if err_ev.get("result_text"):
+                message = str(err_ev["result_text"])[:300]
+        cooldown_key = (target, status if status is not None else type(exc).__name__)
+        now = time.time()
+        last = SubagentRuntime._provider_alert_cooldown.get(cooldown_key, 0.0)
+        if now - last < SubagentRuntime.ALERT_COOLDOWN_SECONDS:
+            return
+        SubagentRuntime._provider_alert_cooldown[cooldown_key] = now
+        banner = (
+            f"\n🚨 PROVIDER ALERT  target={target}  status={status}  "
+            f"class={type(exc).__name__}\n   {message}\n"
+            f"   (operator action required — fallback target will be tried automatically)\n"
+        )
+        try:
+            print(banner, file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            alerts_path = self.store.root / "alerts.jsonl"
+            with open(alerts_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": utc_now().isoformat(),
+                    "target": target,
+                    "api_error_status": status,
+                    "exception_class": type(exc).__name__,
+                    "message": message,
+                }) + "\n")
+        except Exception:  # noqa: BLE001 — alerts are best-effort
+            pass
+
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         try:
             return await self._call_client(target, request)
-        except Exception as exc:  # noqa: BLE001 — try fallback on transient provider errors
-            if target == "fallback" or not _is_provider_transient_error(exc):
+        except Exception as exc:  # noqa: BLE001 — try fallback on transient/permanent provider errors
+            if target == "fallback":
                 raise
-            return await self._call_client("fallback", request)
+            if _is_provider_transient_error(exc):
+                return await self._call_client("fallback", request)
+            if _is_provider_permanent_error(exc):
+                # Operator-actionable error (auth/balance/wrong model).
+                # Alert + try fallback once. If fallback also fails, raise
+                # the ORIGINAL exception so HR metadata pins the real cause.
+                self._emit_provider_alert(target, exc)
+                try:
+                    return await self._call_client("fallback", request)
+                except Exception:  # noqa: BLE001
+                    raise exc from None
+            raise
 
     def _profile_name_for_target(self, target: str) -> str | None:
         """Return the LLM profile name the factory currently resolves for
@@ -2608,9 +2683,10 @@ class SubagentRuntime:
                 # bare subprocess errors) where str(exc) is "" and we lose
                 # the only clue about what went wrong.
                 # LocalCLIExecutionError carries .diagnostics (returncode +
-                # last 4KB of stderr) — without this the message is just
-                # "local CLI provider failed" and the actual cause (auth
-                # rejection, model-name typo, vllm OOM, etc.) is lost.
+                # stderr + error_event with parsed api_error_status). Without
+                # surfacing diagnostics the wrapped message is just "local
+                # CLI provider failed" and the cause (auth/balance/wrong
+                # model/etc.) is lost.
                 diag = getattr(exc, "diagnostics", None)
                 tail = ""
                 if isinstance(diag, dict):
@@ -2618,10 +2694,45 @@ class SubagentRuntime:
                     err = (diag.get("stderr") or "")
                     if isinstance(err, str):
                         err = err.strip().replace("\n", " | ")[-300:]
-                    tail = f" rc={rc} stderr={err!r}"
-                raise _ArbiterCallFailed(
-                    f"llm_call/{type(exc).__name__}: {exc!s}{tail}"
-                ) from exc
+                    err_ev = diag.get("error_event")
+                    api_status = (
+                        err_ev.get("api_error_status") if isinstance(err_ev, dict) else None
+                    )
+                    api_msg = (
+                        err_ev.get("result_text") if isinstance(err_ev, dict) else None
+                    )
+                    tail = f" rc={rc} api_status={api_status} api_msg={str(api_msg)[:200]!r} stderr={err!r}"
+                # Operator-actionable error → alert + try fallback target
+                # for THIS arbiter call. If fallback also fails, fall
+                # through and raise _ArbiterCallFailed as before.
+                if _is_provider_permanent_error(exc):
+                    self._emit_provider_alert(target_name, exc)
+                    try:
+                        fb_client = self.client_factory("fallback")
+                        result = await fb_client.generate(LLMGenerateRequest(
+                            instructions=attempt_instructions,
+                            prompt=prompt,
+                            continuity_handle=None,
+                            response_format={"type": "json_object"},
+                        ))
+                        # fallback succeeded — continue to JSON parse step
+                        # without raising. (Drop out of the except block.)
+                    except Exception:  # noqa: BLE001
+                        raise _ArbiterCallFailed(
+                            f"llm_call/{type(exc).__name__}: {exc!s}{tail}"
+                        ) from exc
+                    else:
+                        try:
+                            close = getattr(fb_client, "aclose", None)
+                            if close is not None:
+                                await close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # `result` now holds fallback output — skip the raise.
+                else:
+                    raise _ArbiterCallFailed(
+                        f"llm_call/{type(exc).__name__}: {exc!s}{tail}"
+                    ) from exc
             try:
                 payload = _parse_llm_json(result.final_text)
             except (json.JSONDecodeError, ValueError) as exc:

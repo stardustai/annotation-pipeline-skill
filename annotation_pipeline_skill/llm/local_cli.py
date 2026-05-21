@@ -257,6 +257,7 @@ def parse_codex_json_events(
     final_text_parts: list[str] = []
     raw_events: list[dict[str, Any]] = []
     usage: dict[str, Any] | None = None
+    error_event: dict[str, Any] | None = None
 
     for line in lines:
         stripped = line.strip()
@@ -284,7 +285,23 @@ def parse_codex_json_events(
         event_usage = event.get("usage")
         if event_type == "turn.completed" and isinstance(event_usage, dict):
             usage = event_usage
+        # Provider-side errors (402 Insufficient Balance, 401 auth, 429
+        # rate limit, 5xx, etc.) come back as a terminal `result` event
+        # with `is_error: true`. The HTTP status is in `api_error_status`
+        # and the human message in `result`. Without this branch the
+        # whole event is silently included in raw_events but the upstream
+        # only sees `final_text=""` + `returncode!=0`, losing the cause.
+        if event_type == "result" and event.get("is_error"):
+            error_event = {
+                "api_error_status": event.get("api_error_status"),
+                "result_text": event.get("result"),
+                "duration_ms": event.get("duration_ms"),
+                "stop_reason": event.get("stop_reason"),
+            }
 
+    diagnostics: dict[str, Any] = {"line_count": len(lines), "event_count": len(raw_events)}
+    if error_event is not None:
+        diagnostics["error_event"] = error_event
     return LLMGenerateResult(
         runtime="codex_cli",
         provider=provider,
@@ -293,7 +310,7 @@ def parse_codex_json_events(
         final_text="\n".join(final_text_parts),
         usage=usage,
         raw_response=raw_events,
-        diagnostics={"line_count": len(lines), "event_count": len(raw_events)},
+        diagnostics=diagnostics,
     )
 
 
@@ -307,6 +324,7 @@ def parse_claude_stream_events(
     final_text_parts: list[str] = []
     raw_events: list[dict[str, Any]] = []
     usage: dict[str, Any] | None = None
+    error_event: dict[str, Any] | None = None
 
     for line in lines:
         stripped = line.strip()
@@ -330,7 +348,23 @@ def parse_claude_stream_events(
         event_usage = event.get("usage")
         if event_type == "result" and isinstance(event_usage, dict):
             usage = event_usage
+        # Provider-side errors (402 Insufficient Balance, 401 auth, 429
+        # rate limit, 5xx, etc.) come back as a terminal `result` event
+        # with `is_error: true`. The HTTP status is in `api_error_status`
+        # and the human message in `result`. Without this branch the
+        # whole event is silently dropped and upstream only sees
+        # `final_text=""` + `returncode != 0`, losing the cause.
+        if event_type == "result" and event.get("is_error"):
+            error_event = {
+                "api_error_status": event.get("api_error_status"),
+                "result_text": event.get("result"),
+                "duration_ms": event.get("duration_ms"),
+                "stop_reason": event.get("stop_reason"),
+            }
 
+    diagnostics: dict[str, Any] = {"line_count": len(lines), "event_count": len(raw_events)}
+    if error_event is not None:
+        diagnostics["error_event"] = error_event
     return LLMGenerateResult(
         runtime="local_cli",
         provider=provider,
@@ -339,7 +373,7 @@ def parse_claude_stream_events(
         final_text="\n".join(final_text_parts),
         usage=usage,
         raw_response=raw_events,
-        diagnostics={"line_count": len(lines), "event_count": len(raw_events)},
+        diagnostics=diagnostics,
     )
 
 
