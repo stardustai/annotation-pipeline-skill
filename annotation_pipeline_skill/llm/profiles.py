@@ -66,7 +66,7 @@ class LLMProfile:
 class LLMRegistry:
     profiles: dict[str, LLMProfile]
     targets: dict[str, str]
-    local_cli_global_concurrency: int | None = None
+    max_concurrent_tasks: int | None = None
 
     def resolve(self, target: str) -> LLMProfile:
         profile_name = self.targets.get(target)
@@ -96,8 +96,8 @@ def load_llm_registry(path: Path | str) -> LLMRegistry:
     limits = payload.get("limits") or {}
     if not isinstance(limits, dict):
         raise ProfileValidationError("LLM profile limits must be a mapping")
-    global_limit = _optional_positive_int(limits.get("local_cli_global_concurrency"), "limits.local_cli_global_concurrency")
-    registry = LLMRegistry(profiles=profiles, targets=targets, local_cli_global_concurrency=global_limit)
+    max_concurrent_tasks = _optional_positive_int(limits.get("max_concurrent_tasks"), "limits.max_concurrent_tasks")
+    registry = LLMRegistry(profiles=profiles, targets=targets, max_concurrent_tasks=max_concurrent_tasks)
     for target in targets:
         registry.resolve(target)
     return registry

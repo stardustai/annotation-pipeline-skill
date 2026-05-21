@@ -1577,10 +1577,17 @@ def _build_runtime_scheduler(
     context: RuntimeCliContext,
     config: RuntimeConfig | None = None,
 ) -> LocalRuntimeScheduler:
+    if config is None:
+        from dataclasses import replace
+        runtime_config = context.config.runtime
+        if getattr(context.registry, "max_concurrent_tasks", None) is not None:
+            runtime_config = replace(runtime_config, max_concurrent_tasks=context.registry.max_concurrent_tasks)
+    else:
+        runtime_config = config
     return LocalRuntimeScheduler(
         store=context.store,
         client_factory=lambda target: _build_llm_client(context.registry.resolve(target)),
-        config=config or context.config.runtime,
+        config=runtime_config,
     )
 
 

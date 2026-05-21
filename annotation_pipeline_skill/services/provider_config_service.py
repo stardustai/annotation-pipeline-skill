@@ -57,7 +57,7 @@ def build_provider_config_snapshot(
         "config_valid": True,
         "profiles": profiles,
         "targets": registry.targets,
-        "limits": {"local_cli_global_concurrency": registry.local_cli_global_concurrency},
+        "limits": {"max_concurrent_tasks": registry.max_concurrent_tasks},
         "diagnostics": diagnostics,
     }
 
@@ -153,7 +153,7 @@ def _payload_to_yaml_data(payload: Mapping[str, Any]) -> dict[str, Any]:
         "profiles": profiles,
         "targets": {str(target): str(profile_name) for target, profile_name in raw_targets.items()},
         "limits": {
-            "local_cli_global_concurrency": raw_limits.get("local_cli_global_concurrency"),
+            "max_concurrent_tasks": raw_limits.get("max_concurrent_tasks"),
         },
     }
 
