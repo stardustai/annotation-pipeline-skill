@@ -23,6 +23,7 @@ _SAFE_ENV_KEYS = {
     "LC_ALL",
     "CODEX_HOME",
     "ANNOTATION_CODEX_HOME_ROOT",
+    "ANNOTATION_CLAUDE_HOME_ROOT",
 }
 
 
@@ -30,6 +31,22 @@ class LocalCLIExecutionError(RuntimeError):
     def __init__(self, message: str, diagnostics: dict[str, Any]):
         super().__init__(message)
         self.diagnostics = diagnostics
+
+
+def _die_with_parent() -> None:
+    """preexec_fn that asks the kernel to SIGKILL this child when its parent
+    dies (Linux PR_SET_PDEATHSIG). Without this, a SIGKILLed runtime leaves
+    its claude/codex subprocesses as PPID=1 orphans that keep talking to the
+    provider — that's how the OAuth credentials got corrupted in the first
+    place. Silent no-op on non-Linux."""
+    try:
+        import ctypes
+        import signal as _signal
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # PR_SET_PDEATHSIG = 1; arg = signal to deliver on parent death
+        libc.prctl(1, _signal.SIGKILL, 0, 0, 0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def codex_shell_environment(env: Mapping[str, str] = os.environ) -> dict[str, str]:
@@ -48,6 +65,16 @@ def _parse_codex_handle(handle: str | None) -> tuple[str | None, str | None]:
         home_id, thread_id = handle.split("::", 1)
         return home_id, thread_id
     return None, handle  # legacy bare thread_id
+
+
+def _parse_claude_handle(handle: str | None) -> tuple[str | None, str | None]:
+    """Split 'home_id::session_id' into components. Legacy bare session_id is
+    treated as no handle: the session file lived in the user's real ~/.claude,
+    which the isolated runtime no longer touches, so resume would orphan-fail."""
+    if not handle or "::" not in handle:
+        return None, None
+    home_id, session_id = handle.split("::", 1)
+    return home_id, session_id
 
 
 def build_codex_command(
@@ -101,7 +128,11 @@ def build_claude_command(
     permission_mode: str | None,
     session_id: str | None = None,
 ) -> list[str]:
-    command = [binary, "-p"]
+    # --bare: never read OAuth / keychain / ~/.claude credentials. Auth is
+    # strictly ANTHROPIC_API_KEY (no token writeback can clobber real creds).
+    # Also skips hooks, auto-memory, CLAUDE.md auto-discovery, background
+    # prefetches — exactly the surface we don't want in a worker.
+    command = [binary, "--bare", "-p"]
     if session_id:
         command.extend(["--resume", session_id])
     else:
@@ -170,6 +201,39 @@ def isolated_codex_home(
         isolated_env["OPENAI_API_KEY"] = provider_api_key
     if provider_base_url:
         isolated_env["OPENAI_BASE_URL"] = provider_base_url
+
+    yield isolated_env, isolated_home, home_id
+
+
+@contextmanager
+def isolated_claude_home(
+    env: Mapping[str, str],
+    *,
+    home_id: str | None,
+    provider_api_key: str | None = None,
+    provider_base_url: str | None = None,
+) -> Iterator[tuple[dict[str, str], Path, str]]:
+    """Per-task isolated HOME for `claude --bare`. Never copies real ~/.claude;
+    auth comes from ANTHROPIC_API_KEY in the env. Defense-in-depth on top of
+    --bare so any path that bypasses --bare (skill plugin dirs, settings
+    lookup, history files) still cannot reach the user's real .claude tree."""
+    runtime_root = Path(env.get("ANNOTATION_CLAUDE_HOME_ROOT") or Path.cwd() / ".annotation-pipeline-claude-homes")
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    if home_id:
+        isolated_home = runtime_root / home_id
+        isolated_home.mkdir(parents=True, exist_ok=True)
+    else:
+        home_id = str(uuid.uuid4())
+        isolated_home = runtime_root / home_id
+        isolated_home.mkdir(parents=True, exist_ok=True)
+
+    isolated_env = codex_shell_environment(env)
+    isolated_env["HOME"] = str(isolated_home)
+    if provider_api_key:
+        isolated_env["ANTHROPIC_API_KEY"] = provider_api_key
+    if provider_base_url:
+        isolated_env["ANTHROPIC_BASE_URL"] = provider_base_url
 
     yield isolated_env, isolated_home, home_id
 
@@ -282,7 +346,8 @@ class LocalCLIClient:
         raise ValueError(f"unsupported runtime: {self.profile.runtime}")
 
     async def _generate_codex(self, request: LLMGenerateRequest) -> LLMGenerateResult:
-        home_id, thread_id = _parse_codex_handle(request.continuity_handle)
+        handle = None if self.profile.disable_continuity else request.continuity_handle
+        home_id, thread_id = _parse_codex_handle(handle)
         api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
         command, prompt_file = build_codex_command(
             binary="codex",
@@ -308,6 +373,7 @@ class LocalCLIClient:
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=_die_with_parent,
                 )
                 try:
                     stdout, stderr = await asyncio.wait_for(
@@ -341,7 +407,7 @@ class LocalCLIClient:
                 runtime=result.runtime,
                 provider=result.provider,
                 model=result.model,
-                continuity_handle=new_handle,
+                continuity_handle=None if self.profile.disable_continuity else new_handle,
                 final_text=result.final_text,
                 usage=result.usage,
                 raw_response=result.raw_response,
@@ -351,41 +417,45 @@ class LocalCLIClient:
             prompt_file.unlink(missing_ok=True)
 
     async def _generate_claude(self, request: LLMGenerateRequest) -> LLMGenerateResult:
+        handle = None if self.profile.disable_continuity else request.continuity_handle
+        home_id, session_id = _parse_claude_handle(handle)
+        api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
         command = build_claude_command(
             binary="claude",
             model=self.profile.model,
             permission_mode=self.profile.permission_mode,
-            session_id=request.continuity_handle,
+            session_id=session_id,
         )
         prompt = request.prompt or _messages_to_prompt(request.input_items)
         if request.instructions:
             prompt = f"{request.instructions}\n\n{prompt}"
-        env = {**os.environ, **request.env}
-        api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
-        if self.profile.base_url:
-            env["ANTHROPIC_BASE_URL"] = self.profile.base_url
-        if api_key:
-            env["ANTHROPIC_AUTH_TOKEN"] = api_key
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(request.cwd) if request.cwd else None,
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(prompt.encode("utf-8")),
-                timeout=self.profile.timeout_seconds,
+        with isolated_claude_home(
+            {**os.environ, **request.env},
+            home_id=home_id,
+            provider_api_key=api_key,
+            provider_base_url=self.profile.base_url,
+        ) as (env, _home, resolved_home_id):
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(request.cwd) if request.cwd else None,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=_die_with_parent,
             )
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            process.kill()
             try:
-                await process.wait()
-            except Exception:  # noqa: BLE001
-                pass
-            raise
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(prompt.encode("utf-8")),
+                    timeout=self.profile.timeout_seconds,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                process.kill()
+                try:
+                    await process.wait()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
         lines = stdout.decode("utf-8", errors="replace").splitlines()
         result = parse_claude_stream_events(lines, provider=self.profile.name, model=self.profile.model)
         diagnostics = dict(result.diagnostics or {})
@@ -394,11 +464,13 @@ class LocalCLIClient:
             diagnostics["stderr"] = stderr.decode("utf-8", errors="replace")[-4000:]
         if process.returncode != 0:
             raise LocalCLIExecutionError("local CLI provider failed", diagnostics)
+        new_session_id = result.continuity_handle
+        new_handle = f"{resolved_home_id}::{new_session_id}" if new_session_id else None
         return LLMGenerateResult(
             runtime=result.runtime,
             provider=result.provider,
             model=result.model,
-            continuity_handle=result.continuity_handle,
+            continuity_handle=None if self.profile.disable_continuity else new_handle,
             final_text=result.final_text,
             usage=result.usage,
             raw_response=result.raw_response,

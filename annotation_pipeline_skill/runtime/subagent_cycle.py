@@ -117,8 +117,26 @@ def _is_provider_permanent_error(exc: BaseException) -> bool:
     if isinstance(status, int) and status in {400, 401, 403, 404, 422}:
         return True
     text = str(exc).lower()
-    return any(s in text for s in ("not found", "unauthorized", "forbidden",
-                                    " 400 ", " 401 ", " 403 ", " 404 ", " 422 "))
+    if any(s in text for s in ("not found", "unauthorized", "forbidden",
+                                    " 400 ", " 401 ", " 403 ", " 404 ", " 422 ")):
+        return True
+    # LocalCLIExecutionError surfaces CLI exit failures with diagnostics
+    # (stderr, returncode). Subprocess providers don't raise SDK-style
+    # NotFoundError/AuthenticationError — they exit non-zero and bury the
+    # cause in stderr. Without this branch, OAuth-broken / bad-api-key /
+    # wrong-endpoint failures all classify as transient and back off
+    # forever instead of escalating.
+    diagnostics = getattr(exc, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        stderr_text = str(diagnostics.get("stderr") or "").lower()
+        if any(s in stderr_text for s in (
+            "unauthorized", "invalid api key", "invalid_api_key",
+            "authentication failed", "auth failed", "auth error",
+            "permission denied", "forbidden", "not authenticated",
+            "missing api key", " 401 ", " 403 ", " 404 ", " 422 ",
+        )):
+            return True
+    return False
 
 
 class SubagentRuntime:
@@ -260,6 +278,7 @@ class SubagentRuntime:
 
         annotation_started_at = utc_now()
         conventions_block = self._build_conventions_block(task)
+        continuation_handle = self._read_pinned_handle(task, "continuity_handle", stage_target)
         annotation_result = await self._generate_async(
             stage_target,
             LLMGenerateRequest(
@@ -268,8 +287,8 @@ class SubagentRuntime:
                     guideline=guideline,
                     conventions_block=conventions_block,
                 ),
-                prompt=self._annotation_prompt(task),
-                continuity_handle=self._read_pinned_handle(task, "continuity_handle", stage_target),
+                prompt=self._annotation_prompt(task, continuation_handle=continuation_handle),
+                continuity_handle=continuation_handle,
                 response_format={"type": "json_object"},
             ),
         )
@@ -345,6 +364,7 @@ class SubagentRuntime:
             task, "continuity_handle",
             annotation_result.continuity_handle, annotation_result.provider,
         )
+        self._snapshot_sent_feedback(task)
         # Validation runs against the CLEANED text so any auto-fix done in
         # _serialize_llm_json (boundary trims, near-verbatim alignments) is
         # what the validators see. Without this, validation parsed the raw
@@ -1246,6 +1266,32 @@ class SubagentRuntime:
                 "reason": "schema validation failed",
                 "target": {"errors": exc.errors},
             }
+        # Enforce row coverage: all source row_ids must appear in the output.
+        # Catches the case where the annotator silently skips rows with no
+        # entities instead of emitting them with empty dicts.
+        try:
+            source_rows = task.source_ref["payload"]["rows"]
+            if isinstance(source_rows, list) and source_rows:
+                source_ids = {r["row_id"] for r in source_rows if isinstance(r, dict) and "row_id" in r}
+                if source_ids:
+                    ann_rows = payload.get("rows", []) if isinstance(payload, dict) else []
+                    ann_ids = {r["row_id"] for r in ann_rows if isinstance(r, dict) and "row_id" in r}
+                    missing = source_ids - ann_ids
+                    if missing:
+                        missing_sorted = sorted(missing)[:5]
+                        return {
+                            "category": "missing_rows",
+                            "message": (
+                                f"Annotation is missing {len(source_ids - ann_ids)} of "
+                                f"{len(source_ids)} expected rows. "
+                                f"First missing row_ids: {missing_sorted}. "
+                                f"Every input row must appear in the output, even rows with no "
+                                f"entities (emit them with empty dicts)."
+                            ),
+                            "reason": "missing rows in annotation output",
+                        }
+        except (KeyError, TypeError):
+            pass
         # After the schema check, enforce verbatim — every annotated entity /
         # phrase string must exist in the corresponding input row's text.
         # Catches "annotator hallucinated a span" failures at validation time
@@ -2524,9 +2570,9 @@ class SubagentRuntime:
                         candidates_block = ""
                         if candidates:
                             candidates_block = (
-                                "\nCANDIDATE VERBATIM SPANS from this row's input.text that "
-                                "share words with the failed span (copy one of these exactly, "
-                                "or pick a different verbatim substring of input.text):\n  - "
+                                "\nCANDIDATE VERBATIM SPANS from this row's input.text "
+                                "(you MUST use one of these exactly as-is, character-for-character — "
+                                "do NOT paraphrase or choose your own wording):\n  - "
                                 + "\n  - ".join(repr(c) for c in candidates)
                             )
                         retry_note = (
@@ -2710,19 +2756,38 @@ class SubagentRuntime:
             + "\n".join(lines)
         )
 
-    def _annotation_prompt(self, task: Task) -> str:
+    def _annotation_prompt(self, task: Task, *, continuation_handle: str | None = None) -> str:
+        if continuation_handle is None:
+            return json.dumps(
+                {
+                    # Pass store so masked rows are filtered out before the
+                    # annotator sees them — masked = "doesn't exist" at every
+                    # downstream boundary.
+                    "task": _task_payload(task, store=self.store),
+                    "feedback_bundle": build_feedback_bundle(self.store, task.task_id),
+                    "prior_artifacts": self._artifact_context(task.task_id),
+                    "output_schema": resolve_output_schema(task, self.store),
+                },
+                sort_keys=True,
+            )
+        # Continuation turn: the server-side KV cache already holds the full
+        # context from turn 1. Send only feedback items the model hasn't seen
+        # yet so the prompt stays small and the cache prefix stays intact.
         return json.dumps(
-            {
-                # Pass store so masked rows are filtered out before the
-                # annotator sees them — masked = "doesn't exist" at every
-                # downstream boundary.
-                "task": _task_payload(task, store=self.store),
-                "feedback_bundle": build_feedback_bundle(self.store, task.task_id),
-                "prior_artifacts": self._artifact_context(task.task_id),
-                "output_schema": resolve_output_schema(task, self.store),
-            },
+            {"feedback_bundle": {"items": self._delta_feedback_items(task)}},
             sort_keys=True,
         )
+
+    def _delta_feedback_items(self, task: Task) -> list[dict]:
+        sent_ids: set[str] = set(task.metadata.get("_ann_sent_feedback_ids", []))
+        bundle = build_feedback_bundle(self.store, task.task_id)
+        return [item for item in bundle.get("items", []) if item["feedback_id"] not in sent_ids]
+
+    def _snapshot_sent_feedback(self, task: Task) -> None:
+        bundle = build_feedback_bundle(self.store, task.task_id)
+        task.metadata["_ann_sent_feedback_ids"] = [
+            item["feedback_id"] for item in bundle.get("items", [])
+        ]
 
     def _qc_prompt(self, task: Task, annotation_artifact: ArtifactRef) -> str:
         return json.dumps(
@@ -2805,12 +2870,26 @@ class SubagentRuntime:
                     k: v for k, v in payload.items()
                     if k not in {"raw_response", "usage", "diagnostics", "task_id"}
                 }
+                # arbiter_result.items is a per-feedback verdict list that
+                # duplicates feedback_bundle.items (same feedback_id keys).
+                # Strip from prompt context — feedback_bundle already carries
+                # the active dispute set, with discussion / consensus state.
+                if artifact.kind == "arbiter_result":
+                    payload = {k: v for k, v in payload.items() if k != "items"}
                 decision = payload.get("decision")
-                if isinstance(decision, dict) and "raw_response" in decision:
-                    payload = {
-                        **payload,
-                        "decision": {k: v for k, v in decision.items() if k != "raw_response"},
-                    }
+                if isinstance(decision, dict):
+                    drop_decision_keys = {"raw_response"}
+                    # arbiter_result.decision.corrected_annotation is a full
+                    # re-emission of the annotation JSON (~13 KB on a 10-row
+                    # task). The latest annotation_result.text already carries
+                    # it, so drop the duplicate from arbiter context.
+                    if artifact.kind == "arbiter_result":
+                        drop_decision_keys.add("corrected_annotation")
+                    if any(k in decision for k in drop_decision_keys):
+                        payload = {
+                            **payload,
+                            "decision": {k: v for k, v in decision.items() if k not in drop_decision_keys},
+                        }
             wrapper = {k: v for k, v in artifact.to_dict().items() if k not in {"path", "content_type"}}
             results.append({**wrapper, "payload": payload})
         return results
@@ -2935,6 +3014,10 @@ def _annotation_instructions(
         "phrase type (jsonStructureType enum or equivalent). "
         "Use ONLY those values — labels outside the schema's enums will be rejected by the validator. "
         "For text entity spans, copy exact contiguous text spans from task.source_ref.payload.text. "
+        "MANDATORY ROW COVERAGE: the output rows array MUST contain an entry for EVERY row in "
+        "task.source_ref.payload.rows, in the same order. If a row has no entities and no phrases, "
+        "still include it with empty dicts: {\"output\": {\"entities\": {}, \"json_structures\": {}}}. "
+        "Omitting any input row is a validation error that resets the task. "
         "For json_structures: on every row, scan the input text for instances of every phrase type the schema "
         "declares and populate json_structures with arrays of VERBATIM strings copied from the input — no "
         "character offsets, just the text itself. The pipeline rejects any span that isn't a substring of "

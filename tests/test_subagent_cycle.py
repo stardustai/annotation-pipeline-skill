@@ -1874,3 +1874,42 @@ def test_apply_arbiter_correction_rejects_non_verbatim_spans(tmp_path):
         f"guard in _apply_arbiter_correction should reject the 'beta' correction "
         f"because 'beta' is not in the input text 'alpha is mentioned here'"
     )
+
+
+def test_permanent_classifier_catches_cli_auth_failure_in_stderr():
+    """LocalCLIExecutionError surfaces CLI exit failures with diagnostics
+    (stderr, returncode). The bug we fixed: OAuth-broken claude exits with
+    'unauthorized' / '401' in stderr but the classifier only looked at
+    exception name + status_code, classifying it as transient and looping
+    forever instead of escalating to HR."""
+    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.runtime.subagent_cycle import (
+        _is_provider_permanent_error,
+    )
+
+    auth_err = LocalCLIExecutionError(
+        "local CLI provider failed",
+        {"stderr": "API Error: 401 Unauthorized — invalid api key",
+         "returncode": 1},
+    )
+    assert _is_provider_permanent_error(auth_err) is True
+
+    fwd_err = LocalCLIExecutionError(
+        "local CLI provider failed",
+        {"stderr": "Authentication failed", "returncode": 1},
+    )
+    assert _is_provider_permanent_error(fwd_err) is True
+
+    # 5xx in stderr should still be transient (not permanent).
+    transient = LocalCLIExecutionError(
+        "local CLI provider failed",
+        {"stderr": "API Error: 503 Service Unavailable", "returncode": 1},
+    )
+    assert _is_provider_permanent_error(transient) is False
+
+    # Generic error with no recognizable auth signal stays transient.
+    unknown = LocalCLIExecutionError(
+        "local CLI provider failed",
+        {"stderr": "connection reset by peer", "returncode": 1},
+    )
+    assert _is_provider_permanent_error(unknown) is False

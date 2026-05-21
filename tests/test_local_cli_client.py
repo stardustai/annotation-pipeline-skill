@@ -10,6 +10,7 @@ from annotation_pipeline_skill.llm.local_cli import (
     build_claude_command,
     build_codex_command,
     codex_shell_environment,
+    isolated_claude_home,
     isolated_codex_home,
     parse_claude_stream_events,
     parse_codex_json_events,
@@ -151,7 +152,7 @@ def test_build_claude_command_uses_stream_json_and_stdin_prompt():
         permission_mode="dontAsk",
     )
 
-    assert command[:2] == ["claude", "-p"]
+    assert command[:3] == ["claude", "--bare", "-p"]
     assert "--no-session-persistence" in command
     assert "--resume" not in command
     assert "--output-format" in command
@@ -169,9 +170,56 @@ def test_build_claude_command_uses_resume_when_session_id_provided():
         session_id="abcd-1234",
     )
 
+    assert "--bare" in command
     assert "--no-session-persistence" not in command
     assert command[command.index("--resume") + 1] == "abcd-1234"
     assert command[-1] == "-"
+
+
+def test_isolated_claude_home_creates_home_and_forces_HOME(tmp_path: Path):
+    runtime_root = tmp_path / "runtime"
+
+    with isolated_claude_home(
+        {
+            "ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root),
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "should-be-stripped",
+            "ANTHROPIC_API_KEY": "should-be-overridden",
+        },
+        home_id=None,
+        provider_api_key="sk-provider",
+        provider_base_url="https://api.example.com/anthropic",
+    ) as (env, isolated_home, home_id):
+        assert isolated_home.is_dir()
+        assert isolated_home.is_relative_to(runtime_root)
+        assert env["HOME"] == str(isolated_home)
+        assert env["ANTHROPIC_API_KEY"] == "sk-provider"
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+        # Unrelated keys are stripped — only the safe-key whitelist + injected auth
+        assert "OPENAI_API_KEY" not in env
+        # Crucially, no credential file or .claude subtree is seeded — auth lives
+        # only in env vars, so the subprocess has nothing to read or clobber.
+        assert not (isolated_home / ".credentials.json").exists()
+        assert not (isolated_home / ".claude").exists()
+        assert home_id and len(home_id) > 0
+
+
+def test_isolated_claude_home_reuses_home_id(tmp_path: Path):
+    runtime_root = tmp_path / "runtime"
+
+    with isolated_claude_home(
+        {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
+        home_id="stable-id",
+    ) as (_env, isolated_home, home_id):
+        assert home_id == "stable-id"
+        assert isolated_home == runtime_root / "stable-id"
+        (isolated_home / "marker").write_text("hi", encoding="utf-8")
+
+    with isolated_claude_home(
+        {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
+        home_id="stable-id",
+    ) as (_env, isolated_home, _home_id):
+        assert (isolated_home / "marker").read_text(encoding="utf-8") == "hi"
 
 
 def test_parse_claude_stream_events_extracts_text_and_usage():
@@ -231,6 +279,7 @@ async def test_local_codex_client_propagates_continuity_handle(tmp_path: Path, m
             )
 
     async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["preexec_fn"] = kwargs.get("preexec_fn")
         return FakeProcess()
 
     import annotation_pipeline_skill.llm.local_cli as local_cli
@@ -254,6 +303,7 @@ async def test_local_codex_client_propagates_continuity_handle(tmp_path: Path, m
     assert result.continuity_handle == "fake-home-id::thread-new"
     assert captured["thread_id"] is None
     assert captured["home_id"] is None
+    assert captured["preexec_fn"] is local_cli._die_with_parent
 
     # Resume call: handle parsed into home_id + thread_id
     result2 = await client.generate(
@@ -263,3 +313,139 @@ async def test_local_codex_client_propagates_continuity_handle(tmp_path: Path, m
     assert captured["thread_id"] == "thread-old"
     assert captured["iso_thread_id"] == "thread-old"
     assert result2.continuity_handle == "my-home::thread-new"
+
+
+@pytest.mark.asyncio
+async def test_local_claude_client_propagates_continuity_handle(tmp_path: Path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_build_claude_command(**kwargs):
+        captured["session_id"] = kwargs["session_id"]
+        return ["claude", "--bare", "-p", "-"]
+
+    @contextmanager
+    def fake_isolated_claude_home(env, *, home_id, provider_api_key=None, provider_base_url=None):
+        captured["home_id"] = home_id
+        captured["provider_api_key"] = provider_api_key
+        captured["provider_base_url"] = provider_base_url
+        resolved = home_id or "fake-home-id"
+        yield {"PATH": env.get("PATH", "")}, tmp_path, resolved
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, stdin=None):
+            return (
+                b'{"type":"system","session_id":"session-new"}\n'
+                b'{"type":"assistant","message":{"content":[{"type":"text","text":"{}"}]}}\n',
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["preexec_fn"] = kwargs.get("preexec_fn")
+        return FakeProcess()
+
+    import annotation_pipeline_skill.llm.local_cli as local_cli
+
+    monkeypatch.setattr(local_cli, "build_claude_command", fake_build_claude_command)
+    monkeypatch.setattr(local_cli, "isolated_claude_home", fake_isolated_claude_home)
+    monkeypatch.setattr(local_cli.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    client = LocalCLIClient(
+        LLMProfile(
+            name="claude_provider",
+            runtime="claude_cli",
+            model="claude-sonnet-4-5",
+            base_url="https://api.example.com/anthropic",
+            api_key_env="ANTHROPIC_API_KEY",
+            api_key="sk-test",
+        )
+    )
+
+    # First call: no prior handle → session_id=None, result gets home::session
+    result = await client.generate(LLMGenerateRequest(prompt="prompt"))
+    assert result.continuity_handle == "fake-home-id::session-new"
+    assert captured["session_id"] is None
+    assert captured["home_id"] is None
+    assert captured["provider_api_key"] == "sk-test"
+    assert captured["provider_base_url"] == "https://api.example.com/anthropic"
+    # PR_SET_PDEATHSIG wired up so a SIGKILLed runtime doesn't leave orphan
+    # claude children writing to ~/.claude/.credentials.json (the orphan
+    # leak that caused this whole bug class in the first place).
+    assert captured["preexec_fn"] is local_cli._die_with_parent
+
+    # Resume call: handle parsed into home_id + session_id
+    result2 = await client.generate(
+        LLMGenerateRequest(prompt="prompt", continuity_handle="my-home::session-old")
+    )
+    assert captured["home_id"] == "my-home"
+    assert captured["session_id"] == "session-old"
+    assert result2.continuity_handle == "my-home::session-new"
+
+    # Legacy bare session_id → cold start (cannot reuse orphaned session file)
+    captured.clear()
+    captured["session_id"] = "sentinel"
+    captured["home_id"] = "sentinel"
+    await client.generate(
+        LLMGenerateRequest(prompt="prompt", continuity_handle="legacy-bare-id")
+    )
+    assert captured["home_id"] is None
+    assert captured["session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_generate_claude_does_not_touch_real_credentials(tmp_path: Path, monkeypatch):
+    """Regression test for the bug where _generate_claude inherited HOME from
+    the user's shell and let `claude` rewrite ~/.claude/.credentials.json
+    while reusing third-party provider tokens. The fix routes the subprocess
+    through isolated_claude_home with a fresh HOME; this test pins that
+    invariant by asserting the subprocess env never points at the real home."""
+    real_home = tmp_path / "real_home"
+    (real_home / ".claude").mkdir(parents=True)
+    creds = real_home / ".claude" / ".credentials.json"
+    creds.write_text('{"do":"not-touch"}', encoding="utf-8")
+    original_mtime_ns = creds.stat().st_mtime_ns
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, stdin=None):
+            return (b'{"type":"system","session_id":"s"}\n', b"")
+
+    captured_env: dict[str, str] = {}
+
+    async def fake_create_subprocess_exec(*args, env, **kwargs):
+        captured_env.update(env)
+        return FakeProcess()
+
+    import annotation_pipeline_skill.llm.local_cli as local_cli
+
+    monkeypatch.setattr(local_cli.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("ANNOTATION_CLAUDE_HOME_ROOT", str(tmp_path / "iso_root"))
+
+    client = LocalCLIClient(
+        LLMProfile(
+            name="p",
+            runtime="claude_cli",
+            model="m",
+            base_url="https://api.example.com/anthropic",
+            api_key_env="ANTHROPIC_API_KEY",
+            api_key="sk-test",
+        )
+    )
+    await client.generate(LLMGenerateRequest(prompt="hi"))
+
+    # The subprocess MUST NOT inherit the user's real HOME — that's what
+    # let the previous code corrupt ~/.claude/.credentials.json.
+    assert captured_env["HOME"] != str(real_home)
+    assert Path(captured_env["HOME"]).is_relative_to(tmp_path / "iso_root")
+    # Auth flows through env vars only, never via a credentials file in the
+    # isolated home (so the subprocess has no file to read OR write back to).
+    assert captured_env["ANTHROPIC_API_KEY"] == "sk-test"
+    assert captured_env["ANTHROPIC_BASE_URL"] == "https://api.example.com/anthropic"
+    assert not (Path(captured_env["HOME"]) / ".credentials.json").exists()
+    assert not (Path(captured_env["HOME"]) / ".claude").exists()
+    # And the real credentials file is untouched.
+    assert creds.stat().st_mtime_ns == original_mtime_ns
+    assert creds.read_text(encoding="utf-8") == '{"do":"not-touch"}'

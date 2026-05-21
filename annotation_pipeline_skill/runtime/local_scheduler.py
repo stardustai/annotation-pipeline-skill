@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
@@ -33,6 +34,13 @@ class LocalRuntimeScheduler:
     # is expected to self-heal. A single transient bail resets the permanent
     # counter so an intermittent 4xx after gateway downtime doesn't escalate.
     PERMANENT_BAIL_CAP: int = 5
+    # Circuit breaker on TOTAL bails (transient + permanent + unclassified).
+    # Catches failure modes the permanent classifier doesn't recognize — e.g.
+    # corrupted local auth, subprocess hangs that timeout-bail forever, exotic
+    # provider error shapes. After this many consecutive bails on the same
+    # task, give up and escalate to HUMAN_REVIEW. Reset on any successful
+    # transition out of ANNOTATING.
+    TOTAL_BAIL_CAP: int = 25
 
     def __init__(
         self,
@@ -229,6 +237,12 @@ class LocalRuntimeScheduler:
                 # actually fires.
                 last_exception_was_permanent = False
                 last_exception_summary = ""
+                # Set when stop fires mid-task. Tells `finally` to skip the
+                # bail-counter logic — shutdown isn't a failure, and counting
+                # it would bump every in-flight task's bail count on every
+                # graceful restart, potentially tripping TOTAL_BAIL_CAP for
+                # tasks that were progressing fine.
+                stop_signaled_mid_task = False
                 try:
                     # Hard upper bound on a single task's run. If an LLM call
                     # (codex subprocess, HTTP stream) hangs past this, we cancel
@@ -243,15 +257,47 @@ class LocalRuntimeScheduler:
                         # Route to the dedicated resolver (which invokes a
                         # second arbiter) instead of the manual re-arbitrate
                         # flow that run_task_async would dispatch to.
-                        await asyncio.wait_for(
-                            runtime._resolve_first_arbiter_divergence_async(task),
-                            timeout=self.config.worker_task_timeout_seconds,
-                        )
+                        work_coro = runtime._resolve_first_arbiter_divergence_async(task)
                     else:
-                        await asyncio.wait_for(
-                            runtime.run_task_async(task, stage_target=stage_target),
+                        work_coro = runtime.run_task_async(task, stage_target=stage_target)
+                    # Race the task against the stop event so SIGTERM is
+                    # honored immediately, not after `worker_task_timeout`.
+                    # Plain `wait_for(coro, timeout=...)` ignores stop entirely:
+                    # 24 workers all mid-call meant shutdown sat for ~15min
+                    # before timeout reaped them, and SIGTERM looked dead.
+                    work_task = asyncio.create_task(work_coro)
+                    stop_wait_task = asyncio.create_task(stop.wait())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {work_task, stop_wait_task},
+                            return_when=asyncio.FIRST_COMPLETED,
                             timeout=self.config.worker_task_timeout_seconds,
                         )
+                        if not done:
+                            # Hard timeout — same semantics as old wait_for.
+                            work_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await work_task
+                            raise asyncio.TimeoutError
+                        if stop_wait_task in done and work_task not in done:
+                            # Shutdown signaled mid-task. Cancel work and drain
+                            # — _generate_claude / _generate_codex catch
+                            # CancelledError and SIGKILL the subprocess, so the
+                            # provider call dies promptly.
+                            stop_signaled_mid_task = True
+                            work_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await work_task
+                        else:
+                            # Work completed (success or exception). Re-raise
+                            # any exception so the except handlers below fire
+                            # with the same semantics as the old wait_for path.
+                            await work_task
+                    finally:
+                        if not stop_wait_task.done():
+                            stop_wait_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await stop_wait_task
                 except asyncio.TimeoutError:
                     import sys
                     print(
@@ -277,6 +323,14 @@ class LocalRuntimeScheduler:
                 finally:
                     self.store.delete_active_run(run.run_id)
                     self.store.delete_runtime_lease(lease.lease_id)
+                    # Shutdown-mid-task: release records and exit, but DO NOT
+                    # touch the bail counter. The task is interrupted, not
+                    # failed; the stale-lease reaper will pick it back up on
+                    # the next runtime start. Skipping the whole bail block
+                    # (rather than `continue`-ing) keeps control flow out of
+                    # the finally clause — that's a SyntaxWarning hazard in
+                    # newer Pythons and a hard error in some versions.
+                    do_bail_logic = not stop_signaled_mid_task
                     # If run_task_async bailed before reaching a terminal
                     # transition (LLM error, timeout, parse failure), the
                     # task is left in whatever in-flight state it last hit
@@ -288,12 +342,12 @@ class LocalRuntimeScheduler:
                     # at ~700 spurious audit events/min. Reset here closes
                     # the loop: next claim sees a clean PENDING task.
                     try:
-                        latest = self.store.load_task(task.task_id)
+                        latest = self.store.load_task(task.task_id) if do_bail_logic else None
                         # Only reset ANNOTATING. QC with runtime_next_stage=qc
                         # is a legitimate "wait for QC re-claim" exit state
                         # used by the QC parse-error retry path; leaving it
                         # alone lets the next worker run QC-only as designed.
-                        if latest.status is TaskStatus.ANNOTATING:
+                        if latest is not None and latest.status is TaskStatus.ANNOTATING:
                             from annotation_pipeline_skill.core.transitions import (
                                 InvalidTransition,
                                 transition_task,
@@ -332,28 +386,52 @@ class LocalRuntimeScheduler:
                                 latest.metadata["worker_permanent_bail_count"] = 0
                                 permanent_bails = 0
 
-                            if (
+                            # Two escalation triggers, either hits → HR:
+                            #   1. permanent error cap (5 consecutive 4xx-like)
+                            #   2. total bail cap — circuit breaker for failure
+                            #      modes the permanent classifier doesn't catch
+                            #      (corrupted auth, subprocess hangs, exotic
+                            #      provider error shapes). Without (2),
+                            #      misclassified-transient bugs loop forever.
+                            permanent_cap_hit = (
                                 last_exception_was_permanent
                                 and permanent_bails >= self.PERMANENT_BAIL_CAP
-                            ):
+                            )
+                            total_cap_hit = bails >= self.TOTAL_BAIL_CAP
+                            if permanent_cap_hit or total_cap_hit:
                                 latest.next_retry_at = None
+                                escalation_kind = (
+                                    "permanent_bail_cap"
+                                    if permanent_cap_hit
+                                    else "total_bail_cap"
+                                )
+                                if permanent_cap_hit:
+                                    reason = (
+                                        f"worker bailed with permanent provider error "
+                                        f"{permanent_bails} consecutive times "
+                                        f"(cap={self.PERMANENT_BAIL_CAP}); routing to "
+                                        f"human review "
+                                        f"(last: {(last_exception_summary or '')[:200]})"
+                                    )
+                                else:
+                                    reason = (
+                                        f"worker bailed {bails} consecutive times "
+                                        f"(total cap={self.TOTAL_BAIL_CAP}); routing "
+                                        f"to human review — likely systemic issue "
+                                        f"the permanent classifier didn't catch "
+                                        f"(last: {(last_exception_summary or '')[:200]})"
+                                    )
                                 try:
                                     event = transition_task(
                                         latest, TaskStatus.HUMAN_REVIEW,
                                         actor="scheduler",
-                                        reason=(
-                                            f"worker bailed with permanent provider error "
-                                            f"{permanent_bails} consecutive times "
-                                            f"(cap={self.PERMANENT_BAIL_CAP}); routing to "
-                                            f"human review "
-                                            f"(last: {(last_exception_summary or '')[:200]})"
-                                        ),
+                                        reason=reason,
                                         stage="recovery",
-                                        metadata={"recovery": "permanent_bail_cap",
+                                        metadata={"recovery": escalation_kind,
                                                   "previous_status": "annotating",
                                                   "worker_bail_count": bails,
                                                   "worker_permanent_bail_count": permanent_bails,
-                                                  "permanent_error": True},
+                                                  "permanent_error": last_exception_was_permanent},
                                     )
                                     self.store.save_task(latest)
                                     self.store.append_event(event)

@@ -21,6 +21,9 @@ projects/
 # Per-worker codex CLI homes (auto-created by local_cli.isolated_codex_home;
 # contains auth.json credentials + transient sqlite state — never commit).
 .annotation-pipeline-codex-homes/
+# Per-worker claude CLI homes (auto-created by local_cli.isolated_claude_home;
+# never contains credentials, but holds transient session/history files).
+.annotation-pipeline-claude-homes/
 # Local Claude Code settings.
 .claude/
 annotation_store/

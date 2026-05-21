@@ -400,3 +400,108 @@ def test_worker_task_timeout_releases_lease_on_hung_llm_call(tmp_path):
     # Lease/active_run released even though the LLM never returned
     assert store.list_runtime_leases() == []
     assert store.list_active_runs() == []
+
+
+def test_total_bail_cap_circuit_breaker_escalates_to_human_review(tmp_path):
+    """Bug 2b regression: when the permanent-error classifier doesn't catch
+    a failure mode (corrupted auth surfacing as a generic RuntimeError,
+    subprocess hangs that keep timing out, etc.), tasks would loop forever
+    in PENDING with growing backoff and never escalate. The TOTAL_BAIL_CAP
+    circuit breaker fires on any kind of bail."""
+    task = Task.new(task_id="task-1", pipeline_id="pipe", source_ref={"kind": "jsonl"})
+    task.status = TaskStatus.PENDING
+    # Seed the bail counter just below the cap so a single failing run trips
+    # it — keeps the test fast. The first claim cycle will see PENDING with
+    # bail_count=24, run the failing LLM, hit the worker_bail path with
+    # bails=25, which equals TOTAL_BAIL_CAP and escalates.
+    task.metadata["worker_bail_count"] = LocalRuntimeScheduler.TOTAL_BAIL_CAP - 1
+    store = SqliteStore.open(tmp_path)
+    store.save_task(task)
+
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=lambda target: FailingLLMClient(),
+        config=RuntimeConfig(max_concurrent_tasks=1),
+    )
+    scheduler.run_until_idle(stage_target="annotation", max_tasks=1)
+
+    loaded = store.load_task("task-1")
+    assert loaded.status is TaskStatus.HUMAN_REVIEW, (
+        f"expected HUMAN_REVIEW after {LocalRuntimeScheduler.TOTAL_BAIL_CAP} "
+        f"bails, got {loaded.status}"
+    )
+    assert loaded.metadata.get("worker_bail_count") >= LocalRuntimeScheduler.TOTAL_BAIL_CAP
+
+
+def test_stop_mid_task_exits_fast_and_does_not_bump_bail_counter(tmp_path):
+    """Bug 1 regression: with the old wait_for-only worker, SIGTERM during a
+    long LLM call meant the worker kept waiting until worker_task_timeout
+    fired (default 900s). The race-against-stop refactor makes shutdown
+    propagate within the cancellation latency of one async hop.
+
+    Also asserts the stop-set exit path does NOT count as a bail — graceful
+    restart should not bump every in-flight task's worker_bail_count, which
+    would otherwise trip TOTAL_BAIL_CAP after a few clean restarts.
+    """
+    import asyncio
+    import time
+
+    task = Task.new(task_id="task-1", pipeline_id="pipe", source_ref={"kind": "jsonl"})
+    task.status = TaskStatus.PENDING
+    initial_bail = 3
+    task.metadata["worker_bail_count"] = initial_bail
+    store = SqliteStore.open(tmp_path)
+    store.save_task(task)
+
+    # Client that sleeps "forever" so the worker is definitely mid-call when
+    # stop fires. 30s ceiling is well above the test's tolerance window but
+    # safe in case the cancellation path is broken — we don't want a hung
+    # test indefinitely.
+    class HangingClient:
+        async def generate(self, request):
+            await asyncio.sleep(30)
+            raise AssertionError("HangingClient.generate should have been cancelled")
+
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=lambda target: HangingClient(),
+        config=RuntimeConfig(
+            max_concurrent_tasks=1,
+            worker_task_timeout_seconds=60,  # well above the test's stop fire
+        ),
+    )
+
+    async def drive() -> float:
+        stop = asyncio.Event()
+        # Give the worker time to claim the task and start the LLM call before
+        # we signal stop. 0.3s is plenty for the claim + dispatch overhead.
+        async def trigger_stop_after_delay():
+            await asyncio.sleep(0.3)
+            stop.set()
+        trigger = asyncio.create_task(trigger_stop_after_delay())
+        t0 = time.monotonic()
+        await scheduler.run_forever(stage_target="annotation", stop_event=stop)
+        elapsed = time.monotonic() - t0
+        await trigger
+        return elapsed
+
+    elapsed = asyncio.run(drive())
+
+    # Cancellation latency budget — must exit way faster than the 60s
+    # worker_task_timeout, proving the race-against-stop is doing its job.
+    assert elapsed < 5.0, (
+        f"runtime took {elapsed:.1f}s to honor stop; before the race-against-"
+        f"stop fix this was 900s (worker_task_timeout). Should be sub-second."
+    )
+
+    loaded = store.load_task("task-1")
+    # Stop-mid-task: bail counter MUST NOT increment. The task is interrupted,
+    # not failed. Graceful restart that bumped every task's bail count would
+    # trip TOTAL_BAIL_CAP after a handful of clean restarts.
+    assert loaded.metadata.get("worker_bail_count") == initial_bail, (
+        f"stop-mid-task wrongly bumped bail counter from {initial_bail} to "
+        f"{loaded.metadata.get('worker_bail_count')}"
+    )
+    # Lease/active_run released cleanly so next runtime can re-claim.
+    assert store.list_runtime_leases() == []
+    assert store.list_active_runs() == []
