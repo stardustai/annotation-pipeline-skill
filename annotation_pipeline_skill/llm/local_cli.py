@@ -447,9 +447,11 @@ class LocalCLIClient:
             provider_api_key=api_key,
             provider_base_url=self.profile.base_url,
         ) as (env, _home, resolved_home_id):
-            # Materialize the per-invocation mcp-config.json INSIDE the
-            # isolated home so it's automatically cleaned up with the home
-            # (no separate try/finally).
+            # Materialize the per-invocation mcp-config.json inside the
+            # isolated home. The home is persistent across invocations
+            # (needed for session resume); this file is simply overwritten
+            # each call. No try/finally needed — the file has no secrets
+            # and the overwrite is idempotent.
             mcp_servers = self.profile.mcp_servers or []
             if mcp_servers:
                 mcp_payload = {
