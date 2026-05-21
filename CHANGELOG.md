@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Annotation knowledge base MCP tool (`check_past_experience`).** Annotator / QC / arbiter subagents launched via Claude CLI can now query the project's accumulated convention history on demand. The tool returns: current convention status + type, type distribution from past proposals, up to 3 diversity-selected sentence-level examples per type (via MinHash farthest-first sampling), and Zipf wordfreq metadata. Wired via `--mcp-config` and exposed by a stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`).
+- **`LLMProfile` schema additions:** `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring per-profile MCP server configurations and locking down built-in tools. LLM provider switching continues to use the existing `base_url` field — `isolated_claude_home` injects it into each subagent subprocess in isolation, leaving the operator's shell untouched.
+- **CJK fallback in `similarity.shingle()`.** Rows containing CJK Unified Ideographs (U+4E00–U+9FFF) or Extension A (U+3400–U+4DBF) are now segmented with jieba instead of degenerating to a single shingle. Improves both the knowledge-base diversity sampling and existing row_dedup precision on Chinese text.
+- **`annotation_pipeline_skill.text.wordfreq_utils.wordfreq_score`** shared helper, replacing a duplicate inline function previously in `interfaces/api.py`.
+- **`annotation_pipeline_skill.similarity.diverse.select_diverse_examples`** — MinHash-based farthest-first traversal sampler used to pick representative context snippets per (span, type) bucket.
+
+### Changed
+
+- **`EntityConventionService.record_decision()`** accepts two new optional kwargs: `row_id: str | None` and `row_content: str | None`. Proposals now carry a `context_snippet` window (±80 chars around the span, with ellipsis markers) and the originating `row_id`. The QC consensus path (`runtime/subagent_cycle.py`) and HR correction path (`services/human_review_service.py`) thread the trace data through automatically; operator-declared sites leave `row_id` and `row_content` unset.
+
+### Dependencies
+
+- Added `jieba` (CJK word segmentation; lazy-imported only when CJK chars are detected).
+- Added `mcp` (official MCP Python SDK; required by the new MCP server).
+
 ## 2026-05-17
 
 - V1.2 prior-driven verifier feature SHIPPED. Implementation complete
