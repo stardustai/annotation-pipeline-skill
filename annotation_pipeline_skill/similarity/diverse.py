@@ -29,8 +29,8 @@ def select_diverse_examples(snippets: list[str], k: int = 3) -> list[str]:
 
     Algorithm: farthest-first traversal. Seed with the lexicographically
     smallest snippet (deterministic), then repeatedly add the snippet
-    whose minimum Jaccard similarity to the already-selected set is
-    lowest (i.e., is farthest from the selected set).
+    whose maximum Jaccard similarity to the already-selected set is
+    smallest (i.e., the candidate farthest from its nearest already-selected neighbor).
     """
     # Deduplicate while preserving original ordering for tie-break stability.
     deduped: list[str] = []
