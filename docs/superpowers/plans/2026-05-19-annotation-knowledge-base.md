@@ -4,7 +4,7 @@
 
 **Goal:** Add a `check_past_experience(entry)` MCP tool that returns per-span convention, type distribution, diversity-selected sentence-level examples, and wordfreq meta to annotator/QC/arbiter subagents — sourced entirely from the existing `entity_conventions` table (extended with row trace fields).
 
-**Architecture:** A single-tool stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`) is launched by Claude CLI via `--mcp-config`. The tool queries `EntityConventionService`, groups proposals by type, selects ≤3 diverse `context_snippet` strings per type via MinHash + farthest-first, and pairs the result with Zipf wordfreq metadata. LLM provider switching already works in the project via the `LLMProfile.base_url` field (translated to `ANTHROPIC_BASE_URL` by `isolated_claude_home`) — no env-merge work is needed in this plan.
+**Architecture:** A single-tool stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`) is launched by Claude CLI via `--mcp-config`. The tool queries `EntityConventionService`, groups proposals by type, selects ≤3 diverse `context_snippet` strings per type via MinHash + farthest-first, and pairs the result with Zipf wordfreq metadata. LLM provider switching already works via the `LLMProfile.base_url` profile field — `isolated_claude_home` injects it into the subprocess environment in isolation (no shell state changed, no effect on the parent process). This plan does not require the operator to manage any environment variables.
 
 **Tech Stack:** Python 3.13, SQLite (existing `entity_conventions`), `mcp` Python SDK (new dep), `jieba` (new dep, lazy-loaded only when CJK detected), `wordfreq` (existing dep), `datasketch` (existing dep for MinHash).
 
@@ -35,7 +35,7 @@
 - `annotation_pipeline_skill/services/entity_convention_service.py` — extend `record_decision()` signature; persist `row_id` + `context_snippet` in proposals
 - `annotation_pipeline_skill/services/human_review_service.py` — update 2 `record_decision` call sites
 - `annotation_pipeline_skill/runtime/subagent_cycle.py` — update 1 `record_decision` call site
-- `annotation_pipeline_skill/llm/profiles.py` — add `mcp_servers`, `strict_mcp_config`, `disallowed_tools` fields to `LLMProfile` (the existing `base_url` field already handles provider switching)
+- `annotation_pipeline_skill/llm/profiles.py` — add `mcp_servers`, `strict_mcp_config`, `disallowed_tools` fields to `LLMProfile` (the existing `base_url` profile field already handles provider switching with subprocess-level isolation)
 - `annotation_pipeline_skill/llm/local_cli.py` — extend `build_claude_command()` to accept MCP flags; `_generate_claude()` materializes the per-invocation `mcp-config.json` inside the `isolated_claude_home` directory
 - `tests/test_similarity_minhash.py` — add CJK case tests
 - `pyproject.toml` — add `mcp` and `jieba` dependencies
@@ -1383,7 +1383,7 @@ git commit -m "feat(mcp): stdio server exposing check_past_experience"
 
 ## Task 8: LLMProfile schema — add `mcp_servers`, `disallowed_tools`, `strict_mcp_config`
 
-> **Schema note:** The project already uses a flat `runtime: claude_cli | codex_cli | …` schema (renamed from the old `provider: local_cli` + `cli_kind: …`). LLM provider switching already works via the existing `base_url` field — `isolated_claude_home` translates it to `ANTHROPIC_BASE_URL` automatically. This task only adds **three** new fields; `extra_env` is not needed.
+> **Schema note:** The project already uses a flat `runtime: claude_cli | codex_cli | …` schema. LLM provider switching already works via the existing `base_url` profile field (`isolated_claude_home` injects it into the subprocess in isolation — the operator never touches an env var). This task only adds **three** new fields.
 
 **Files:**
 - Modify: `annotation_pipeline_skill/llm/profiles.py:34-65, 106-…`
@@ -1537,14 +1537,14 @@ Expected: green. New fields are optional and default to `None` so existing profi
 
 ```bash
 git add annotation_pipeline_skill/llm/profiles.py tests/test_llm_profiles_mcp.py
-git commit -m "feat(profiles): add mcp_servers, strict_mcp_config, disallowed_tools, extra_env"
+git commit -m "feat(profiles): add mcp_servers, strict_mcp_config, disallowed_tools"
 ```
 
 ---
 
 ## Task 9: Wire MCP config into Claude CLI invocation
 
-> **Schema note:** `isolated_claude_home` already translates `profile.base_url` → `ANTHROPIC_BASE_URL` and `profile.resolve_api_key()` → `ANTHROPIC_API_KEY`. This task does **not** touch env composition — it only adds MCP-related CLI flags and the per-invocation `mcp-config.json` materialization. The tmp config file's lifetime is managed **inside** the `isolated_claude_home` context (so it's cleaned up at the same time as the isolated home root).
+> **Schema note:** `isolated_claude_home` already handles base_url and api_key injection into the subprocess in isolation. This task does **not** touch env composition — it only adds MCP-related CLI flags and the per-invocation `mcp-config.json` materialization. The tmp config file's lifetime is managed **inside** the `isolated_claude_home` context (so it's cleaned up at the same time as the isolated home root).
 
 **Files:**
 - Modify: `annotation_pipeline_skill/llm/local_cli.py:123-153` (`build_claude_command`)
@@ -1802,7 +1802,7 @@ Expected: green.
 
 ```bash
 git add annotation_pipeline_skill/llm/local_cli.py tests/test_local_cli_claude_mcp.py
-git commit -m "feat(local_cli): materialize MCP config + extra_env for Claude CLI launches"
+git commit -m "feat(local_cli): materialize MCP config inside isolated home for Claude CLI launches"
 ```
 
 ---
@@ -1878,39 +1878,19 @@ profiles:
     disallowed_tools: ["Bash", "Edit", "Write"]
 ```
 
-- [ ] **Step 10.4: Launch claude with the new profile via a small test harness**
+- [ ] **Step 10.4: Run a real subagent cycle through the runtime**
 
-Verify the runtime composes the correct command and reaches the tool. Two ways:
-
-**a) Through the runtime (preferred — tests the full integration):**
-
-Bind the new profile to a stage target (e.g. `annotation`) in the runtime config and run a single subagent cycle on a fixture task. The runtime will compose `claude` with `--mcp-config`, materialize the config inside the isolated home, and launch.
-
-**b) Standalone smoke test (faster, narrower):**
+Bind the new `annotator_claude_kb` profile to the `annotation` stage target in the project's runtime configuration, then trigger a single subagent cycle against a fixture task:
 
 ```bash
-ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-claude --bare -p --strict-mcp-config \
-  --mcp-config <(python -c "
-import json
-print(json.dumps({
-  'mcpServers': {
-    'annotation-kb': {
-      'command': 'python',
-      'args': ['-m', 'annotation_pipeline_skill.mcp.kb_server',
-               '--db-path', '/tmp/annotation-kb-fixture/.annotation-pipeline/db.sqlite',
-               '--project-id', 'memory-ner-v2']
-    }
-  }
-}))
-") \
-  --disallowedTools="Bash,Edit,Write" \
-  "Call the check_past_experience tool with entry='Android' and report what you see." <<< ""
+annotation-pipeline runtime once --project-root /tmp/annotation-kb-fixture
 ```
 
-Expected: claude prints output indicating it called the tool and received a response with `convention.type == "technology"` and 5 evidence proposals.
+The runtime composes `claude` with `--bare`, `--mcp-config <path-inside-isolated-home>`, `--strict-mcp-config`, `--disallowedTools=Bash,Edit,Write`, and `isolated_claude_home` injects `base_url` + `api_key` into the subprocess environment in isolation. The operator does **not** export or set anything in the shell — the parent process's env is untouched.
 
-> **Note on `ANTHROPIC_BASE_URL`:** for path (a) it's set automatically by `isolated_claude_home` from `profile.base_url`. For path (b), if you want to point at a non-Anthropic endpoint (DeepSeek, GLM, etc.), set `ANTHROPIC_BASE_URL` in the shell — the standalone test doesn't go through `isolated_claude_home`.
+Inspect the subagent's transcript (under the project's artifacts/ directory) and confirm the agent invoked `check_past_experience` with `entry="Android"` and received a response showing `convention.type == "technology"` and 5 evidence proposals.
+
+> Going through the runtime is the **only** verification path in this plan: it tests the production launch sequence (isolated home, env injection, MCP config materialization, tool-call round-trip) end-to-end without requiring the operator to manage shell state.
 
 - [ ] **Step 10.5: Update CHANGELOG**
 
@@ -1919,7 +1899,7 @@ Edit `CHANGELOG.md` and add an entry under the next unreleased version:
 ```markdown
 ### Added
 - `check_past_experience` MCP tool for annotator/QC/arbiter subagents: returns convention status, type distribution, diverse sentence-level examples, and wordfreq metadata for a candidate span. Wired via `--mcp-config` on Claude CLI subagents.
-- `LLMProfile` schema: `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring MCP servers and locking down built-in tools per profile. LLM provider switching continues to use the existing `base_url` field (translated to `ANTHROPIC_BASE_URL` by `isolated_claude_home`).
+- `LLMProfile` schema: `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring MCP servers and locking down built-in tools per profile. LLM provider switching continues to use the existing `base_url` field — `isolated_claude_home` injects it into each subagent subprocess in isolation, leaving the operator's shell untouched.
 - CJK fallback in `similarity.shingle()`: rows containing CJK characters are segmented with jieba instead of degenerating to a single shingle, improving both KB diversity sampling and existing row_dedup precision on Chinese text.
 
 ### Changed
@@ -1951,7 +1931,7 @@ Cross-check against the spec sections:
 | MCP server (kb_server.py) | Task 7 |
 | `mcp_servers` / `strict_mcp_config` / `disallowed_tools` profile fields | Task 8 |
 | `build_claude_command` MCP wiring | Task 9 |
-| LLM switching via `ANTHROPIC_BASE_URL` | Already in place via `LLMProfile.base_url` + `isolated_claude_home` — no new work required |
+| LLM switching via profile `base_url` (isolated subprocess env, no shell pollution) | Already in place via `LLMProfile.base_url` + `isolated_claude_home` — no new work required |
 | Tests (unit + integration smoke) | Tasks 1, 2, 3, 4, 6, 7, 8, 9 |
 | Manual Claude CLI verification | Task 10 |
 
@@ -1973,9 +1953,10 @@ No placeholders detected.
 
 The original plan was written against an older LLMProfile schema (`provider: local_cli` + `cli_kind: claude` + `cli_binary: claude`). The codebase has since migrated to a flat `runtime: claude_cli | codex_cli | …` schema with `base_url` as a required field and `isolated_claude_home` already translating `base_url` → `ANTHROPIC_BASE_URL`. Tasks 8, 9, and 10 were updated accordingly:
 
-- **Removed `extra_env` field** — `base_url` is already a `LLMProfile` field, and `isolated_claude_home` already exports it as `ANTHROPIC_BASE_URL`. No env-merge work needed.
+- **Removed `extra_env` field** — `base_url` is already a `LLMProfile` field, and `isolated_claude_home` already injects it into the subprocess in isolation. No env-merge work needed.
 - **Task 9 mcp-config.json materialization moved inside `isolated_claude_home`** — the tmp file lives at `<isolated_home>/mcp-config.json` and is cleaned up with the home. No separate try/finally.
 - **All yaml examples in Task 10 rewritten** to the flat `runtime:` schema.
 - **Task 5 line-number guidance softened** — added `grep -n record_decision` step to locate current line numbers rather than baking specific line numbers into the plan.
+- **Task 10 standalone smoke test removed** — the only verification path is now through the runtime, so the operator never touches shell env state. The parent process's environment remains untouched throughout the production launch sequence (subprocess env injection in `isolated_claude_home` does not modify `os.environ` or the user's shell).
 
 Tasks 1, 2, 3, 4, 6, 7 are unchanged — they touch modules (`text/`, `similarity/minhash.py`, `similarity/diverse.py`, `entity_convention_service.py`, new `mcp/` package) that the recent refactor did not affect.
