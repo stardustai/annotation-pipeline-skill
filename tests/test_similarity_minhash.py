@@ -97,3 +97,40 @@ def test_finder_skips_empty_text():
     clusters = finder.clusters(include_singletons=True)
     empty_clusters = [c for c in clusters if "empty" in c.task_ids]
     assert empty_clusters == [] or empty_clusters[0].task_ids == ["empty"]
+
+
+def test_shingle_pure_ascii_unchanged_by_cjk_gate():
+    text = "Telegram is faster than Facebook on my Redmi 3S"
+    grams = shingle(text, n=3)
+    # 9 tokens → 7 trigrams
+    assert len(grams) == 7
+    assert "telegram is faster" in grams
+    assert "my redmi 3s" in grams
+
+
+def test_shingle_cjk_uses_jieba_path():
+    text = "苹果的客户支持昨天帮我处理了退款问题"
+    grams = shingle(text, n=3)
+    # Should NOT be the degenerate single-shingle result.
+    assert len(grams) > 1
+    # Should contain semantically meaningful 3-grams of jieba tokens.
+    assert any("客户" in g for g in grams)
+
+
+def test_shingle_mixed_cjk_ascii_uses_jieba_path():
+    text = "TalkBack 在 Android 10 上经常崩溃"
+    grams = shingle(text, n=3)
+    # Mixed CJK + ASCII → jieba path produces more granular split than
+    # whitespace alone (which keeps '上经常崩溃' as one token).
+    joined = " | ".join(grams)
+    assert "经常" in joined
+    assert "崩溃" in joined
+
+
+def test_shingle_empty_string_returns_empty_set():
+    assert shingle("", n=3) == set()
+
+
+def test_shingle_short_cjk_returns_singleton():
+    grams = shingle("苹果", n=3)
+    assert grams == {"苹果"}

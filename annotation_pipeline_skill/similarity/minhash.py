@@ -19,16 +19,33 @@ from datasketch import MinHash, MinHashLSH
 from annotation_pipeline_skill.similarity.clusters import Cluster
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
 
 
 def shingle(text: str, n: int = 5) -> set[str]:
     """Word-level n-gram shingle set. Lowercases and collapses runs of
     whitespace so trivially-different spacing doesn't perturb the
-    fingerprint."""
+    fingerprint.
+
+    CJK fallback: when the input contains CJK Unified Ideographs (or
+    Extension A), tokens are produced by jieba word segmentation instead
+    of whitespace splitting. This rescues CJK rows from degenerating to
+    a single shingle (which makes Jaccard binary and useless for
+    diversity ranking or near-duplicate clustering). Pure-ASCII inputs
+    are unaffected — the jieba path is skipped entirely so existing
+    row_dedup behaviour is preserved.
+    """
     if not text:
         return set()
     normalized = _WHITESPACE_RE.sub(" ", text.lower()).strip()
-    tokens = normalized.split(" ")
+
+    if _CJK_RE.search(normalized):
+        # Lazy import: ASCII-only projects never pay the jieba load cost.
+        import jieba
+        tokens = [t for t in jieba.cut(normalized) if t.strip()]
+    else:
+        tokens = normalized.split(" ")
+
     if len(tokens) < n:
         return {normalized} if normalized else set()
     return {" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}
