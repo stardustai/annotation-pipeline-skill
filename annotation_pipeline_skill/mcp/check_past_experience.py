@@ -11,9 +11,6 @@ import json
 from collections import Counter
 from typing import Any
 
-from annotation_pipeline_skill.services.entity_convention_service import (
-    EntityConventionService,
-)
 from annotation_pipeline_skill.similarity.diverse import select_diverse_examples
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 from annotation_pipeline_skill.text.wordfreq_utils import wordfreq_score
