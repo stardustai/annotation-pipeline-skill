@@ -48,6 +48,9 @@ class LLMProfile:
     concurrency_limit: int | None = None
     no_progress_timeout_seconds: int | None = None
     disable_continuity: bool | None = None
+    mcp_servers: list[dict] | None = None
+    strict_mcp_config: bool | None = None
+    disallowed_tools: list[str] | None = None
 
     def resolve_api_key(self, env: Mapping[str, str] = os.environ) -> str:
         if self.api_key:
@@ -97,7 +100,11 @@ def load_llm_registry(path: Path | str) -> LLMRegistry:
     if not isinstance(limits, dict):
         raise ProfileValidationError("LLM profile limits must be a mapping")
     max_concurrent_tasks = _optional_positive_int(limits.get("max_concurrent_tasks"), "limits.max_concurrent_tasks")
-    registry = LLMRegistry(profiles=profiles, targets=targets, max_concurrent_tasks=max_concurrent_tasks)
+    registry = LLMRegistry(
+        profiles=profiles,
+        targets=targets,
+        max_concurrent_tasks=max_concurrent_tasks,
+    )
     for target in targets:
         registry.resolve(target)
     return registry
@@ -126,6 +133,9 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
         concurrency_limit=_optional_positive_int(raw.get("concurrency_limit"), f"profile {name} concurrency_limit"),
         no_progress_timeout_seconds=_optional_positive_int(raw.get("no_progress_timeout_seconds"), f"profile {name} no_progress_timeout_seconds"),
         disable_continuity=_optional_bool(raw.get("disable_continuity"), f"profile {name} disable_continuity"),
+        mcp_servers=_optional_mcp_servers(raw.get("mcp_servers"), f"profile {name} mcp_servers"),
+        strict_mcp_config=_optional_bool(raw.get("strict_mcp_config"), f"profile {name} strict_mcp_config"),
+        disallowed_tools=_optional_string_list(raw.get("disallowed_tools"), f"profile {name} disallowed_tools"),
     )
 
 
@@ -190,3 +200,33 @@ def _optional_non_negative_int(value: object, label: str) -> int | None:
     if parsed < 0:
         raise ProfileValidationError(f"invalid {label}")
     return parsed
+
+
+def _optional_mcp_servers(value: object, label: str) -> list[dict] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ProfileValidationError(f"{label} must be a list")
+    out: list[dict] = []
+    for i, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ProfileValidationError(f"{label}[{i}] must be a mapping")
+        name = entry.get("name")
+        command = entry.get("command")
+        args = entry.get("args", [])
+        if not isinstance(name, str) or not name.strip():
+            raise ProfileValidationError(f"{label}[{i}].name must be a non-empty string")
+        if not isinstance(command, str) or not command.strip():
+            raise ProfileValidationError(f"{label}[{i}].command must be a non-empty string")
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise ProfileValidationError(f"{label}[{i}].args must be a list of strings")
+        out.append({"name": name, "command": command, "args": list(args)})
+    return out
+
+
+def _optional_string_list(value: object, label: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ProfileValidationError(f"{label} must be a list of strings")
+    return list(value)
