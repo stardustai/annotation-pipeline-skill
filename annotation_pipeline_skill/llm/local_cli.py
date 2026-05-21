@@ -127,6 +127,9 @@ def build_claude_command(
     model: str,
     permission_mode: str | None,
     session_id: str | None = None,
+    mcp_config_path: Path | None = None,
+    strict_mcp_config: bool = False,
+    disallowed_tools: list[str] | None = None,
 ) -> list[str]:
     # --bare: never read OAuth / keychain / ~/.claude credentials. Auth is
     # strictly ANTHROPIC_API_KEY (no token writeback can clobber real creds).
@@ -146,6 +149,12 @@ def build_claude_command(
     ])
     if permission_mode:
         command.extend(["--permission-mode", permission_mode])
+    if mcp_config_path is not None:
+        command.extend(["--mcp-config", str(mcp_config_path)])
+        if strict_mcp_config:
+            command.append("--strict-mcp-config")
+    if disallowed_tools:
+        command.extend(["--disallowedTools", ",".join(disallowed_tools)])
     command.append("-")
     return command
 
@@ -425,6 +434,9 @@ class LocalCLIClient:
             model=self.profile.model,
             permission_mode=self.profile.permission_mode,
             session_id=session_id,
+            mcp_config_path=None,  # set inside the isolated_claude_home block below
+            strict_mcp_config=bool(self.profile.strict_mcp_config),
+            disallowed_tools=self.profile.disallowed_tools,
         )
         prompt = request.prompt or _messages_to_prompt(request.input_items)
         if request.instructions:
@@ -435,6 +447,29 @@ class LocalCLIClient:
             provider_api_key=api_key,
             provider_base_url=self.profile.base_url,
         ) as (env, _home, resolved_home_id):
+            # Materialize the per-invocation mcp-config.json INSIDE the
+            # isolated home so it's automatically cleaned up with the home
+            # (no separate try/finally).
+            mcp_servers = self.profile.mcp_servers or []
+            if mcp_servers:
+                mcp_payload = {
+                    "mcpServers": {
+                        s["name"]: {"command": s["command"], "args": s["args"]}
+                        for s in mcp_servers
+                    }
+                }
+                mcp_config_path = _home / "mcp-config.json"
+                mcp_config_path.write_text(json.dumps(mcp_payload), encoding="utf-8")
+                # Rebuild the command now that we have a real path.
+                command = build_claude_command(
+                    binary="claude",
+                    model=self.profile.model,
+                    permission_mode=self.profile.permission_mode,
+                    session_id=session_id,
+                    mcp_config_path=mcp_config_path,
+                    strict_mcp_config=bool(self.profile.strict_mcp_config),
+                    disallowed_tools=self.profile.disallowed_tools,
+                )
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(request.cwd) if request.cwd else None,
