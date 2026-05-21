@@ -274,23 +274,29 @@ export function PosteriorAuditPanel({
               flexWrap: "wrap",
             }}
           >
-            <nav className="view-tabs" aria-label="Audit sections" style={{ margin: 0 }}>
+            <nav className="sub-tabs" aria-label="Audit sections" role="tablist">
               <button
-                className={subtab === "deviations" ? "view-tab selected" : "view-tab"}
+                className={subtab === "deviations" ? "sub-tab selected" : "sub-tab"}
+                role="tab"
+                aria-selected={subtab === "deviations"}
                 type="button"
                 onClick={() => { setSubtab("deviations"); setFilter(""); }}
               >
                 Task deviations ({deviations.length})
               </button>
               <button
-                className={subtab === "contested" ? "view-tab selected" : "view-tab"}
+                className={subtab === "contested" ? "sub-tab selected" : "sub-tab"}
+                role="tab"
+                aria-selected={subtab === "contested"}
                 type="button"
                 onClick={() => { setSubtab("contested"); setFilter(""); }}
               >
                 Divergent annotations ({contested.length})
               </button>
               <button
-                className={subtab === "low_info" ? "view-tab selected" : "view-tab"}
+                className={subtab === "low_info" ? "sub-tab selected" : "sub-tab"}
+                role="tab"
+                aria-selected={subtab === "low_info"}
                 type="button"
                 onClick={() => { setSubtab("low_info"); setFilter(""); }}
               >

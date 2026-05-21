@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   fetchKanbanSnapshot,
   fetchProjects,
+  fetchRuntimeMonitor,
   fetchStores,
   fetchTaskDetail,
   postHumanReviewDecision,
@@ -13,12 +14,12 @@ import { AnnotationRulesPanel } from "./components/AnnotationRulesPanel";
 import { SchemaPanel } from "./components/SchemaPanel";
 import { EventLogPanel } from "./components/EventLogPanel";
 import { EntityKnowledgePanel } from "./components/EntityKnowledgePanel";
-import { TypeStatisticsPanel } from "./components/TypeStatisticsPanel";
 import { KanbanBoard } from "./components/KanbanBoard";
 import { OutputPanel } from "./components/OutputPanel";
-// Lazy-loaded: the Distribution panel pulls plotly.js-dist-min (~3 MB) into the
-// bundle. Keep it off the critical path so the rest of the dashboard loads fast;
-// the plotly chunk only ships when the operator clicks the Distribution tab.
+// Lazy-loaded: the Statistics panel pulls plotly.js-dist-min (~3 MB) into the
+// bundle (via the Scatter plot sub-tab). Keep it off the critical path so the
+// rest of the dashboard loads fast; plotly only ships when the operator opens
+// the Statistics tab.
 const DistributionPanel = lazy(() =>
   import("./components/DistributionPanel").then((m) => ({ default: m.DistributionPanel })),
 );
@@ -31,7 +32,27 @@ import type { KanbanSnapshot, ProjectSummary, StoreInfo, TaskCard, TaskDetail } 
 import { useUrlState, type UrlState } from "./url_state";
 
 const emptySnapshot: KanbanSnapshot = { project_id: null, columns: [] };
-type ViewMode = "kanban" | "runtime" | "output" | "providers" | "config" | "events" | "annotation-rules" | "schema" | "posterior-audit" | "entity-knowledge" | "distribution" | "statistics";
+// Top-level dashboard tabs. "statistics" hosts Duplicates+Scatter+Statistics
+// sub-tabs; "annotation-rules" hosts Guidelines+Schema sub-tabs.
+type ViewMode =
+  | "kanban"
+  | "statistics"
+  | "annotation-rules"
+  | "runtime"
+  | "providers"
+  | "config"
+  | "events"
+  | "entity-knowledge"
+  | "posterior-audit"
+  | "output";
+
+// Backward-compatible aliases for old URLs that still link to the
+// since-merged standalone tabs.
+function canonicalizeViewMode(raw: string): ViewMode {
+  if (raw === "distribution") return "statistics";
+  if (raw === "schema") return "annotation-rules";
+  return raw as ViewMode;
+}
 
 const urlDefaults: UrlState = { view: "kanban", store: null, project: null, task: null };
 
@@ -54,7 +75,40 @@ export default function App() {
   const selectedStoreKey = urlState.store;
   const selectedProjectId = urlState.project;
   const selectedTaskId = urlState.task;
-  const viewMode = urlState.view as ViewMode;
+  const viewMode = canonicalizeViewMode(urlState.view);
+  // Sub-tab state for Annotation Rules (Guidelines vs Schema). Kept in App
+  // so the top-tab restructure doesn't force AnnotationRulesPanel to grow
+  // a Schema-aware mode.
+  const [annotationRulesSubtab, setAnnotationRulesSubtab] = useState<"guidelines" | "schema">("guidelines");
+  // Aliased URL ?view=schema → land directly on the Schema sub-tab.
+  useEffect(() => {
+    if (urlState.view === "schema") setAnnotationRulesSubtab("schema");
+  }, [urlState.view]);
+
+  // ── Runtime issue badge ───────────────────────────────────────────────
+  // Poll the runtime monitor every 30s so the Runtime tab can show a red
+  // dot + failure count even when the operator is on a different tab.
+  const [runtimeIssueCount, setRuntimeIssueCount] = useState(0);
+  useEffect(() => {
+    let active = true;
+    let timer: number | null = null;
+    async function poll() {
+      try {
+        const report = await fetchRuntimeMonitor(selectedStoreKey);
+        if (!active) return;
+        setRuntimeIssueCount(report.ok ? 0 : report.failures.length);
+      } catch {
+        if (active) setRuntimeIssueCount(0);
+      } finally {
+        if (active) timer = window.setTimeout(poll, 30000);
+      }
+    }
+    poll();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [selectedStoreKey]);
 
   const [selectedDetail, setSelectedDetail] = useState<TaskDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -227,42 +281,101 @@ export default function App() {
 
       <DashboardStatsBar projectId={selectedProjectId} storeKey={selectedStoreKey} />
 
-      <nav className="view-tabs" aria-label="Dashboard views">
-        <button className={viewMode === "kanban" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("kanban")}>
+      <nav className="view-tabs" aria-label="Dashboard views" role="tablist">
+        <button
+          className={viewMode === "kanban" ? "view-tab kanban-tab selected" : "view-tab kanban-tab"}
+          role="tab"
+          aria-selected={viewMode === "kanban"}
+          type="button"
+          onClick={() => setView("kanban")}
+        >
           Kanban
         </button>
-        <button className={viewMode === "runtime" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("runtime")}>
-          Runtime
+        <button
+          className={viewMode === "statistics" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "statistics"}
+          type="button"
+          onClick={() => setView("statistics")}
+        >
+          Statistics
         </button>
-        <button className={viewMode === "output" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("output")}>
-          Export
-        </button>
-        <button className={viewMode === "providers" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("providers")}>
-          Providers
-        </button>
-        <button className={viewMode === "config" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("config")}>
-          Configuration
-        </button>
-        <button className={viewMode === "events" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("events")}>
-          Event Log
-        </button>
-        <button className={viewMode === "annotation-rules" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("annotation-rules")}>
+        <button
+          className={viewMode === "annotation-rules" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "annotation-rules"}
+          type="button"
+          onClick={() => setView("annotation-rules")}
+        >
           Annotation Rules
         </button>
-        <button className={viewMode === "schema" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("schema")}>
-          Schema
+        <button
+          className={viewMode === "runtime" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "runtime"}
+          type="button"
+          onClick={() => setView("runtime")}
+        >
+          Runtime
+          {runtimeIssueCount > 0 ? (
+            <span className="view-tab-badge" aria-label={`${runtimeIssueCount} runtime issues`}>
+              {runtimeIssueCount}
+            </span>
+          ) : null}
         </button>
-        <button className={viewMode === "posterior-audit" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("posterior-audit")}>
-          Posterior Audit
+        <button
+          className={viewMode === "providers" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "providers"}
+          type="button"
+          onClick={() => setView("providers")}
+        >
+          Providers
         </button>
-        <button className={viewMode === "entity-knowledge" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("entity-knowledge")}>
+        <button
+          className={viewMode === "config" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "config"}
+          type="button"
+          onClick={() => setView("config")}
+        >
+          Configuration
+        </button>
+        <button
+          className={viewMode === "events" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "events"}
+          type="button"
+          onClick={() => setView("events")}
+        >
+          Event Log
+        </button>
+        <button
+          className={viewMode === "entity-knowledge" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "entity-knowledge"}
+          type="button"
+          onClick={() => setView("entity-knowledge")}
+        >
           Entity Knowledge
         </button>
-        <button className={viewMode === "distribution" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("distribution")}>
-          Distribution
+        <button
+          className={viewMode === "posterior-audit" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "posterior-audit"}
+          type="button"
+          onClick={() => setView("posterior-audit")}
+        >
+          Posterior Audit
         </button>
-        <button className={viewMode === "statistics" ? "view-tab selected" : "view-tab"} type="button" onClick={() => setView("statistics")}>
-          Statistics
+        <button
+          className={viewMode === "output" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "output"}
+          type="button"
+          onClick={() => setView("output")}
+        >
+          Export
         </button>
       </nav>
 
@@ -283,8 +396,32 @@ export default function App() {
       {viewMode === "providers" ? <ProvidersPanel /> : null}
       {viewMode === "config" ? <ConfigPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "events" ? <EventLogPanel projectId={selectedProjectId} storeKey={selectedStoreKey} /> : null}
-      {viewMode === "annotation-rules" ? <AnnotationRulesPanel storeKey={selectedStoreKey} /> : null}
-      {viewMode === "schema" ? <SchemaPanel storeKey={selectedStoreKey} /> : null}
+      {viewMode === "annotation-rules" ? (
+        <section className="runtime-panel" aria-label="Annotation rules and schema">
+          <nav className="sub-tabs" aria-label="Annotation rules sections" role="tablist">
+            <button
+              className={annotationRulesSubtab === "guidelines" ? "sub-tab selected" : "sub-tab"}
+              role="tab"
+              aria-selected={annotationRulesSubtab === "guidelines"}
+              type="button"
+              onClick={() => setAnnotationRulesSubtab("guidelines")}
+            >
+              Guidelines
+            </button>
+            <button
+              className={annotationRulesSubtab === "schema" ? "sub-tab selected" : "sub-tab"}
+              role="tab"
+              aria-selected={annotationRulesSubtab === "schema"}
+              type="button"
+              onClick={() => setAnnotationRulesSubtab("schema")}
+            >
+              Schema
+            </button>
+          </nav>
+          {annotationRulesSubtab === "guidelines" ? <AnnotationRulesPanel storeKey={selectedStoreKey} /> : null}
+          {annotationRulesSubtab === "schema" ? <SchemaPanel storeKey={selectedStoreKey} /> : null}
+        </section>
+      ) : null}
       {viewMode === "posterior-audit" ? (
         <PosteriorAuditPanel
           projectId={selectedProjectId}
@@ -312,17 +449,14 @@ export default function App() {
       {viewMode === "entity-knowledge" ? (
         <EntityKnowledgePanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
       ) : null}
-      {viewMode === "distribution" ? (
-        <Suspense fallback={<div className="runtime-muted" style={{ padding: "2rem" }}>Loading Distribution panel…</div>}>
+      {viewMode === "statistics" ? (
+        <Suspense fallback={<div className="runtime-muted" style={{ padding: "2rem" }}>Loading Statistics panel…</div>}>
           <DistributionPanel
             projectId={selectedProjectId}
             storeKey={selectedStoreKey}
             onSelectTask={(tid) => setTask(tid)}
           />
         </Suspense>
-      ) : null}
-      {viewMode === "statistics" ? (
-        <TypeStatisticsPanel projectId={selectedProjectId} storeKey={selectedStoreKey} />
       ) : null}
       <TaskDrawer
         task={selectedTask}

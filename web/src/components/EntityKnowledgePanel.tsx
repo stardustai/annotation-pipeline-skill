@@ -55,23 +55,16 @@ export function EntityKnowledgePanel({
 
   async function handleUnset(span: string | null) {
     if (!projectId || !span) return;
-    if (
-      !window.confirm(
-        `Unset the project convention for '${span}'? This removes the rule from future prompts. Any task annotations already modified via Apply-to-all are NOT reverted.`,
-      )
-    ) {
-      return;
-    }
+    // No confirm dialog, no re-fetch: drop the row only AFTER the API
+    // confirms the delete, so a failed call leaves the row visible with
+    // an error rather than silently re-appearing on next refresh.
     setUnsetting(span);
     setError(null);
     try {
       await clearConvention(projectId, span, storeKey);
-      // Optimistically drop from the in-memory list so the row vanishes
-      // immediately; re-fetch in the background for the source of truth.
       setConventions((prev) =>
         prev ? prev.filter((c) => (c.span ?? "").toLowerCase() !== span.toLowerCase()) : prev,
       );
-      fetchData("conventions");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -168,16 +161,20 @@ export function EntityKnowledgePanel({
         </button>
       </div>
 
-      <nav className="view-tabs" aria-label="Knowledge tabs" style={{ marginBottom: 0 }}>
+      <nav className="sub-tabs" aria-label="Knowledge tabs" role="tablist">
         <button
-          className={subtab === "conventions" ? "view-tab selected" : "view-tab"}
+          className={subtab === "conventions" ? "sub-tab selected" : "sub-tab"}
+          role="tab"
+          aria-selected={subtab === "conventions"}
           type="button"
           onClick={() => setSubtab("conventions")}
         >
           Conventions ({conventions?.length ?? "…"})
         </button>
         <button
-          className={subtab === "statistics" ? "view-tab selected" : "view-tab"}
+          className={subtab === "statistics" ? "sub-tab selected" : "sub-tab"}
+          role="tab"
+          aria-selected={subtab === "statistics"}
           type="button"
           onClick={() => setSubtab("statistics")}
         >

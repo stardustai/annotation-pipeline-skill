@@ -5,6 +5,7 @@ import React, { lazy, Suspense, useEffect, useMemo, useState } from "react";
 // Duplicates view is instant; plotly only ships when the operator actually
 // switches to the Scatter plot sub-tab.
 const ScatterSubTab = lazy(() => import("./ScatterSubTab"));
+import { TypeStatisticsPanel } from "./TypeStatisticsPanel";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -109,7 +110,8 @@ export type RowDedupCacheResponse = {
 // and aren't found. Row-level dedup catches the real cases, so the
 // task-level UI was deleted; "duplicates" now IS row-level. The
 // /api/distribution endpoints are still wired for the Scatter plot.
-type Subtab = "duplicates" | "scatter";
+// "statistics" hosts the type-frequency panel that used to be its own tab.
+type Subtab = "duplicates" | "scatter" | "statistics";
 
 export type DistributionPanelProps = {
   projectId: string | null;
@@ -302,24 +304,35 @@ export function DistributionPanel({
       {error ? <div className="notice compact">{error}</div> : null}
 
       {/* ── Sub-tab nav ──────────────────────────────────────────────── */}
-      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-        <nav className="view-tabs" aria-label="Distribution sections" style={{ margin: 0 }}>
+      <nav className="sub-tabs" aria-label="Statistics sections" role="tablist">
           <button
-            className={subtab === "duplicates" ? "view-tab selected" : "view-tab"}
+            className={subtab === "duplicates" ? "sub-tab selected" : "sub-tab"}
+            role="tab"
+            aria-selected={subtab === "duplicates"}
             type="button"
             onClick={() => setSubtab("duplicates")}
           >
             Duplicates ({rowDedupClusterCount})
           </button>
           <button
-            className={subtab === "scatter" ? "view-tab selected" : "view-tab"}
+            className={subtab === "scatter" ? "sub-tab selected" : "sub-tab"}
+            role="tab"
+            aria-selected={subtab === "scatter"}
             type="button"
             onClick={() => setSubtab("scatter")}
           >
             Scatter plot
           </button>
-        </nav>
-      </div>
+          <button
+            className={subtab === "statistics" ? "sub-tab selected" : "sub-tab"}
+            role="tab"
+            aria-selected={subtab === "statistics"}
+            type="button"
+            onClick={() => setSubtab("statistics")}
+          >
+            Statistics
+          </button>
+      </nav>
 
       {/* ── Duplicates sub-tab (row-level) ──────────────────────────── */}
       {subtab === "duplicates" ? (
@@ -441,6 +454,13 @@ export function DistributionPanel({
                 : <>No scan yet. Click <strong>Scan</strong> above to embed all tasks (UMAP + HDBSCAN, may take minutes the first time).</>}
             </div>
           )}
+        </div>
+      ) : null}
+
+      {/* ── Statistics sub-tab (entity / phrase type frequencies) ────── */}
+      {subtab === "statistics" ? (
+        <div style={{ marginTop: "0.75rem" }}>
+          <TypeStatisticsPanel projectId={projectId} storeKey={storeKey} />
         </div>
       ) : null}
     </section>

@@ -185,34 +185,170 @@ button {
 }
 
 .view-tabs {
+  border-bottom: 1px solid #d7e0e5;
   display: flex;
-  gap: 8px;
+  gap: 2px;
   margin: 0 auto 14px;
   max-width: 1680px;
+  flex-wrap: wrap;
 }
 
-.view-tab,
-.primary-button {
-  background: #ffffff;
-  border: 1px solid #cfd9df;
-  border-radius: 6px;
+.view-tab {
+  align-items: center;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #52616b;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 600;
+  gap: 6px;
+  margin-bottom: -1px;
+  padding: 8px 14px;
+  position: relative;
+}
+
+.view-tab:hover {
   color: #172026;
+}
+
+.view-tab.selected {
+  border-bottom-color: #2f6f73;
+  color: #2f6f73;
+}
+
+.view-tab.danger {
+  color: #7a2b12;
+}
+
+/* Rainbow accent on the primary Kanban tab so it visually anchors the bar. */
+.view-tab.kanban-tab {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 99, 99, 0.10),
+    rgba(255, 184, 76, 0.10),
+    rgba(255, 232, 102, 0.10),
+    rgba(120, 219, 130, 0.10),
+    rgba(86, 175, 235, 0.10),
+    rgba(170, 110, 230, 0.10)
+  );
+  background-size: 200% 100%;
+  background-position: 0% 50%;
+  border-radius: 4px 4px 0 0;
+  font-weight: 700;
+  position: relative;
+  transition: background-position 800ms ease;
+}
+
+.view-tab.kanban-tab:hover {
+  background-position: 100% 50%;
+}
+
+.view-tab.kanban-tab::after {
+  background: linear-gradient(
+    90deg,
+    #ff6363,
+    #ffb84c,
+    #ffe866,
+    #78db82,
+    #56afeb,
+    #aa6ee6
+  );
+  background-size: 200% 100%;
+  background-position: 0% 0%;
+  bottom: -2px;
+  content: "";
+  height: 2px;
+  left: 0;
+  position: absolute;
+  right: 0;
+  border-radius: 2px;
+}
+
+.view-tab.kanban-tab.selected {
+  color: #1a1f24;
+}
+
+.view-tab.kanban-tab.selected::after {
+  animation: kanban-rainbow-shift 4s linear infinite;
+  height: 3px;
+}
+
+@keyframes kanban-rainbow-shift {
+  0% { background-position: 0% 0%; }
+  100% { background-position: 200% 0%; }
+}
+
+/* Pill-style sub-tabs (used inside Statistics, Annotation Rules, Entity Knowledge).
+   Distinct from the top .view-tab underline style so the visual hierarchy
+   reads "top tabs > sub-tabs" at a glance. */
+.sub-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: #eef2f5;
+  border: 1px solid #d7e0e5;
+  border-radius: 999px;
+  /* Self-center on the row in every parent layout we use:
+     - ``width: fit-content`` shrinks the pill to its content.
+     - ``margin: 0 auto`` handles block-flow parents.
+     - ``justify-self: center`` handles grid parents (e.g. .runtime-panel
+       is display:grid and would otherwise stretch us across the full
+       grid track, making the pill page-wide).
+     - ``align-self: center`` handles flex-column parents.            */
+  width: fit-content;
+  margin: 0 auto 12px;
+  justify-self: center;
+  align-self: center;
+}
+
+.sub-tab {
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  color: #52616b;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 7px 18px;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.sub-tab:hover {
+  color: #172026;
+}
+
+.sub-tab.selected {
+  background: #ffffff;
+  color: #214f55;
+  box-shadow: 0 1px 2px rgba(20, 30, 40, 0.10);
+}
+
+/* Red badge on the Runtime tab when failures > 0 */
+.view-tab-badge {
+  background: #d23a2a;
+  border-radius: 999px;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  min-width: 18px;
+  padding: 3px 6px;
+  text-align: center;
+  box-shadow: 0 0 0 2px rgba(210, 58, 42, 0.18);
+}
+
+.primary-button {
+  background: #214f55;
+  border: 1px solid #214f55;
+  border-radius: 6px;
+  color: #ffffff;
   cursor: pointer;
   font-size: 13px;
   font-weight: 680;
   min-height: 34px;
   padding: 7px 12px;
-}
-
-.view-tab.selected,
-.primary-button {
-  background: #214f55;
-  border-color: #214f55;
-  color: #ffffff;
-}
-
-.view-tab.danger {
-  color: #7a2b12;
 }
 
 .primary-button:disabled {
