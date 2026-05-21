@@ -161,6 +161,12 @@ class SubagentRuntime:
     ):
         self.store = store
         self.client_factory = client_factory
+        # Profile-name cache populated as a side-effect of ``_call_client``
+        # and consumed by ``_profile_name_for_target``. Without this, probing
+        # for a profile name to validate a pinned continuity handle would
+        # call the factory an extra time — cheap in production but in finite-
+        # list test stubs it consumes a client and breaks retry flows.
+        self._profile_name_cache: dict[str, str | None] = {}
         # ``config`` carries the project-level QC sampling policy and the
         # max-rounds setting. When omitted (callers that predate the lift, or
         # tests that only care about the per-task flow), fall back to defaults.
@@ -1204,19 +1210,25 @@ class SubagentRuntime:
             raise
 
     def _profile_name_for_target(self, target: str) -> str | None:
-        """Return the LLM profile name the factory currently resolves for
-        ``target``. Used to invalidate cross-provider continuity handles —
-        a ``previous_response_id`` minted by codex (e.g.) is meaningless to
-        a Qwen-backed gateway and causes the gateway to 404. Compares
-        cheaply via a transient client construction; profile lookup itself
-        does not open any network connections.
+        """Return the LLM profile name observed for ``target``, or ``None``
+        if no client for that target has been constructed yet in this
+        runtime instance.
+
+        Used to invalidate cross-provider continuity handles — a
+        ``previous_response_id`` minted by codex (e.g.) is meaningless to
+        a Qwen-backed gateway and causes the gateway to 404. The cache is
+        populated as a side effect of ``_call_client``; this avoids the
+        eager-probe pattern (constructing a throwaway client just to read
+        ``.profile.name``) which is cheap in production but exhausts
+        finite-list test stubs.
+
+        On a true cache miss (first call ever for a target) the caller
+        gracefully degrades — returning ``None`` here makes
+        ``_read_pinned_handle`` accept the handle as-is. If the handle is
+        actually stale, the upstream 404 will be observed and the runtime
+        will retry without it.
         """
-        try:
-            client = self.client_factory(target)
-        except Exception:  # noqa: BLE001
-            return None
-        prof = getattr(client, "profile", None)
-        return getattr(prof, "name", None)
+        return self._profile_name_cache.get(target)
 
     def _read_pinned_handle(self, task: Task, key: str, target: str) -> str | None:
         """Return ``task.metadata[key]`` only if it was minted by the SAME
@@ -1228,8 +1240,16 @@ class SubagentRuntime:
         if not handle:
             return None
         minted_by = task.metadata.get(f"{key}_profile")
+        # Defer the factory probe until we actually need to compare profiles.
+        # When minted_by is None there's nothing to compare against — return
+        # the handle as-is. Probing here would have an unwanted side effect:
+        # ``_profile_name_for_target`` calls ``client_factory(target)`` which
+        # in production is cheap but in finite-list test stubs consumes one
+        # client per probe, exhausting the list and breaking retry flows.
+        if minted_by is None:
+            return handle
         current = self._profile_name_for_target(target)
-        if minted_by is None or current is None or minted_by == current:
+        if current is None or minted_by == current:
             return handle
         return None
 
@@ -1251,11 +1271,18 @@ class SubagentRuntime:
     async def _call_client(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         client = self.client_factory(target)
         try:
-            return await client.generate(request)
+            result = await client.generate(request)
         finally:
             close = getattr(client, "aclose", None)
             if close is not None:
                 await close()
+        # Cache the profile name (== the value that ``_write_pinned_handle``
+        # will record as the handle's mint origin) so future
+        # ``_profile_name_for_target`` lookups don't need to call the
+        # factory again. Using ``result.provider`` keeps the cache and the
+        # pinned-handle profile column written in the same alphabet.
+        self._profile_name_cache[target] = getattr(result, "provider", None) or self._profile_name_cache.get(target)
+        return result
 
     def _append_attempt(self, attempt: Attempt, artifact: ArtifactRef) -> None:
         self.store.append_attempt(attempt)
