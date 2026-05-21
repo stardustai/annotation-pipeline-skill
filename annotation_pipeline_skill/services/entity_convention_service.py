@@ -27,8 +27,10 @@ _SNIPPET_WINDOW = 80  # chars before and after the span hit
 
 def _build_context_snippet(span: str, row_content: str | None) -> str | None:
     """Build a ~200-char window around the first case-insensitive
-    occurrence of ``span`` in ``row_content``. Returns ``None`` when no
-    row_content is provided or the span isn't found.
+    occurrence of ``span`` in ``row_content``. Returns ``None`` only when
+    ``row_content`` is falsy. When the span is not found (e.g. normalization
+    mismatch), returns the first ~160 chars of ``row_content`` as a
+    fallback so the row is still surfaced as evidence.
     """
     if not row_content:
         return None
@@ -36,7 +38,9 @@ def _build_context_snippet(span: str, row_content: str | None) -> str | None:
     if hit < 0:
         # Span not present in row_content (e.g., normalization mismatch);
         # still surface the row as evidence by returning a head window.
-        return row_content[: _SNIPPET_WINDOW * 2].strip()
+        head = row_content[: _SNIPPET_WINDOW * 2].strip()
+        suffix = "…" if len(row_content) > _SNIPPET_WINDOW * 2 else ""
+        return f"{head}{suffix}"
     start = max(0, hit - _SNIPPET_WINDOW)
     end = min(len(row_content), hit + len(span) + _SNIPPET_WINDOW)
     snippet = row_content[start:end].strip()

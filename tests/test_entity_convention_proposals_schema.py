@@ -104,3 +104,27 @@ def test_legacy_call_signature_still_works(store):
     )
     assert proposals[0]["row_id"] is None
     assert proposals[0].get("context_snippet") is None
+
+
+def test_snippet_falls_back_to_head_window_when_span_not_found(store):
+    """If span text doesn't appear verbatim in row_content (e.g.,
+    normalization mismatch), the snippet should fall back to a head
+    window of row_content with a trailing ellipsis when truncated."""
+    svc = EntityConventionService(store)
+    long_row = "completely unrelated content " * 20  # ~580 chars, no "Android"
+    svc.record_decision(
+        project_id="proj1",
+        span="Android",
+        entity_type="technology",
+        source="qc_consensus",
+        task_id="task_019",
+        row_id="row_99",
+        row_content=long_row,
+    )
+    proposals = json.loads(
+        next(store._conn.execute("SELECT proposals_json FROM entity_conventions"))[0]
+    )
+    snippet = proposals[0]["context_snippet"]
+    assert snippet is not None  # the docstring promises this
+    assert snippet.startswith("completely unrelated content")
+    assert snippet.endswith("…")  # trailing ellipsis since row > 160 chars
