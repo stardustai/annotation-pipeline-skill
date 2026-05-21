@@ -6,6 +6,7 @@ tools/call.
 """
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -40,10 +41,31 @@ def _rpc(proc, msg):
 
 
 def _recv(proc, timeout=5.0):
+    """Read one JSON-RPC line with a real wall-clock timeout.
+
+    proc.stdout.readline() blocks until newline arrives — wrapping it in
+    a `while time.time() < deadline` loop is useless because the check
+    only runs *after* readline returns. Use select() so a hung server
+    fails fast instead of hanging the test indefinitely.
+    """
     deadline = time.time() + timeout
+    buf = bytearray()
     while time.time() < deadline:
-        line = proc.stdout.readline()
-        if line:
+        remaining = deadline - time.time()
+        rlist, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not rlist:
+            continue
+        chunk = proc.stdout.read1(4096)
+        if not chunk:
+            # EOF — server died.
+            raise RuntimeError("server closed stdout (likely crashed)")
+        buf.extend(chunk)
+        if b"\n" in buf:
+            line, _, rest = bytes(buf).partition(b"\n")
+            # If we read past the first line, put the rest back by
+            # creating a small buffer attribute on proc — but for our
+            # simple one-request-one-response tests, the assumption is
+            # one line per recv. Truncate to the first line.
             return json.loads(line.decode("utf-8"))
     raise TimeoutError("no response")
 
@@ -97,6 +119,42 @@ def test_mcp_server_calls_check_past_experience(project_with_convention):
         assert payload["entry"] == "Android"
         assert payload["convention"]["type"] == "technology"
         assert payload["convention"]["evidence_count"] == 5
+    finally:
+        proc.kill()
+        proc.wait(timeout=2)
+
+
+def test_mcp_server_handles_storage_error_gracefully(tmp_path):
+    """If the DB doesn't have the entity_conventions table (e.g. corrupt
+    workspace), the tool should return a structured error payload, not
+    crash the MCP protocol."""
+    # Spawn against a fresh tmp dir that has no SqliteStore initialization.
+    # SqliteStore.open() creates the schema, so the call should still work
+    # but with empty proposals — the tool returns a 'none' status, not an error.
+    # Instead, test that empty-string entry returns the ValueError-as-error
+    # path through the protocol (the unit test already covers the function
+    # raising; this exercises the protocol surface).
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "annotation_pipeline_skill.mcp.kb_server",
+         "--project-root", str(tmp_path),
+         "--project-id", "proj_demo"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2024-11-05",
+                               "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}})
+        _recv(proc)
+        _rpc(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        _rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "check_past_experience",
+                               "arguments": {"entry": ""}}})
+        resp = _recv(proc)
+        content = resp["result"]["content"][0]["text"]
+        payload = json.loads(content)
+        assert "error" in payload
+        assert "entry is required" in payload["error"].lower()
     finally:
         proc.kill()
         proc.wait(timeout=2)

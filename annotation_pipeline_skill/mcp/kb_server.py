@@ -68,7 +68,14 @@ def build_server(*, project_root: Path, project_id: str) -> Server:
         try:
             result = check_past_experience(store, project_id=project_id, entry=entry)
         except ValueError as exc:
+            # Caller-input errors (e.g. empty entry) — return structured error
+            # so the agent sees a clear message rather than a protocol fault.
             payload = {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully on unexpected failures
+            # Storage corruption, malformed proposals_json, etc. The agent
+            # should see "tool failed: <reason>" not an unhandled exception.
+            logger.exception("check_past_experience failed", exc_info=exc)
+            payload = {"error": f"tool failure: {type(exc).__name__}: {exc!s}"}
         else:
             payload = result
         return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
