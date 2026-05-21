@@ -22,6 +22,28 @@ from uuid import uuid4
 
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
+_SNIPPET_WINDOW = 80  # chars before and after the span hit
+
+
+def _build_context_snippet(span: str, row_content: str | None) -> str | None:
+    """Build a ~200-char window around the first case-insensitive
+    occurrence of ``span`` in ``row_content``. Returns ``None`` when no
+    row_content is provided or the span isn't found.
+    """
+    if not row_content:
+        return None
+    hit = row_content.lower().find(span.lower())
+    if hit < 0:
+        # Span not present in row_content (e.g., normalization mismatch);
+        # still surface the row as evidence by returning a head window.
+        return row_content[: _SNIPPET_WINDOW * 2].strip()
+    start = max(0, hit - _SNIPPET_WINDOW)
+    end = min(len(row_content), hit + len(span) + _SNIPPET_WINDOW)
+    snippet = row_content[start:end].strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(row_content) else ""
+    return f"{prefix}{snippet}{suffix}"
+
 
 @dataclass(frozen=True)
 class EntityConvention:
@@ -66,6 +88,8 @@ class EntityConventionService:
         entity_type: str,
         source: str,
         task_id: str | None = None,
+        row_id: str | None = None,
+        row_content: str | None = None,
         notes: str | None = None,
     ) -> EntityConvention:
         """Upsert a convention. Rules:
@@ -82,6 +106,8 @@ class EntityConventionService:
             "type": entity_type,
             "source": source,
             "task_id": task_id,
+            "row_id": row_id,
+            "context_snippet": _build_context_snippet(span, row_content),
             "notes": notes,
             "at": now.isoformat(),
         }
