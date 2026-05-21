@@ -27,3 +27,8 @@ projects/
 # Local Claude Code settings.
 .claude/
 annotation_store/
+# Pipeline artifacts: ad-hoc CLI output dumps + graphify exports. These
+# are local debugging outputs, not part of the codebase.
+annotation_output.json
+arbitration_output.json
+graphify-out/

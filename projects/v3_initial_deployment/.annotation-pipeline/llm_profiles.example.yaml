@@ -1,0 +1,66 @@
+# llm_profiles.example.yaml — template for llm_profiles.yaml
+#
+# To use: cp llm_profiles.example.yaml llm_profiles.yaml, then set the
+# env vars referenced by api_key_env. Prefer api_key_env over inline
+# `api_key:` — inline keys end up in `git diff` by accident, and that
+# leaks them to anyone with repo access.
+#
+# Loaded by annotation_pipeline_skill.llm.profiles.load_llm_registry.
+# Read that module for the authoritative schema; what's below covers the
+# fields that matter day-to-day.
+
+profiles:
+  # ─── claude_cli runtime ──────────────────────────────────────────────
+  # Anthropic-compatible third-party endpoints invoked via `claude --bare`.
+  # --bare guarantees the CLI never reads OAuth or keychain state, so a
+  # broken provider can never write back to your real ~/.claude/. Combined
+  # with an isolated HOME per task (see llm/local_cli.isolated_claude_home),
+  # the subprocess literally cannot see or touch your user credentials.
+  deepseek_claude:
+    runtime: claude_cli
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 120
+
+  minimax_claude:
+    runtime: claude_cli
+    model: MiniMax-M2.7
+    base_url: https://api.minimaxi.com/anthropic
+    api_key_env: MINIMAX_API_KEY
+    timeout_seconds: 300
+
+  glm_claude:
+    runtime: claude_cli
+    model: glm-5
+    base_url: https://open.bigmodel.cn/api/anthropic
+    # api_key_env accepts a list — first env var present in the
+    # process environment wins. Lets one profile work across machines
+    # that name the same key differently.
+    api_key_env:
+      - GLM_API_KEY
+      - BIGMODEL_MCP_API_KEY
+    timeout_seconds: 300
+
+  # ─── codex_cli runtime ───────────────────────────────────────────────
+  # OpenAI-format endpoints invoked via `codex exec`. Same isolation
+  # guarantees as the claude path (see isolated_codex_home).
+  deepseek_codex:
+    runtime: codex_cli
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 120
+
+# Which profile handles each pipeline stage. Edit these to point at the
+# profiles you actually configured above.
+targets:
+  annotation: minimax_claude
+  qc: deepseek_claude
+  coordinator: glm_claude
+
+limits:
+  # Optional ceiling on concurrent tasks the runtime scheduler pursues.
+  # Cuts off both wall-clock contention and provider rate-limit pressure.
+  # Defaults to RuntimeConfig.max_concurrent_tasks when unset.
+  max_concurrent_tasks: 8
