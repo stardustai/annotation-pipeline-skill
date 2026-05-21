@@ -76,12 +76,19 @@ def test_feedback_bundle_includes_discussion_and_consensus(tmp_path):
     store.append_feedback_discussion(annotator_reply)
     store.append_feedback_discussion(qc_reply)
 
-    bundle = build_feedback_bundle(store, "task-1")
+    # include_resolved=True so the consensus-closed item still surfaces — the
+    # prompt path defaults to filtering closed items, but the audit / UI path
+    # asks for the full history.
+    bundle = build_feedback_bundle(store, "task-1", include_resolved=True)
     summary = build_feedback_consensus_summary(store, "task-1")
 
     assert bundle["items"][0]["discussion"][0]["stance"] == "partial_agree"
     assert bundle["items"][0]["consensus"] is True
     assert summary["can_accept_by_consensus"] is True
+
+    # Default (include_resolved=False) drops resolved items.
+    filtered = build_feedback_bundle(store, "task-1")
+    assert filtered["items"] == []
 
 
 def test_external_task_pull_is_idempotent_and_creates_status_outbox(tmp_path):

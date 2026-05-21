@@ -1,11 +1,29 @@
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 
-def build_feedback_bundle(store: SqliteStore, task_id: str, *, limit: int = 6) -> dict:
+def build_feedback_bundle(
+    store: SqliteStore,
+    task_id: str,
+    *,
+    limit: int = 6,
+    include_resolved: bool = False,
+) -> dict:
+    """Build feedback bundle for prompt context.
+
+    By default filters out *resolved* (consensus=True) feedback items — the
+    annotator/QC don't need to re-address items that already reached
+    consensus, and including them just bloats the prompt. Pass
+    ``include_resolved=True`` to surface the full history (e.g. for audit
+    UIs that want to show closed disputes).
+    """
+    discussions = sorted(store.list_feedback_discussions(task_id), key=lambda entry: entry.created_at)
+    consensus_ids = {entry.feedback_id for entry in discussions if entry.consensus}
+
     records = sorted(store.list_feedback(task_id), key=lambda record: record.created_at)
+    if not include_resolved:
+        records = [r for r in records if r.feedback_id not in consensus_ids]
     # Keep only the most-recent N records to bound prompt growth across retries.
     records = records[-limit:]
-    discussions = sorted(store.list_feedback_discussions(task_id), key=lambda entry: entry.created_at)
     return {
         "task_id": task_id,
         "items": [
@@ -25,11 +43,7 @@ def build_feedback_bundle(store: SqliteStore, task_id: str, *, limit: int = 6) -
                     for entry in discussions
                     if entry.feedback_id == record.feedback_id
                 ],
-                "consensus": any(
-                    entry.consensus
-                    for entry in discussions
-                    if entry.feedback_id == record.feedback_id
-                ),
+                "consensus": record.feedback_id in consensus_ids,
             }
             for record in records
         ],
