@@ -22,6 +22,22 @@ annotation-pipeline doctor --project-root ./annotation-project
 annotation-pipeline provider doctor --project-root ./annotation-project
 ```
 
+Wire up LLM providers from the template (the real `llm_profiles.yaml`
+is gitignored so inline keys can't slip into commits):
+
+```bash
+cd ./annotation-project/.annotation-pipeline
+cp llm_profiles.example.yaml llm_profiles.yaml
+# then export the env vars referenced by api_key_env in each profile:
+export DEEPSEEK_API_KEY=sk-...
+export MINIMAX_API_KEY=sk-...
+export GLM_API_KEY=...
+```
+
+Edit `llm_profiles.yaml` to match the providers you have keys for and the
+stage targets you want each one to handle. `provider doctor` re-runs the
+config validation and reports any missing env vars.
+
 Create project-scoped tasks from JSONL:
 
 ```bash

@@ -1,9 +1,15 @@
 # llm_profiles.example.yaml — template for llm_profiles.yaml
 #
-# To use: cp llm_profiles.example.yaml llm_profiles.yaml, then set the
-# env vars referenced by api_key_env. Prefer api_key_env over inline
-# `api_key:` — inline keys end up in `git diff` by accident, and that
-# leaks them to anyone with repo access.
+# Quickstart (see README.md "Agent Quickstart" for the full flow):
+#   cp llm_profiles.example.yaml llm_profiles.yaml
+#   export DEEPSEEK_API_KEY=sk-...   # match each api_key_env below
+#   export MINIMAX_API_KEY=sk-...
+#   export GLM_API_KEY=...
+#   annotation-pipeline provider doctor --project-root <your project>
+#
+# Prefer api_key_env over inline `api_key:` — inline keys end up in
+# `git diff` by accident, which is why llm_profiles.yaml itself is
+# gitignored. This template stays tracked.
 #
 # Loaded by annotation_pipeline_skill.llm.profiles.load_llm_registry.
 # Read that module for the authoritative schema; what's below covers the
