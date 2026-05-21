@@ -4,7 +4,7 @@
 
 **Goal:** Add a `check_past_experience(entry)` MCP tool that returns per-span convention, type distribution, diversity-selected sentence-level examples, and wordfreq meta to annotator/QC/arbiter subagents — sourced entirely from the existing `entity_conventions` table (extended with row trace fields).
 
-**Architecture:** A single-tool stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`) is launched by Claude CLI via `--mcp-config`. The tool queries `EntityConventionService`, groups proposals by type, selects ≤3 diverse `context_snippet` strings per type via MinHash + farthest-first, and pairs the result with Zipf wordfreq metadata. LLM provider switching uses the `ANTHROPIC_BASE_URL` environment variable per profile.
+**Architecture:** A single-tool stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`) is launched by Claude CLI via `--mcp-config`. The tool queries `EntityConventionService`, groups proposals by type, selects ≤3 diverse `context_snippet` strings per type via MinHash + farthest-first, and pairs the result with Zipf wordfreq metadata. LLM provider switching already works in the project via the `LLMProfile.base_url` field (translated to `ANTHROPIC_BASE_URL` by `isolated_claude_home`) — no env-merge work is needed in this plan.
 
 **Tech Stack:** Python 3.13, SQLite (existing `entity_conventions`), `mcp` Python SDK (new dep), `jieba` (new dep, lazy-loaded only when CJK detected), `wordfreq` (existing dep), `datasketch` (existing dep for MinHash).
 
@@ -35,8 +35,8 @@
 - `annotation_pipeline_skill/services/entity_convention_service.py` — extend `record_decision()` signature; persist `row_id` + `context_snippet` in proposals
 - `annotation_pipeline_skill/services/human_review_service.py` — update 2 `record_decision` call sites
 - `annotation_pipeline_skill/runtime/subagent_cycle.py` — update 1 `record_decision` call site
-- `annotation_pipeline_skill/llm/profiles.py` — add `mcp_servers`, `extra_env`, `strict_mcp_config`, `disallowed_tools` fields to `LLMProfile`
-- `annotation_pipeline_skill/llm/local_cli.py` — extend `build_claude_command()` and `_generate_claude()` to wire MCP config
+- `annotation_pipeline_skill/llm/profiles.py` — add `mcp_servers`, `strict_mcp_config`, `disallowed_tools` fields to `LLMProfile` (the existing `base_url` field already handles provider switching)
+- `annotation_pipeline_skill/llm/local_cli.py` — extend `build_claude_command()` to accept MCP flags; `_generate_claude()` materializes the per-invocation `mcp-config.json` inside the `isolated_claude_home` directory
 - `tests/test_similarity_minhash.py` — add CJK case tests
 - `pyproject.toml` — add `mcp` and `jieba` dependencies
 
@@ -656,11 +656,13 @@ git commit -m "feat(conventions): persist row_id and context_snippet in proposal
 ## Task 5: Update all `record_decision()` call sites to pass trace data
 
 **Files:**
-- Modify: `annotation_pipeline_skill/runtime/subagent_cycle.py:794-803`
-- Modify: `annotation_pipeline_skill/services/human_review_service.py:441-450, 609-616`
-- Modify: `annotation_pipeline_skill/interfaces/api.py:1427-1437, 2082-2090`
+- Modify: `annotation_pipeline_skill/runtime/subagent_cycle.py:798-813` (`_record_conventions_from_qc_consensus` loop body — line numbers may drift)
+- Modify: `annotation_pipeline_skill/services/human_review_service.py:432-450` (`hr_correction` site) and `~609-616` (`posterior_audit_operator` site — leave as-is)
+- Modify: `annotation_pipeline_skill/interfaces/api.py:~1429` (Set Convention endpoint — operator declarations, leave as-is unless request body adds row_id) and `~2079` (the per-row decision loop — thread row data through)
 - Test: `tests/test_subagent_cycle.py` (existing) — extend
 - Test: `tests/test_dashboard_api_row_dedup.py` (existing) — extend
+
+> **Line numbers drift over time.** Before editing, run `grep -n "record_decision" annotation_pipeline_skill/<file>.py` to locate the current line. The structural pattern (kwargs to `record_decision(...)`) is stable even when line numbers shift.
 
 > **Why this task exists:** Without these updates, the new `context_snippet` field stays `None` everywhere and the MCP tool's `examples_by_type` will be permanently empty. Each site needs to find out what `row_id` and `row_content` mean *for that call site* and pass them through.
 
@@ -754,7 +756,7 @@ Expected: PASS.
 
 - [ ] **Step 5.6: Update call site in `subagent_cycle.py`**
 
-Change lines 794-803 (the loop body in `_record_conventions_from_qc_consensus`) from:
+Change the loop body in `_record_conventions_from_qc_consensus` (currently around line 798-813 — confirm with `grep -n record_decision`) from:
 
 ```python
             decisions = extract_entity_type_decisions(prelabel or {}, current)
@@ -1379,10 +1381,12 @@ git commit -m "feat(mcp): stdio server exposing check_past_experience"
 
 ---
 
-## Task 8: LLMProfile schema — add `mcp_servers`, `extra_env`, `disallowed_tools`, `strict_mcp_config`
+## Task 8: LLMProfile schema — add `mcp_servers`, `disallowed_tools`, `strict_mcp_config`
+
+> **Schema note:** The project already uses a flat `runtime: claude_cli | codex_cli | …` schema (renamed from the old `provider: local_cli` + `cli_kind: …`). LLM provider switching already works via the existing `base_url` field — `isolated_claude_home` translates it to `ANTHROPIC_BASE_URL` automatically. This task only adds **three** new fields; `extra_env` is not needed.
 
 **Files:**
-- Modify: `annotation_pipeline_skill/llm/profiles.py:46-87, 134-188`
+- Modify: `annotation_pipeline_skill/llm/profiles.py:34-65, 106-…`
 - Test: `tests/test_llm_profiles_mcp.py`
 
 - [ ] **Step 8.1: Write failing tests**
@@ -1390,7 +1394,6 @@ git commit -m "feat(mcp): stdio server exposing check_past_experience"
 Create `tests/test_llm_profiles_mcp.py`:
 
 ```python
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -1411,18 +1414,16 @@ def test_profile_parses_mcp_servers(tmp_path):
     path = _write_yaml(tmp_path, """
 profiles:
   annotator_claude_kb:
-    provider: local_cli
-    cli_kind: claude
-    cli_binary: claude
+    runtime: claude_cli
     model: sonnet
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
     mcp_servers:
       - name: annotation-kb
         command: python
         args: ["-m", "annotation_pipeline_skill.mcp.kb_server"]
     strict_mcp_config: true
     disallowed_tools: ["Bash", "Edit", "Write"]
-    extra_env:
-      ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
 """)
     reg = load_llm_registry(path)
     profile = reg.profiles["annotator_claude_kb"]
@@ -1432,34 +1433,32 @@ profiles:
     ]
     assert profile.strict_mcp_config is True
     assert profile.disallowed_tools == ["Bash", "Edit", "Write"]
-    assert profile.extra_env == {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"}
 
 
 def test_profile_mcp_fields_optional(tmp_path):
     path = _write_yaml(tmp_path, """
 profiles:
   classic:
-    provider: local_cli
-    cli_kind: claude
-    cli_binary: claude
+    runtime: claude_cli
     model: sonnet
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
 """)
     reg = load_llm_registry(path)
     p = reg.profiles["classic"]
     assert p.mcp_servers is None
     assert p.strict_mcp_config is None
     assert p.disallowed_tools is None
-    assert p.extra_env is None
 
 
 def test_profile_rejects_malformed_mcp_servers(tmp_path):
     path = _write_yaml(tmp_path, """
 profiles:
   bad:
-    provider: local_cli
-    cli_kind: claude
-    cli_binary: claude
+    runtime: claude_cli
     model: sonnet
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
     mcp_servers: "not a list"
 """)
     with pytest.raises(ProfileValidationError):
@@ -1473,24 +1472,22 @@ Expected: failures — `mcp_servers` etc. are not yet fields.
 
 - [ ] **Step 8.3: Extend `LLMProfile` dataclass**
 
-In `annotation_pipeline_skill/llm/profiles.py`, find the `@dataclass(frozen=True) class LLMProfile:` definition (around line 46). Append these fields after `disable_continuity` and before the `resolve_api_key` method (so they remain part of the dataclass):
+In `annotation_pipeline_skill/llm/profiles.py`, find the `@dataclass(frozen=True) class LLMProfile:` definition. Append these fields after `disable_continuity` and before the `resolve_api_key` method (so they remain part of the dataclass):
 
 ```python
     mcp_servers: list[dict] | None = None
     strict_mcp_config: bool | None = None
     disallowed_tools: list[str] | None = None
-    extra_env: dict[str, str] | None = None
 ```
 
 - [ ] **Step 8.4: Parse the new fields in `_parse_profile`**
 
-In `annotation_pipeline_skill/llm/profiles.py`, find `_parse_profile` (around line 134). After the existing field extractions, add:
+In `annotation_pipeline_skill/llm/profiles.py`, find `_parse_profile`. After the existing field extractions, add (matching the existing kwarg style):
 
 ```python
         mcp_servers=_optional_mcp_servers(raw.get("mcp_servers"), f"profile {name} mcp_servers"),
         strict_mcp_config=_optional_bool(raw.get("strict_mcp_config"), f"profile {name} strict_mcp_config"),
         disallowed_tools=_optional_string_list(raw.get("disallowed_tools"), f"profile {name} disallowed_tools"),
-        extra_env=_optional_string_dict(raw.get("extra_env"), f"profile {name} extra_env"),
 ```
 
 Append these helpers at the end of the file (after the last `_optional_*` helper):
@@ -1524,19 +1521,6 @@ def _optional_string_list(value: object, label: str) -> list[str] | None:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ProfileValidationError(f"{label} must be a list of strings")
     return list(value)
-
-
-def _optional_string_dict(value: object, label: str) -> dict[str, str] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ProfileValidationError(f"{label} must be a mapping")
-    out: dict[str, str] = {}
-    for k, v in value.items():
-        if not isinstance(k, str) or not isinstance(v, str):
-            raise ProfileValidationError(f"{label} must map strings to strings")
-        out[k] = v
-    return out
 ```
 
 - [ ] **Step 8.5: Run tests, confirm pass**
@@ -1558,10 +1542,13 @@ git commit -m "feat(profiles): add mcp_servers, strict_mcp_config, disallowed_to
 
 ---
 
-## Task 9: Wire MCP config and env into Claude CLI invocation
+## Task 9: Wire MCP config into Claude CLI invocation
+
+> **Schema note:** `isolated_claude_home` already translates `profile.base_url` → `ANTHROPIC_BASE_URL` and `profile.resolve_api_key()` → `ANTHROPIC_API_KEY`. This task does **not** touch env composition — it only adds MCP-related CLI flags and the per-invocation `mcp-config.json` materialization. The tmp config file's lifetime is managed **inside** the `isolated_claude_home` context (so it's cleaned up at the same time as the isolated home root).
 
 **Files:**
-- Modify: `annotation_pipeline_skill/llm/local_cli.py:87-107, 314-355`
+- Modify: `annotation_pipeline_skill/llm/local_cli.py:123-153` (`build_claude_command`)
+- Modify: `annotation_pipeline_skill/llm/local_cli.py:419-…` (`_generate_claude`)
 - Test: `tests/test_local_cli_claude_mcp.py`
 
 - [ ] **Step 9.1: Write failing tests for the new command composition**
@@ -1569,7 +1556,6 @@ git commit -m "feat(profiles): add mcp_servers, strict_mcp_config, disallowed_to
 Create `tests/test_local_cli_claude_mcp.py`:
 
 ```python
-import json
 from pathlib import Path
 
 from annotation_pipeline_skill.llm.local_cli import build_claude_command
@@ -1582,6 +1568,9 @@ def test_build_claude_command_without_mcp_unchanged():
     assert "--mcp-config" not in cmd
     assert "--strict-mcp-config" not in cmd
     assert "--disallowedTools" not in cmd
+    # Existing flags must still be there.
+    assert "--bare" in cmd
+    assert "--no-session-persistence" in cmd
 
 
 def test_build_claude_command_includes_mcp_config_path(tmp_path):
@@ -1616,7 +1605,7 @@ Expected: `TypeError: build_claude_command() got an unexpected keyword argument 
 
 - [ ] **Step 9.3: Extend `build_claude_command`**
 
-In `annotation_pipeline_skill/llm/local_cli.py`, replace `build_claude_command` (lines 87-107) with:
+In `annotation_pipeline_skill/llm/local_cli.py`, find the existing `build_claude_command` (around line 123). Update its signature and body to accept the new MCP-related kwargs. The current implementation is:
 
 ```python
 def build_claude_command(
@@ -1624,20 +1613,56 @@ def build_claude_command(
     binary: str,
     model: str,
     permission_mode: str | None,
-    mcp_config_path: Path | None = None,
-    strict_mcp_config: bool = False,
-    disallowed_tools: list[str] | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
-    command = [
-        binary,
-        "-p",
-        "--no-session-persistence",
+    # --bare: ...
+    command = [binary, "--bare", "-p"]
+    if session_id:
+        command.extend(["--resume", session_id])
+    else:
+        command.append("--no-session-persistence")
+    command.extend([
         "--verbose",
         "--output-format",
         "stream-json",
         "--model",
         model,
-    ]
+    ])
+    if permission_mode:
+        command.extend(["--permission-mode", permission_mode])
+    command.append("-")
+    return command
+```
+
+Replace it with:
+
+```python
+def build_claude_command(
+    *,
+    binary: str,
+    model: str,
+    permission_mode: str | None,
+    session_id: str | None = None,
+    mcp_config_path: Path | None = None,
+    strict_mcp_config: bool = False,
+    disallowed_tools: list[str] | None = None,
+) -> list[str]:
+    # --bare: never read OAuth / keychain / ~/.claude credentials. Auth is
+    # strictly ANTHROPIC_API_KEY (no token writeback can clobber real creds).
+    # Also skips hooks, auto-memory, CLAUDE.md auto-discovery, background
+    # prefetches — exactly the surface we don't want in a worker.
+    command = [binary, "--bare", "-p"]
+    if session_id:
+        command.extend(["--resume", session_id])
+    else:
+        command.append("--no-session-persistence")
+    command.extend([
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--model",
+        model,
+    ])
     if permission_mode:
         command.extend(["--permission-mode", permission_mode])
     if mcp_config_path is not None:
@@ -1650,7 +1675,7 @@ def build_claude_command(
     return command
 ```
 
-Make sure `from pathlib import Path` is already imported at the top of the file (it should be; if not, add it).
+`from pathlib import Path` is already imported at the top of `local_cli.py`.
 
 - [ ] **Step 9.4: Run new command tests, confirm pass**
 
@@ -1659,46 +1684,83 @@ Expected: all 3 tests pass.
 
 - [ ] **Step 9.5: Wire profile fields into `_generate_claude`**
 
-In `annotation_pipeline_skill/llm/local_cli.py`, replace the body of `_generate_claude` (lines 314-355) to materialize the MCP config from the profile, pass the new build_claude_command kwargs, and merge `extra_env`:
+Open `annotation_pipeline_skill/llm/local_cli.py` and locate `_generate_claude` (around line 419). Inside it, **two surgical changes** are needed; everything else stays as-is.
+
+Change A — pass new kwargs to `build_claude_command`. Find this block:
 
 ```python
-    async def _generate_claude(self, request: LLMGenerateRequest) -> LLMGenerateResult:
-        import json as _json
-        import tempfile
-
-        mcp_servers = self.profile.mcp_servers or []
-        mcp_config_path: Path | None = None
-        if mcp_servers:
-            # Materialize the per-invocation mcp-config.json.
-            mcp_payload = {
-                "mcpServers": {
-                    s["name"]: {"command": s["command"], "args": s["args"]}
-                    for s in mcp_servers
-                }
-            }
-            tmp = tempfile.NamedTemporaryFile(
-                mode="w", suffix="-mcp.json", delete=False, encoding="utf-8"
-            )
-            try:
-                _json.dump(mcp_payload, tmp)
-                tmp.flush()
-                mcp_config_path = Path(tmp.name)
-            finally:
-                tmp.close()
-
         command = build_claude_command(
-            binary=self.profile.cli_binary or "claude",
+            binary="claude",
             model=self.profile.model,
             permission_mode=self.profile.permission_mode,
-            mcp_config_path=mcp_config_path,
+            session_id=session_id,
+        )
+```
+
+Replace with:
+
+```python
+        command = build_claude_command(
+            binary="claude",
+            model=self.profile.model,
+            permission_mode=self.profile.permission_mode,
+            session_id=session_id,
+            mcp_config_path=None,  # set inside the isolated_claude_home block below
             strict_mcp_config=bool(self.profile.strict_mcp_config),
             disallowed_tools=self.profile.disallowed_tools,
         )
-        prompt = request.prompt or _messages_to_prompt(request.input_items)
-        if request.instructions:
-            prompt = f"{request.instructions}\n\n{prompt}"
-        env = {**os.environ, **(self.profile.extra_env or {}), **request.env}
-        try:
+```
+
+Change B — materialize the per-invocation `mcp-config.json` **inside the `isolated_claude_home` context**, then rebuild the command with the resolved path. Find this block:
+
+```python
+        with isolated_claude_home(
+            {**os.environ, **request.env},
+            home_id=home_id,
+            provider_api_key=api_key,
+            provider_base_url=self.profile.base_url,
+        ) as (env, _home, resolved_home_id):
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(request.cwd) if request.cwd else None,
+                env=env,
+                ...
+            )
+```
+
+Replace the *interior* of the `with` block (everything from the `with` line down to the `await asyncio.wait_for(...)` call) with:
+
+```python
+        with isolated_claude_home(
+            {**os.environ, **request.env},
+            home_id=home_id,
+            provider_api_key=api_key,
+            provider_base_url=self.profile.base_url,
+        ) as (env, _home, resolved_home_id):
+            # Materialize the per-invocation mcp-config.json INSIDE the
+            # isolated home so it's automatically cleaned up with the home
+            # (no separate try/finally).
+            mcp_servers = self.profile.mcp_servers or []
+            if mcp_servers:
+                import json as _json
+                mcp_payload = {
+                    "mcpServers": {
+                        s["name"]: {"command": s["command"], "args": s["args"]}
+                        for s in mcp_servers
+                    }
+                }
+                mcp_config_path = _home / "mcp-config.json"
+                mcp_config_path.write_text(_json.dumps(mcp_payload), encoding="utf-8")
+                # Rebuild the command now that we have a real path.
+                command = build_claude_command(
+                    binary="claude",
+                    model=self.profile.model,
+                    permission_mode=self.profile.permission_mode,
+                    session_id=session_id,
+                    mcp_config_path=mcp_config_path,
+                    strict_mcp_config=bool(self.profile.strict_mcp_config),
+                    disallowed_tools=self.profile.disallowed_tools,
+                )
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(request.cwd) if request.cwd else None,
@@ -1706,6 +1768,7 @@ In `annotation_pipeline_skill/llm/local_cli.py`, replace the body of `_generate_
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                preexec_fn=_die_with_parent,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -1719,35 +1782,11 @@ In `annotation_pipeline_skill/llm/local_cli.py`, replace the body of `_generate_
                 except Exception:  # noqa: BLE001
                     pass
                 raise
-        finally:
-            # Always clean up the tmp config file so /tmp doesn't accumulate.
-            if mcp_config_path is not None:
-                try:
-                    mcp_config_path.unlink(missing_ok=True)
-                except Exception:  # noqa: BLE001
-                    pass
-
-        lines = stdout.decode("utf-8", errors="replace").splitlines()
-        result = parse_claude_stream_events(lines, provider=self.profile.name, model=self.profile.model)
-        diagnostics = dict(result.diagnostics or {})
-        diagnostics["returncode"] = process.returncode
-        if stderr:
-            diagnostics["stderr"] = stderr.decode("utf-8", errors="replace")[-4000:]
-        if process.returncode != 0:
-            raise LocalCLIExecutionError("local CLI provider failed", diagnostics)
-        return LLMGenerateResult(
-            runtime=result.runtime,
-            provider=result.provider,
-            model=result.model,
-            continuity_handle=result.continuity_handle,
-            final_text=result.final_text,
-            usage=result.usage,
-            raw_response=result.raw_response,
-            diagnostics=diagnostics,
-        )
 ```
 
-If you find the surrounding code differs from the snippet above (e.g. existing return-value transformations), preserve those — the change is **adding** the mcp_config materialization, env merge, and new `build_claude_command` kwargs while keeping the rest unchanged.
+The rest of `_generate_claude` (parsing stdout, building the `LLMGenerateResult`) stays unchanged.
+
+> **Why this is the right shape:** when `mcp_servers` is unset the inner block is a single `if` guard that does nothing — existing behaviour preserved exactly. When it's set, the config file lives inside the isolated home directory which `isolated_claude_home` is already responsible for managing, so no extra try/finally for tmp file cleanup is needed.
 
 - [ ] **Step 9.6: Run all Claude CLI-touching tests**
 
@@ -1807,16 +1846,23 @@ print('seeded')
 
 - [ ] **Step 10.3: Add a profile to `llm_profiles.yaml`**
 
-Edit `/tmp/annotation-kb-fixture/.annotation-pipeline/llm_profiles.yaml` and add:
+Bootstrap the file from the example template if it doesn't exist:
+
+```bash
+cp /tmp/annotation-kb-fixture/.annotation-pipeline/llm_profiles.example.yaml \
+   /tmp/annotation-kb-fixture/.annotation-pipeline/llm_profiles.yaml
+```
+
+Then edit it and add a new profile **alongside** the existing ones (note the flat `runtime` schema — no `provider`/`cli_kind` fields):
 
 ```yaml
 profiles:
   # ... existing profiles ...
   annotator_claude_kb:
-    provider: local_cli
-    cli_kind: claude
-    cli_binary: claude
+    runtime: claude_cli
     model: sonnet
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
     permission_mode: dontAsk
     mcp_servers:
       - name: annotation-kb
@@ -1834,11 +1880,17 @@ profiles:
 
 - [ ] **Step 10.4: Launch claude with the new profile via a small test harness**
 
+Verify the runtime composes the correct command and reaches the tool. Two ways:
+
+**a) Through the runtime (preferred — tests the full integration):**
+
+Bind the new profile to a stage target (e.g. `annotation`) in the runtime config and run a single subagent cycle on a fixture task. The runtime will compose `claude` with `--mcp-config`, materialize the config inside the isolated home, and launch.
+
+**b) Standalone smoke test (faster, narrower):**
+
 ```bash
-ANTHROPIC_BASE_URL=https://api.anthropic.com \
-PYTHONPATH=/home/derek/Projects/annotation-pipeline-skill \
-claude --print --bare \
-  --strict-mcp-config \
+ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+claude --bare -p --strict-mcp-config \
   --mcp-config <(python -c "
 import json
 print(json.dumps({
@@ -1853,10 +1905,12 @@ print(json.dumps({
 }))
 ") \
   --disallowedTools="Bash,Edit,Write" \
-  "Call the check_past_experience tool with entry='Android' and report what you see."
+  "Call the check_past_experience tool with entry='Android' and report what you see." <<< ""
 ```
 
 Expected: claude prints output indicating it called the tool and received a response with `convention.type == "technology"` and 5 evidence proposals.
+
+> **Note on `ANTHROPIC_BASE_URL`:** for path (a) it's set automatically by `isolated_claude_home` from `profile.base_url`. For path (b), if you want to point at a non-Anthropic endpoint (DeepSeek, GLM, etc.), set `ANTHROPIC_BASE_URL` in the shell — the standalone test doesn't go through `isolated_claude_home`.
 
 - [ ] **Step 10.5: Update CHANGELOG**
 
@@ -1865,7 +1919,7 @@ Edit `CHANGELOG.md` and add an entry under the next unreleased version:
 ```markdown
 ### Added
 - `check_past_experience` MCP tool for annotator/QC/arbiter subagents: returns convention status, type distribution, diverse sentence-level examples, and wordfreq metadata for a candidate span. Wired via `--mcp-config` on Claude CLI subagents.
-- `LLMProfile` schema: `mcp_servers`, `strict_mcp_config`, `disallowed_tools`, `extra_env` for declaring MCP servers and overriding env vars per profile (enables LLM provider switching via `ANTHROPIC_BASE_URL`).
+- `LLMProfile` schema: `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring MCP servers and locking down built-in tools per profile. LLM provider switching continues to use the existing `base_url` field (translated to `ANTHROPIC_BASE_URL` by `isolated_claude_home`).
 - CJK fallback in `similarity.shingle()`: rows containing CJK characters are segmented with jieba instead of degenerating to a single shingle, improving both KB diversity sampling and existing row_dedup precision on Chinese text.
 
 ### Changed
@@ -1895,9 +1949,9 @@ Cross-check against the spec sections:
 | CJK Shingle Fallback | Task 2 |
 | Shared `wordfreq_score` utility | Task 1 |
 | MCP server (kb_server.py) | Task 7 |
-| `mcp_servers` / `extra_env` / `disallowed_tools` profile fields | Task 8 |
+| `mcp_servers` / `strict_mcp_config` / `disallowed_tools` profile fields | Task 8 |
 | `build_claude_command` MCP wiring | Task 9 |
-| LLM switching via `ANTHROPIC_BASE_URL` | Task 9 (via `extra_env` merge) |
+| LLM switching via `ANTHROPIC_BASE_URL` | Already in place via `LLMProfile.base_url` + `isolated_claude_home` — no new work required |
 | Tests (unit + integration smoke) | Tasks 1, 2, 3, 4, 6, 7, 8, 9 |
 | Manual Claude CLI verification | Task 10 |
 
@@ -1907,6 +1961,21 @@ Cross-check against the spec sections:
 - `record_decision()` kwargs (`row_id: str | None`, `row_content: str | None`) consistent in Tasks 4, 5, 6.
 - `mcp_servers` shape (`list[dict]` with `name`/`command`/`args`) consistent in Tasks 8, 9.
 - `check_past_experience` return-dict shape consistent between Task 6 logic and Task 7 server passthrough.
-- `build_claude_command` signature (Task 9.3) matches the call site (Task 9.5).
+- `build_claude_command` signature (Task 9.3) matches the call sites in `_generate_claude` (Task 9.5).
+- LLMProfile schema fields (`mcp_servers`, `strict_mcp_config`, `disallowed_tools`) consistent in Tasks 8 (schema), 9 (consumption), and 10 (example yaml).
+- All Task 10 yaml examples use the current flat `runtime: claude_cli` schema (no `provider`/`cli_kind`).
 
 No placeholders detected.
+
+---
+
+## Revision Notes (2026-05-19, post-rebase)
+
+The original plan was written against an older LLMProfile schema (`provider: local_cli` + `cli_kind: claude` + `cli_binary: claude`). The codebase has since migrated to a flat `runtime: claude_cli | codex_cli | …` schema with `base_url` as a required field and `isolated_claude_home` already translating `base_url` → `ANTHROPIC_BASE_URL`. Tasks 8, 9, and 10 were updated accordingly:
+
+- **Removed `extra_env` field** — `base_url` is already a `LLMProfile` field, and `isolated_claude_home` already exports it as `ANTHROPIC_BASE_URL`. No env-merge work needed.
+- **Task 9 mcp-config.json materialization moved inside `isolated_claude_home`** — the tmp file lives at `<isolated_home>/mcp-config.json` and is cleaned up with the home. No separate try/finally.
+- **All yaml examples in Task 10 rewritten** to the flat `runtime:` schema.
+- **Task 5 line-number guidance softened** — added `grep -n record_decision` step to locate current line numbers rather than baking specific line numbers into the plan.
+
+Tasks 1, 2, 3, 4, 6, 7 are unchanged — they touch modules (`text/`, `similarity/minhash.py`, `similarity/diverse.py`, `entity_convention_service.py`, new `mcp/` package) that the recent refactor did not affect.
