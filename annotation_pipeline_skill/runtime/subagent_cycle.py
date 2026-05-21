@@ -1644,6 +1644,20 @@ class SubagentRuntime:
                         or find_trailing_punctuation_spans(task, _payload):
                     arb["mechanical_fail"] += 1
                     return None
+                # Row coverage check: every source row_id must appear in the
+                # annotation. Hard boundary — no fallback acceptance.
+                try:
+                    source_rows = task.source_ref["payload"]["rows"]
+                    if isinstance(source_rows, list) and source_rows:
+                        source_ids = {r["row_id"] for r in source_rows if isinstance(r, dict) and "row_id" in r}
+                        if source_ids:
+                            ann_rows = _payload.get("rows", [])
+                            ann_ids = {r["row_id"] for r in ann_rows if isinstance(r, dict) and "row_id" in r}
+                            if source_ids - ann_ids:
+                                arb["mechanical_fail"] += 1
+                                return None
+                except (KeyError, TypeError):
+                    pass
             self._increment_entity_statistics_for_task(
                 task, annotation_artifact, weight=1
             )
@@ -2593,7 +2607,21 @@ class SubagentRuntime:
                 # message exceptions (asyncio.CancelledError / TimeoutError /
                 # bare subprocess errors) where str(exc) is "" and we lose
                 # the only clue about what went wrong.
-                raise _ArbiterCallFailed(f"llm_call/{type(exc).__name__}: {exc!s}") from exc
+                # LocalCLIExecutionError carries .diagnostics (returncode +
+                # last 4KB of stderr) — without this the message is just
+                # "local CLI provider failed" and the actual cause (auth
+                # rejection, model-name typo, vllm OOM, etc.) is lost.
+                diag = getattr(exc, "diagnostics", None)
+                tail = ""
+                if isinstance(diag, dict):
+                    rc = diag.get("returncode")
+                    err = (diag.get("stderr") or "")
+                    if isinstance(err, str):
+                        err = err.strip().replace("\n", " | ")[-300:]
+                    tail = f" rc={rc} stderr={err!r}"
+                raise _ArbiterCallFailed(
+                    f"llm_call/{type(exc).__name__}: {exc!s}{tail}"
+                ) from exc
             try:
                 payload = _parse_llm_json(result.final_text)
             except (json.JSONDecodeError, ValueError) as exc:
