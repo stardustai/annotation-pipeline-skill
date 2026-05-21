@@ -259,12 +259,8 @@ def _type_entropy(dist: dict[str, int]) -> float:
 
 
 def _wordfreq_score(span: str) -> float:
-    from wordfreq import zipf_frequency, tokenize
-    lang = "zh" if any("一" <= ch <= "鿿" for ch in span) else "en"
-    tokens = tokenize(span, lang)
-    if not tokens:
-        return 0.0
-    return sum(zipf_frequency(t, lang) for t in tokens) / len(tokens)
+    from annotation_pipeline_skill.text.wordfreq_utils import wordfreq_score
+    return wordfreq_score(span)
 
 
 def find_typical_text_for_span(
