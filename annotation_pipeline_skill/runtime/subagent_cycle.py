@@ -1688,6 +1688,20 @@ class SubagentRuntime:
         # validation path. Arbiter should fix this in retries.
         if find_trailing_punctuation_spans(task, corrected):
             return None
+        # Row coverage — all source rows must appear in the corrected annotation,
+        # same as the annotator validation path. Arbiter sometimes returns only
+        # the corrected rows, leaving others absent.
+        try:
+            source_rows = task.source_ref["payload"]["rows"]
+            if isinstance(source_rows, list) and source_rows:
+                source_ids = {r["row_id"] for r in source_rows if isinstance(r, dict) and "row_id" in r}
+                if source_ids:
+                    corr_rows = corrected.get("rows", []) if isinstance(corrected, dict) else []
+                    corr_ids = {r["row_id"] for r in corr_rows if isinstance(r, dict) and "row_id" in r}
+                    if source_ids - corr_ids:
+                        return None
+        except (KeyError, TypeError):
+            pass
         # Match the annotator write path (see _serialize_llm_json): dedupe
         # within-type. No character-level normalization — the downstream
         # GLiNER pipeline requires byte-for-byte verbatim spans.
