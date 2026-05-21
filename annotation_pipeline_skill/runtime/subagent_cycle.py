@@ -423,6 +423,17 @@ class SubagentRuntime:
                 "arbiter_unresolved": arb["unresolved"],
                 "arbiter_mechanical_fail": arb["mechanical_fail"],
             }
+            # Surface the latest captured arbiter exception (set by
+            # _arbitrate_and_apply when the LLM call raised, or by the outer
+            # try/except in _run_arbitration_cycle when an uncaught exception
+            # escaped). Lets us tell client-unavail / LLM exception / JSON
+            # parse / missing-verdicts apart in the HR audit row.
+            for k in ("exception_class", "exception_message"):
+                if arb.get(k):
+                    metadata[f"arbiter_{k}"] = arb[k]
+            for k in ("arbiter_last_exception_class", "arbiter_last_exception_message"):
+                if task.metadata.get(k):
+                    metadata.setdefault(k, task.metadata[k])
             # Surface the arbiter's failed verbatim correction so HR can
             # see what it tried to fix and decide whether to apply it
             # manually (after fixing the verbatim issue) or send back to
@@ -2302,7 +2313,17 @@ class SubagentRuntime:
                 items=items,
                 target_name="arbiter",
             )
-        except (_ArbiterClientUnavailable, _ArbiterCallFailed):
+        except (_ArbiterClientUnavailable, _ArbiterCallFailed) as exc:
+            # Preserve the actual failure cause so HR metadata + task.metadata
+            # show whether it was client-unavailable, LLM exception, JSON
+            # parse error, or missing-verdicts shape. Without this the outer
+            # `_handle_arbiter_mechanical_fail` writes uninformative HR
+            # entries (`arbiter_ran=false, arbiter_mechanical_fail=0`) and we
+            # have to grep codex rollouts to guess the cause.
+            empty["exception_class"] = type(exc).__name__
+            empty["exception_message"] = str(exc)[:500]
+            task.metadata["arbiter_last_exception_class"] = empty["exception_class"]
+            task.metadata["arbiter_last_exception_message"] = empty["exception_message"]
             return empty
         verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
         if not isinstance(verdicts, list):
