@@ -266,49 +266,63 @@ python -m annotation_pipeline_skill.mcp.kb_server --project-root <path>
 
 ## Profile Integration
 
-`llm_profiles.yaml` gains two optional fields per profile:
+`llm_profiles.yaml` profiles gain three optional top-level fields. LLM provider switching keeps using the existing `base_url` + `api_key_env` fields — `isolated_claude_home` already translates those to `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` inside the subprocess (operator's shell is never modified).
 
 ```yaml
 profiles:
   annotator_claude:
     runtime: claude_cli
-    env:
-      ANTHROPIC_BASE_URL: https://api.anthropic.com
-      ANTHROPIC_API_KEY: ${CLAUDE_API_KEY}
+    model: sonnet
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    permission_mode: dontAsk
     mcp_servers:
       - name: annotation-kb
         command: python
-        args: ["-m", "annotation_pipeline_skill.mcp.kb_server"]
-    cli_args:
-      strict_mcp_config: true
-      disallowed_tools: ["Bash", "Edit", "Write"]
+        args:
+          - -m
+          - annotation_pipeline_skill.mcp.kb_server
+          - --project-root
+          - /path/to/project/.annotation-pipeline
+          - --project-id
+          - my-project
+    strict_mcp_config: true
+    disallowed_tools: ["Bash", "Edit", "Write"]
 
   annotator_deepseek:
     runtime: claude_cli            # reuse Claude CLI binary
-    env:
-      ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
-      ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY}
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
     mcp_servers:
       - name: annotation-kb
         command: python
-        args: ["-m", "annotation_pipeline_skill.mcp.kb_server"]
-    cli_args:
-      strict_mcp_config: true
-      disallowed_tools: ["Bash", "Edit", "Write"]
+        args:
+          - -m
+          - annotation_pipeline_skill.mcp.kb_server
+          - --project-root
+          - /path/to/project/.annotation-pipeline
+          - --project-id
+          - my-project
+    strict_mcp_config: true
+    disallowed_tools: ["Bash", "Edit", "Write"]
 ```
 
-The runtime (`subagent_cycle.py`) builds a per-invocation `mcp-config.json` from the profile and passes:
+The runtime (`llm/local_cli.py::_generate_claude`) materializes a per-invocation `mcp-config.json` **inside the isolated claude home** (`<isolated_home>/mcp-config.json`), then invokes claude approximately as:
 
 ```bash
-ANTHROPIC_BASE_URL=$URL ANTHROPIC_API_KEY=$KEY \
-claude --print --bare \
+claude --bare -p --no-session-persistence \
+       --verbose --output-format stream-json \
+       --model <model> \
+       --permission-mode <mode> \
+       --mcp-config <isolated_home>/mcp-config.json \
        --strict-mcp-config \
-       --mcp-config=/tmp/<run-id>-mcp.json \
-       --disallowedTools="Bash,Edit,Write" \
-       --append-system-prompt-file=<task-prompt>
+       --disallowedTools "Bash,Edit,Write"
 ```
 
-`--bare` is used to keep the subagent free of host-side hooks, plugins, and auto-memory, ensuring the only tools available are the MCP-provided ones and `--tools`-restricted built-ins.
+with `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` set only in the subprocess `env` (`isolated_claude_home` constructs the dict from `profile.base_url` and `profile.resolve_api_key()`). The operator's shell state is never modified.
+
+`--bare` keeps the subagent free of host-side hooks, plugins, and auto-memory, ensuring the only tools available are the MCP-provided ones and built-ins not in `disallowed_tools`.
 
 ---
 
