@@ -778,7 +778,7 @@ class SubagentRuntime:
         """
         from annotation_pipeline_skill.services.entity_convention_service import (
             EntityConventionService,
-            extract_entity_type_decisions,
+            extract_entity_type_decisions_with_row,
         )
         # Read the latest annotation payload (cleaned canonical JSON written
         # by _serialize_llm_json) and the prelabel baseline to diff against.
@@ -806,11 +806,25 @@ class SubagentRuntime:
                         else:
                             prelabel = prelabel_outer
                     break
-            decisions = extract_entity_type_decisions(prelabel or {}, current)
+            # Pull source rows from the task payload so the extractor can
+            # attach row_content for each decision (used by the KB MCP tool).
+            source_rows: list[dict] | None = None
+            try:
+                payload = task.source_ref["payload"]
+                if isinstance(payload, dict):
+                    candidate = payload.get("rows")
+                    if isinstance(candidate, list):
+                        source_rows = candidate
+            except (KeyError, TypeError):
+                source_rows = None
+
+            decisions = extract_entity_type_decisions_with_row(
+                prelabel or {}, current, source_rows=source_rows,
+            )
             if not decisions:
                 return
             svc = EntityConventionService(self.store)
-            for span, entity_type in decisions:
+            for span, entity_type, row_id, row_content in decisions:
                 try:
                     svc.record_decision(
                         project_id=task.pipeline_id,
@@ -818,6 +832,8 @@ class SubagentRuntime:
                         entity_type=entity_type,
                         source="qc_consensus",
                         task_id=task.task_id,
+                        row_id=row_id,
+                        row_content=row_content,
                     )
                 except Exception:  # noqa: BLE001 — convention recording is best-effort
                     continue

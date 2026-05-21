@@ -128,3 +128,73 @@ def test_snippet_falls_back_to_head_window_when_span_not_found(store):
     assert snippet is not None  # the docstring promises this
     assert snippet.startswith("completely unrelated content")
     assert snippet.endswith("…")  # trailing ellipsis since row > 160 chars
+
+
+def test_extract_entity_type_decisions_with_row_links_rows():
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        extract_entity_type_decisions_with_row,
+    )
+    prior = {"rows": []}
+    new = {
+        "rows": [
+            {
+                "row_id": "r1",
+                "row_index": 0,
+                "output": {"entities": {"technology": ["Android"]}},
+            },
+            {
+                "row_id": "r2",
+                "row_index": 1,
+                "output": {"entities": {"technology": ["PicsArt"]}},
+            },
+        ]
+    }
+    source_rows = [
+        {"row_id": "r1", "content": "Crashes on Android 10"},
+        {"row_id": "r2", "content": "PicsArt edits missing"},
+    ]
+    out = extract_entity_type_decisions_with_row(prior, new, source_rows=source_rows)
+    out_sorted = sorted(out)
+    assert ("Android", "technology", "r1", "Crashes on Android 10") in out_sorted
+    assert ("PicsArt", "technology", "r2", "PicsArt edits missing") in out_sorted
+
+
+def test_extract_with_row_supports_text_field_for_source_content():
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        extract_entity_type_decisions_with_row,
+    )
+    prior = {"rows": []}
+    new = {"rows": [{"row_id": "r1", "row_index": 0,
+                     "output": {"entities": {"organization": ["Apple"]}}}]}
+    source_rows = [{"row_id": "r1", "text": "Apple's customer support helped me"}]
+    out = extract_entity_type_decisions_with_row(prior, new, source_rows=source_rows)
+    assert out == [("Apple", "organization", "r1", "Apple's customer support helped me")]
+
+
+def test_extract_with_row_handles_missing_source_rows():
+    """If source_rows isn't provided, row_id is still emitted but row_content is None."""
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        extract_entity_type_decisions_with_row,
+    )
+    prior = {"rows": []}
+    new = {"rows": [{"row_id": "r1", "row_index": 0,
+                     "output": {"entities": {"technology": ["Android"]}}}]}
+    out = extract_entity_type_decisions_with_row(prior, new, source_rows=None)
+    assert out == [("Android", "technology", "r1", None)]
+
+
+def test_extract_with_row_omits_rows_whose_type_didnt_change():
+    """Same diff semantic as extract_entity_type_decisions."""
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        extract_entity_type_decisions_with_row,
+    )
+    prior = {"rows": [
+        {"row_id": "r1", "row_index": 0,
+         "output": {"entities": {"technology": ["Android"]}}}
+    ]}
+    new = {"rows": [
+        {"row_id": "r1", "row_index": 0,
+         "output": {"entities": {"technology": ["Android"]}}}  # unchanged
+    ]}
+    out = extract_entity_type_decisions_with_row(prior, new, source_rows=[])
+    assert out == []

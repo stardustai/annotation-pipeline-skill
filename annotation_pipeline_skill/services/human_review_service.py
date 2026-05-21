@@ -429,14 +429,23 @@ class HumanReviewService:
     def _record_conventions_from_correction(self, task: Task, answer: dict, actor: str) -> None:
         from annotation_pipeline_skill.services.entity_convention_service import (
             EntityConventionService,
-            extract_entity_type_decisions,
+            extract_entity_type_decisions_with_row,
         )
         prior = self._latest_annotation_payload(task.task_id)
-        decisions = extract_entity_type_decisions(prior, answer)
+        source_rows: list[dict] | None = None
+        try:
+            payload = task.source_ref["payload"]
+            if isinstance(payload, dict):
+                candidate = payload.get("rows")
+                if isinstance(candidate, list):
+                    source_rows = candidate
+        except (KeyError, TypeError):
+            source_rows = None
+        decisions = extract_entity_type_decisions_with_row(prior, answer, source_rows=source_rows)
         if not decisions:
             return
         svc = EntityConventionService(self.store)
-        for span, entity_type in decisions:
+        for span, entity_type, row_id, row_content in decisions:
             try:
                 svc.record_decision(
                     project_id=task.pipeline_id,
@@ -444,6 +453,8 @@ class HumanReviewService:
                     entity_type=entity_type,
                     source=f"hr_correction:{actor}",
                     task_id=task.task_id,
+                    row_id=row_id,
+                    row_content=row_content,
                 )
             except (ValueError, TypeError):
                 continue

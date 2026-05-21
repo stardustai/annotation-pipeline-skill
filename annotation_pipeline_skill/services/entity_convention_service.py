@@ -428,6 +428,107 @@ def extract_entity_type_decisions(
     return decisions
 
 
+def extract_entity_type_decisions_with_row(
+    prior_annotation: Any,
+    new_annotation: Any,
+    source_rows: list[dict] | None = None,
+) -> list[tuple[str, str, str | None, str | None]]:
+    """Like ``extract_entity_type_decisions`` but also returns ``row_id`` and
+    ``row_content`` for each decision.
+
+    Returns list of ``(span, new_type, row_id, row_content)`` tuples.
+    ``row_id`` is taken from the annotation row that triggered the decision.
+    ``row_content`` is looked up from ``source_rows`` by ``row_id`` (the
+    ``"content"`` field falls back to ``"text"``); ``None`` if the row
+    isn't in ``source_rows`` or ``source_rows`` is not provided.
+
+    Diff semantic matches ``extract_entity_type_decisions``: a decision is
+    emitted only when ``new`` has the span under type X and ``prior`` either
+    didn't have the span at the same row_index, or had it under type Y != X.
+    Within a single batch, the first occurrence of a span wins (matching
+    the existing dedupe behavior).
+    """
+    # Reuse the same prior-index logic as extract_entity_type_decisions
+    # (the diff semantics are identical; we just also carry row data).
+    def _index_entities(annotation: Any) -> dict[tuple[int, str], str]:
+        index: dict[tuple[int, str], str] = {}
+        if not isinstance(annotation, dict):
+            return index
+        rows = annotation.get("rows")
+        if not isinstance(rows, list):
+            return index
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_idx = row.get("row_index") if isinstance(row.get("row_index"), int) else 0
+            output = row.get("output")
+            if not isinstance(output, dict):
+                continue
+            entities = output.get("entities")
+            if not isinstance(entities, dict):
+                continue
+            for typ, items in entities.items():
+                if not isinstance(items, list):
+                    continue
+                for s in items:
+                    if isinstance(s, str) and s.strip():
+                        index.setdefault((row_idx, s.strip().lower()), typ)
+        return index
+
+    prior_index = _index_entities(prior_annotation)
+
+    # Build a row_id → content lookup from source_rows.
+    content_by_row_id: dict[str, str] = {}
+    if isinstance(source_rows, list):
+        for sr in source_rows:
+            if not isinstance(sr, dict):
+                continue
+            rid = sr.get("row_id")
+            if not isinstance(rid, str):
+                continue
+            content = sr.get("content") or sr.get("text")
+            if isinstance(content, str):
+                content_by_row_id[rid] = content
+
+    decisions: list[tuple[str, str, str | None, str | None]] = []
+    seen_spans: set[str] = set()
+
+    if not isinstance(new_annotation, dict):
+        return decisions
+    rows = new_annotation.get("rows", [])
+    if not isinstance(rows, list):
+        return decisions
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_idx = row.get("row_index") if isinstance(row.get("row_index"), int) else 0
+        row_id = row.get("row_id") if isinstance(row.get("row_id"), str) else None
+        row_content = content_by_row_id.get(row_id) if row_id else None
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        entities = output.get("entities")
+        if not isinstance(entities, dict):
+            continue
+        for typ, items in entities.items():
+            if not isinstance(items, list):
+                continue
+            for s in items:
+                if not isinstance(s, str) or not s.strip():
+                    continue
+                key = (row_idx, s.strip().lower())
+                prior_type = prior_index.get(key)
+                if prior_type == typ:
+                    continue
+                span_key = s.strip().lower()
+                if span_key in seen_spans:
+                    continue
+                seen_spans.add(span_key)
+                decisions.append((s.strip(), typ, row_id, row_content))
+    return decisions
+
+
 def _span_in_text_at_word_boundary(span: str, text: str) -> bool:
     """Case-insensitive word-boundary match. Both args expected lowercase.
 
