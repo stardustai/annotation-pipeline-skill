@@ -32,3 +32,8 @@ annotation_store/
 annotation_output.json
 arbitration_output.json
 graphify-out/
+# Provider config carries plaintext api_key values in practice; track
+# llm_profiles.example.yaml as the template instead. (Also matched by
+# the projects/ pattern above — listed explicitly here so the intent is
+# obvious to anyone reading this file.)
+projects/v3_initial_deployment/.annotation-pipeline/llm_profiles.yaml
