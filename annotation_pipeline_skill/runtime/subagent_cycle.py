@@ -2573,14 +2573,18 @@ class SubagentRuntime:
                     response_format={"type": "json_object"},
                 ))
             except Exception as exc:  # noqa: BLE001
-                raise _ArbiterCallFailed(str(exc))
+                # Tag with the underlying class — some clients raise empty-
+                # message exceptions (asyncio.CancelledError / TimeoutError /
+                # bare subprocess errors) where str(exc) is "" and we lose
+                # the only clue about what went wrong.
+                raise _ArbiterCallFailed(f"llm_call/{type(exc).__name__}: {exc!s}") from exc
             try:
                 payload = _parse_llm_json(result.final_text)
             except (json.JSONDecodeError, ValueError) as exc:
-                raise _ArbiterCallFailed(str(exc))
+                raise _ArbiterCallFailed(f"json_parse/{type(exc).__name__}: {exc!s}") from exc
             verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
             if not isinstance(verdicts, list):
-                raise _ArbiterCallFailed("arbiter response missing 'verdicts' list")
+                raise _ArbiterCallFailed("shape/missing_verdicts_list")
             corrected_check = payload.get("corrected_annotation") if isinstance(payload, dict) else None
             if isinstance(corrected_check, dict):
                 # First try a safe whitespace/punctuation auto-alignment of
