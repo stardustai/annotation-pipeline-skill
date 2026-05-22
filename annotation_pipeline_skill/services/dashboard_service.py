@@ -191,7 +191,7 @@ def _task_card(index: dict, task: Task) -> dict:
         "selected_annotator_id": task.selected_annotator_id,
         "annotator_model": annotator_model,
         "qc_model": qc_model,
-        "status_age_seconds": int((datetime.now(timezone.utc) - task.updated_at).total_seconds()),
+        "status_age_seconds": int((datetime.now(timezone.utc) - (task.updated_at if task.updated_at.tzinfo is not None else task.updated_at.replace(tzinfo=timezone.utc))).total_seconds()),
         "latest_attempt_status": latest_attempt.get("status") if latest_attempt else None,
         "feedback_count": feedback_count,
         "retry_pending": task.next_retry_at is not None,
