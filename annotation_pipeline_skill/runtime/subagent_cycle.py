@@ -193,6 +193,14 @@ class SubagentRuntime:
             output_schema=None,
             store=self.store,
         )
+        # Extracted prompt builder (Task 8). Old method bodies in this class
+        # remain intact for now; this wires the new module in for future use.
+        from annotation_pipeline_skill.runtime.prompt_builder import AnnotationPromptBuilder
+        self._prompt_builder = AnnotationPromptBuilder(
+            store=self.store,
+            project_id=self._project_id if hasattr(self, "_project_id") else "",
+            config=self.config,
+        )
 
     def run_once(self, stage_target: str = "annotation", limit: int | None = None) -> SubagentRuntimeResult:
         pending_tasks = self.store.list_tasks_by_status({TaskStatus.PENDING})
