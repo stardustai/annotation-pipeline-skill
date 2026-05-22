@@ -54,7 +54,15 @@ class LocalRuntimeScheduler:
     # provider error shapes. After this many consecutive bails on the same
     # task, give up and escalate to HUMAN_REVIEW. Reset on any successful
     # transition out of ANNOTATING.
-    TOTAL_BAIL_CAP: int = 25
+    #
+    # Lowered 25 → 10 (2026-05-22): in production the high cap caused
+    # hundreds of "hopeless" tasks (broken UTF-8, malformed source rows,
+    # repeated truncated JSON from MiniMax) to occupy worker slots for
+    # hours retrying without ever progressing. By the time bail count
+    # reaches ~5-6, the task has tried every fallback profile in the
+    # rotation; 10 gives enough headroom for transient outages while
+    # cutting effective worker-time-wasted-per-hopeless-task by 60%.
+    TOTAL_BAIL_CAP: int = 10
 
     # Provider health probe: every PROBE_INTERVAL the observer sends a minimal
     # ping ("ok") through each common target. If a target returns a permanent
@@ -75,6 +83,15 @@ class LocalRuntimeScheduler:
     # 0.0 disables the cap entirely (any worker can pick up any role).
     ARBITER_SLOT_FRACTION: float = 0.5
 
+    # Hot-reload: how often the dedicated config-watcher task re-reads the
+    # LLM profiles yaml to pick up changes to `max_concurrent_tasks`
+    # without restarting the scheduler. yaml stat() is cheap (single
+    # syscall, no I/O); we only fully re-parse when mtime actually
+    # changed, so polling fast is safe. Runs as its own asyncio.Task so
+    # the cadence is independent of the much slower observer
+    # (snapshot_interval_seconds, default 30s).
+    CONFIG_RELOAD_INTERVAL_SECONDS: float = 2.0
+
     def __init__(
         self,
         store: SqliteStore,
@@ -82,11 +99,35 @@ class LocalRuntimeScheduler:
         config: RuntimeConfig,
         *,
         now_fn: Callable[[], datetime] | None = None,
+        profiles_yaml_path: Path | None = None,
+        registry: Any | None = None,
+        client_builder: Callable[[Any], LLMClient] | None = None,
     ):
         self.store = store
-        self.client_factory = client_factory
+        # Two binding modes for client_factory:
+        #   - legacy: caller supplies `client_factory`; scheduler uses it
+        #     verbatim. Targets are baked in at startup, no hot-reload.
+        #   - hot-reload: caller supplies `registry` (the resolved LLMRegistry)
+        #     + `client_builder` (a function that turns one profile into a
+        #     client, default = LocalCLIClient). Scheduler builds its own
+        #     factory that calls `self._registry.resolve(target)` every
+        #     invocation, so a yaml-change → registry-swap takes effect on
+        #     the next worker request without restarting.
+        self._registry = registry
+        self._client_builder = client_builder
+        if registry is not None and client_builder is not None:
+            self.client_factory: Callable[[str], LLMClient] = self._resolve_client_from_registry
+        else:
+            self.client_factory = client_factory
         self.config = config
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        # Source-of-truth for hot-reloadable `max_concurrent_tasks`. Workers
+        # check this on every claim loop; observer rewrites it when yaml
+        # changes. Initial value comes from the frozen config; if the yaml
+        # path is provided, the observer can grow/shrink it at runtime.
+        self._runtime_max_workers: int = config.max_concurrent_tasks
+        self._profiles_yaml_path = profiles_yaml_path
+        self._profiles_yaml_mtime: float = 0.0
         # Per-target cooldown for the provider health probe — once the
         # observer ticks at PROBE_INTERVAL_SECONDS it walks PROBE_TARGETS
         # in order; this tracks last successful probe timestamps so a
@@ -105,6 +146,19 @@ class LocalRuntimeScheduler:
         # that budget and contradict the "HR = arbiter uncertain only"
         # invariant.
         self._clear_stale_records()
+
+    def _resolve_client_from_registry(self, target: str) -> "LLMClient":
+        """Used as ``self.client_factory`` when the scheduler was built in
+        registry-binding mode (``registry`` + ``client_builder`` supplied
+        at init). Resolves the target against the CURRENT registry — which
+        may have been swapped by the yaml hot-reload — so target re-bindings
+        in projects/llm_profiles.yaml take effect without a restart.
+        """
+        if self._registry is None or self._client_builder is None:
+            raise RuntimeError(
+                "scheduler not in registry-binding mode; cannot resolve target"
+            )
+        return self._client_builder(self._registry.resolve(target))
 
     def _clear_stale_records(self) -> None:
         """Drop leases / active_runs whose heartbeat is older than the stale window.
@@ -358,9 +412,20 @@ class LocalRuntimeScheduler:
         completed = 0
         busy_workers = 0
 
-        async def worker() -> None:
+        async def worker(worker_idx: int) -> None:
             nonlocal completed, busy_workers
             while not stop.is_set():
+                # Hot-reload self-cap: if the desired worker pool shrank
+                # (observer reloaded yaml, max_concurrent_tasks went down),
+                # the surplus workers idle here instead of claiming. Cheap
+                # 5s sleep — no DB hit. They wake up immediately if the
+                # pool grows back.
+                if worker_idx >= self._runtime_max_workers:
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
                 claim = self._try_claim_task(stage_target)
                 if claim is None:
                     if stop_when_idle and busy_workers == 0:
@@ -670,16 +735,109 @@ class LocalRuntimeScheduler:
                 if owns_singleton:
                     self._refresh_singleton()
 
-        worker_tasks = [
-            asyncio.create_task(worker()) for _ in range(self.config.max_concurrent_tasks)
+        # Worker pool starts at the configured size and can grow at
+        # runtime when the observer detects the yaml's
+        # `max_concurrent_tasks` went up. Held in a list so the observer
+        # can append new worker tasks (`worker_tasks.append(...)`); they're
+        # NOT awaited by `gather()` below — only the initial cohort is —
+        # so dynamically-added workers run as background tasks bound by
+        # the same `stop` event.
+        worker_tasks: list[asyncio.Task] = [
+            asyncio.create_task(worker(i))
+            for i in range(self._runtime_max_workers)
         ]
+        # Pool ceiling — highest worker_idx ever spawned. The observer
+        # uses this to know how many new tasks to create when scaling up.
+        spawned_workers = self._runtime_max_workers
+
+        async def reload_max_workers_from_yaml() -> None:
+            """Re-read the LLM profiles yaml mtime; if changed, parse it
+            and apply (a) the new ``max_concurrent_tasks`` and (b) the
+            new ``targets`` mapping. Scale-up spawns extra worker tasks;
+            scale-down is implicit (workers self-skip when their idx is
+            over the new cap). Target swap takes effect on the next
+            `client_factory(target)` call — workers in flight finish
+            their current LLM call against the OLD target binding, then
+            pick up the new one on the next claim."""
+            nonlocal spawned_workers
+            path = self._profiles_yaml_path
+            if path is None:
+                return
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                return
+            if mtime == self._profiles_yaml_mtime:
+                return
+            self._profiles_yaml_mtime = mtime
+            try:
+                from annotation_pipeline_skill.llm.profiles import load_llm_registry
+                reg = load_llm_registry(path)
+            except Exception:  # noqa: BLE001 — never let reload tank observer
+                return
+            import sys
+            # (a) max_concurrent_tasks
+            new_max = getattr(reg, "max_concurrent_tasks", None)
+            if isinstance(new_max, int) and new_max > 0 and new_max != self._runtime_max_workers:
+                old = self._runtime_max_workers
+                self._runtime_max_workers = new_max
+                print(
+                    f"[scheduler] hot-reload max_concurrent_tasks: {old} → {new_max}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                while spawned_workers < new_max:
+                    worker_tasks.append(asyncio.create_task(worker(spawned_workers)))
+                    spawned_workers += 1
+            # (b) targets (only effective when scheduler was constructed
+            # in registry-binding mode; legacy `client_factory=lambda...`
+            # mode keeps targets frozen because the caller's closure can't
+            # be reached from here)
+            if self._registry is not None and self._client_builder is not None:
+                old_targets = dict(getattr(self._registry, "targets", {}))
+                new_targets = dict(getattr(reg, "targets", {}))
+                if old_targets != new_targets:
+                    changes = []
+                    for k in sorted(set(old_targets) | set(new_targets)):
+                        if old_targets.get(k) != new_targets.get(k):
+                            changes.append(f"{k}: {old_targets.get(k)!r} → {new_targets.get(k)!r}")
+                    print(
+                        "[scheduler] hot-reload targets:\n  "
+                        + "\n  ".join(changes),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                self._registry = reg
+
+        async def config_watcher() -> None:
+            """Fast-tick watcher dedicated to hot-reloading
+            `max_concurrent_tasks` from the yaml. Independent of the
+            (slow, snapshot-cadence) observer so concurrency edits show
+            up within seconds, not 30s+."""
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=self.CONFIG_RELOAD_INTERVAL_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                if stop.is_set():
+                    return
+                try:
+                    await reload_max_workers_from_yaml()
+                except Exception:  # noqa: BLE001 — never let reload tank watcher
+                    pass
+
         observer_task = asyncio.create_task(observer())
+        config_watcher_task = asyncio.create_task(config_watcher())
         try:
             try:
-                await asyncio.gather(*worker_tasks, observer_task)
+                await asyncio.gather(*worker_tasks, observer_task, config_watcher_task)
             except asyncio.CancelledError:
                 stop.set()
-                await asyncio.gather(*worker_tasks, observer_task, return_exceptions=True)
+                await asyncio.gather(
+                    *worker_tasks, observer_task, config_watcher_task, return_exceptions=True
+                )
                 raise
         finally:
             if owns_singleton:

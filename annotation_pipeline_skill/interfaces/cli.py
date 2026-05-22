@@ -1743,10 +1743,22 @@ def _build_runtime_scheduler(
             runtime_config = replace(runtime_config, max_concurrent_tasks=context.registry.max_concurrent_tasks)
     else:
         runtime_config = config
+    # Resolve the yaml path so the scheduler can hot-reload
+    # `max_concurrent_tasks` AND `targets` without a restart. None when no
+    # yaml exists (scheduler then runs with the frozen startup value).
+    profiles_yaml_path = _resolve_project_profiles_path(context.project_root)
+    # Registry-binding mode: scheduler holds `registry` as a mutable attribute
+    # and resolves targets per request, so when reload_max_workers_from_yaml
+    # swaps `self._registry` the next worker call picks up the new binding.
+    # `client_factory` is still supplied as a no-op default so the legacy
+    # call signature stays valid (it's never invoked in this mode).
     return LocalRuntimeScheduler(
         store=context.store,
         client_factory=lambda target: LocalCLIClient(context.registry.resolve(target)),
+        registry=context.registry,
+        client_builder=LocalCLIClient,
         config=runtime_config,
+        profiles_yaml_path=profiles_yaml_path,
     )
 
 
