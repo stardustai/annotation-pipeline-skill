@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Literal, Mapping
 import yaml
 
 
-Runtime = Literal["claude_cli", "codex_cli"]
+Runtime = Literal["claude_cli", "codex_cli", "anthropic_sdk"]
 
 LLM_PROFILES_FILENAME = "llm_profiles.yaml"
 
@@ -100,6 +101,21 @@ def load_llm_registry(path: Path | str) -> LLMRegistry:
     if not isinstance(limits, dict):
         raise ProfileValidationError("LLM profile limits must be a mapping")
     max_concurrent_tasks = _optional_positive_int(limits.get("max_concurrent_tasks"), "limits.max_concurrent_tasks")
+    system_mcp_servers = _optional_mcp_servers(payload.get("mcp_servers"), "mcp_servers") or []
+    if system_mcp_servers:
+        # Both claude_cli and anthropic_sdk runtimes consume MCP-style
+        # tool declarations (claude_cli via --mcp-config subprocess,
+        # anthropic_sdk via the in-process tool_registry). Both must
+        # inherit the workspace-level mcp_servers list or SDK profiles
+        # would silently lose access to the KB / validator tools that
+        # the prompts already reference.
+        profiles = {
+            name: dataclasses.replace(
+                profile,
+                mcp_servers=system_mcp_servers + (profile.mcp_servers or []),
+            ) if profile.runtime in {"claude_cli", "anthropic_sdk"} else profile
+            for name, profile in profiles.items()
+        }
     registry = LLMRegistry(
         profiles=profiles,
         targets=targets,
@@ -114,8 +130,11 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
     if not isinstance(raw, dict):
         raise ProfileValidationError(f"LLM profile must be a mapping: {name}")
     runtime = raw.get("runtime")
-    if runtime not in {"claude_cli", "codex_cli"}:
-        raise ProfileValidationError(f"profile {name} runtime must be 'claude_cli' or 'codex_cli', got: {runtime!r}")
+    if runtime not in {"claude_cli", "codex_cli", "anthropic_sdk"}:
+        raise ProfileValidationError(
+            f"profile {name} runtime must be 'claude_cli', 'codex_cli', or 'anthropic_sdk', "
+            f"got: {runtime!r}"
+        )
     model = _required_string(raw.get("model"), f"profile {name} model")
     base_url = _required_string(raw.get("base_url"), f"profile {name} base_url")
     api_key_env = _optional_api_key_env(raw.get("api_key_env"), f"profile {name} api_key_env")

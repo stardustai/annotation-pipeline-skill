@@ -528,10 +528,35 @@ def parse_claude_stream_events(
 
 
 class LocalCLIClient:
-    def __init__(self, profile: LLMProfile):
+    def __init__(
+        self,
+        profile: LLMProfile,
+        *,
+        store: "SqliteStore | None" = None,
+        project_id: str | None = None,
+    ) -> None:
         self.profile = profile
+        # SDK runtime needs the store + project_id at construction (the
+        # in-process tool dispatcher binds to them). claude_cli /
+        # codex_cli paths ignore these — their MCP tools spawn stdio
+        # subprocesses with their own --project-root args.
+        self._store = store
+        self._project_id = project_id
+        self._anthropic_impl: object | None = None
+        if profile.runtime == "anthropic_sdk":
+            # Lazy import keeps the anthropic package optional for
+            # workers that only run claude_cli / codex_cli profiles.
+            from annotation_pipeline_skill.llm.anthropic_sdk import (
+                AnthropicSDKClient,
+            )
+            self._anthropic_impl = AnthropicSDKClient(
+                profile, store=store, project_id=project_id,
+            )
 
     async def generate(self, request: LLMGenerateRequest) -> LLMGenerateResult:
+        if self.profile.runtime == "anthropic_sdk":
+            assert self._anthropic_impl is not None  # set in __init__
+            return await self._anthropic_impl.generate(request)
         if self.profile.runtime == "codex_cli":
             return await self._generate_codex(request)
         if self.profile.runtime == "claude_cli":
