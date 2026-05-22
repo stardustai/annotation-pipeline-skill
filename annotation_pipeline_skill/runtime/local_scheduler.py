@@ -317,8 +317,26 @@ class LocalRuntimeScheduler:
                         _is_provider_permanent_error,
                     )
                     last_exception_was_permanent = _is_provider_permanent_error(worker_exc)
+                    # Mirror of the arbiter wrap site: LocalCLIExecutionError
+                    # only stringifies to "local CLI provider failed"; the
+                    # actual cause (auth, model name, OOM, API 5xx, 402) is in
+                    # .diagnostics (returncode + last 4KB of stderr + parsed
+                    # error_event from stream-json is_error). Without this
+                    # tail, last_provider_error stored on tasks gives operators
+                    # no clue what to fix when annotation/qc bail.
+                    diag = getattr(worker_exc, "diagnostics", None)
+                    tail = ""
+                    if isinstance(diag, dict):
+                        rc = diag.get("returncode")
+                        err = (diag.get("stderr") or "")
+                        if isinstance(err, str):
+                            err = err.strip().replace("\n", " | ")[-300:]
+                        err_ev = diag.get("error_event") or {}
+                        api_status = err_ev.get("api_error_status") if isinstance(err_ev, dict) else None
+                        api_msg = err_ev.get("result_text") if isinstance(err_ev, dict) else None
+                        tail = f" rc={rc} api_status={api_status} api_msg={str(api_msg)[:200]!r} stderr={err!r}"
                     last_exception_summary = (
-                        f"{type(worker_exc).__name__}: {str(worker_exc)[:200]}"
+                        f"{type(worker_exc).__name__}: {str(worker_exc)[:200]}{tail}"
                     )
                 finally:
                     self.store.delete_active_run(run.run_id)
