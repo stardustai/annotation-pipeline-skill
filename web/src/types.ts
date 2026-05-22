@@ -286,7 +286,7 @@ export interface ProviderConfigSnapshot {
   profiles: ProviderProfileConfig[];
   targets: Record<string, string>;
   limits: {
-    local_cli_global_concurrency: number | null;
+    max_concurrent_tasks: number | null;
   };
   diagnostics: Record<string, ProviderDiagnostic>;
 }

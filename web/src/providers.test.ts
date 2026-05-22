@@ -21,7 +21,7 @@ const snapshot: ProviderConfigSnapshot = {
     },
   ],
   targets: { annotation: "local_codex", qc: "local_codex" },
-  limits: { local_cli_global_concurrency: 4 },
+  limits: { max_concurrent_tasks: 4 },
   diagnostics: {
     local_codex: {
       status: "ok",

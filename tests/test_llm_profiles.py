@@ -31,14 +31,11 @@ profiles:
 targets:
   qc: ds
   coordinator: glm
-limits:
-  local_cli_global_concurrency: 4
 """)
     registry = load_llm_registry(p)
     assert registry.resolve("qc").runtime == "claude_cli"
     assert registry.resolve("qc").model == "deepseek-v4-flash"
     assert registry.resolve("coordinator").runtime == "claude_cli"
-    assert registry.local_cli_global_concurrency == 4
 
 
 def test_codex_runtime_parsed(tmp_path: Path):

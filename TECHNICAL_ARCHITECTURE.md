@@ -702,6 +702,21 @@ loop:
 `worker_task_timeout_seconds` 是单次 task 的硬上限。LLM 调用挂死（codex
 subprocess 卡住、HTTP stream 不返回）超过这个时间会被取消，task 回收。
 
+#### Stage priority
+
+`_try_claim_task` 在扫候选时按 stage 优先级 + `created_at` 排序：
+
+| 优先级 | Status | 理由 |
+|---|---|---|
+| 0 | ARBITRATING | 最靠近 terminal，优先消化避免堆积 |
+| 1 | QC (resume) | 标注已完成，下一步就出结果 |
+| 2 | ANNOTATING | restart orphan，可能升 QC 或回 PENDING |
+| 3 | PENDING | 池子通常最大（千级），优先级最低 |
+
+不加优先级时 PENDING 池子（常态 3000+）会一直霸占新 claim，几十个
+ARBITRATING / QC 永远轮不到 → 累积成 ghost。`ARBITER_SLOT_FRACTION = 0.5`
+保证一半 worker 留给 PENDING/ANNOTATION，防止 ARBITRATING 反向饿死下游。
+
 ### 10.3 Worker-bail reset
 
 worker `finally` 段会主动把 ANNOTATING 的 task reset 回 PENDING。理由：
@@ -750,9 +765,48 @@ runtime 强制以下隔离参数：
   需要 bash/read）
 - `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check` —— 非
   交互运行
+- `claude --bare` —— 强制不读 OAuth / keychain / `~/.claude` credentials，
+  不加载 hooks / CLAUDE.md / MCP / background prefetch
 
-每次调用创建一个隔离的 `CODEX_HOME`（auth + config 拷贝），避免并发 codex
-调用互相污染。
+每次调用创建一个隔离的 `CODEX_HOME` / `HOME`（auth + config 拷贝），避免并
+发 codex/claude 调用互相污染。
+
+#### Subprocess lifecycle
+
+`_die_with_parent()`（preexec_fn）调用 Linux `PR_SET_PDEATHSIG = SIGKILL`，
+确保 runtime 进程被 kill 时所有 codex/claude 子进程立即被内核收割。没有这
+个机制时，runtime 被 SIGKILL 后子进程会变成 PPID=1 的孤儿继续跑，可能写回
+真实的 OAuth credentials 文件造成污染（曾观察到 isolated home 里
+`auth.json` 被孤儿进程覆盖成测试用的 `{"token":"demo"}` 而触发后续大批 HR
+的事故）。
+
+#### OAuth state 拷贝 / 注入
+
+`isolated_codex_home`：默认 path（profile 没设 `api_key`）下从用户 `~/.codex/`
+拷贝 OAuth 完整 state 到 isolated HOME，包括：
+
+| 文件 | 用途 |
+|---|---|
+| `auth.json` | `{auth_mode, OPENAI_API_KEY?, tokens{id,access,refresh}, last_refresh}` |
+| `config.toml` | 先拷贝以保留 mcp 等配置，随后由 `_write_isolated_codex_config` 覆盖 model 字段 |
+| `credentials.json` | legacy key-mode（少见） |
+| `.credentials.json` | 某些版本用的隐藏 credentials 文件 |
+| `installation_id` | OAuth client 标识；refresh flow 部分场景需要 |
+
+**不拷贝**：`history.jsonl`、`log/`、`logs_2.sqlite*`、`cache/`、`.tmp/`（用户
+历史与运行时状态）；`app-server-control/`、`app-server-daemon/`（IPC socket
+目录）；`memories/`（用户记忆）。
+
+`isolated_claude_home`：claude `--bare` 模式下，二进制不读 `.credentials.json`
+里的 OAuth token（实测 strace 确认会 open 文件但忽略），所以拷贝文件无效。
+改为**从 `~/.claude/.credentials.json` 读取 `claudeAiOauth.accessToken`，注入
+到 isolated env 的 `ANTHROPIC_API_KEY`** —— 让 Claude Code Pro / Max 订阅
+用户可以直接用 `claude_sonnet` / `claude_haiku` profile（无需 sk-ant-... API
+key）跑 arbiter / QC，走的是订阅 quota 不是 metered API。优先级：profile.
+api_key > OAuth fallback > 不注入（runtime 报正常 auth 错）。
+
+第三方 Anthropic-兼容 vendor（DeepSeek / GLM / MiniMax）的 profile 必须显
+式设 `api_key` 和 `base_url`，走第三方端点；不会触发 OAuth fallback。
 
 
 ## 11. 执行模型
@@ -862,6 +916,22 @@ discussion replies。
   emit verbatim
 
 retry 耗尽后清空 corrected_annotation，让外层逻辑继续。
+
+#### Safe-span auto-fix
+
+verbatim 校验之前，`auto_fix_safe_spans_in_place`（`core/schema_validation.py`）
+对 corrected_annotation 做安全字符级修正，三类操作都保证**不改字母 / 数字 /
+任何非空白字符**：
+
+- **头尾 trim**：去掉 span 两端的空白 / 句末标点 / 引号（中英文都支持）
+- **Internal whitespace recovery**：当 span 是 input 的"去空白版"时
+  （例：arbiter 输出 `"1764"`，input 是 `"1 7 6 4"`），自动恢复 input 里
+  那段原始带空白的子串。处理 CJK OCR / 排版风格的字符间空格场景
+- **共享类型 field routing**：单 word span 放 `entities.<type>`，多 word
+  放 `json_structures.<type>`
+
+只有真正的字母级差异（大小写、简繁体、Unicode 等价、paraphrase）才会触发
+verbatim 失败并走 retry / bail counter。
 
 #### Arbiter outcome counters
 
@@ -1274,12 +1344,36 @@ targets:
   coordinator: glm_46
 
 limits:
-  local_cli_global_concurrency: 8     # 同时跑的 codex/claude subprocess 上限
+  max_concurrent_tasks: 16            # async worker 数（local_scheduler 直接读这个）
 ```
 
 `targets` 是逻辑角色 → profile 的映射。runtime 通过
 `registry.resolve("annotation")` 拿到当前 annotation 该用的 profile。
 fallback 是 `_generate_async` 在 429 时切换的目标（参见 §12.2）。
+
+`max_concurrent_tasks` 是 worker 协程数的硬上限（`local_scheduler.py:509`
+`asyncio.create_task(worker()) for _ in range(self.config.max_concurrent_tasks)`）。
+ARBITER_SLOT_FRACTION = 0.5 在此基础上限制并发 arbitration 数，保证
+annotation/QC 不被 arbiter 长尾饿死（参见 §10.2）。
+
+#### 真 Anthropic 模型的 OAuth fallback
+
+对于 `model: claude-*` + `base_url: https://api.anthropic.com` 的 profile，
+**可以省略 `api_key` 字段** —— runtime 会自动从 `~/.claude/.credentials.json`
+里的 `claudeAiOauth.accessToken` 注入到 `ANTHROPIC_API_KEY`，走用户
+Claude Code Pro / Max 订阅 quota（详见 §10.6 OAuth state 拷贝 / 注入）。
+
+```yaml
+claude_sonnet:
+  provider: local_cli
+  cli_kind: claude
+  model: claude-sonnet-4-5
+  base_url: https://api.anthropic.com
+  # api_key 可省 —— 自动复用本地订阅 OAuth
+```
+
+第三方 Anthropic-兼容 vendor（DeepSeek / GLM / MiniMax 的 `/anthropic`
+端点）必须显式设 `api_key`，不会触发 OAuth fallback。
 
 ### 13.3 workflow.yaml 示例
 

@@ -698,14 +698,50 @@ def validate_payload_against_task_schema(
     validator = Draft202012Validator(schema)
     errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.absolute_path))
     if errors:
+        # jsonschema's `err.message` embeds the failing value as a Python
+        # repr. For top-level array errors ("rows: array is too long") that
+        # repr is the ENTIRE annotation — 3KB+ on a 10-row task — which
+        # propagates through feedback storage, audit_events, AND every
+        # downstream arbiter prompt as a redundant copy of the data the
+        # arbiter is already getting through `current_annotation`. Strip
+        # to a compact one-liner using the validator name + the relevant
+        # bits, and cap the raw message as a safety net.
+        MSG_CAP = 400
         raise SchemaValidationError(
             f"schema validation failed with {len(errors)} error(s)",
-            [
-                {
-                    "kind": "schema_error",
-                    "path": "/".join(str(p) for p in err.absolute_path),
-                    "message": err.message,
-                }
-                for err in errors
-            ],
+            [_compact_schema_error(err, MSG_CAP) for err in errors],
         )
+
+
+def _compact_schema_error(err: Any, msg_cap: int) -> dict[str, Any]:
+    """Build a feedback-friendly dict from a jsonschema ValidationError.
+    Avoids dumping the failing value (which can be the entire payload)
+    into `message`; instead names the rule + the local context.
+    """
+    path = "/".join(str(p) for p in err.absolute_path)
+    rule = getattr(err, "validator", "?")
+    rule_val = getattr(err, "validator_value", None)
+    if rule in {"maxItems", "minItems"} and isinstance(rule_val, int):
+        size = len(err.instance) if hasattr(err.instance, "__len__") else None
+        compact = f"array at {path or '<root>'} violates {rule}={rule_val} (got len={size})"
+    elif rule in {"required"}:
+        compact = f"object at {path or '<root>'} missing required field(s): {rule_val}"
+    elif rule in {"type"}:
+        compact = f"value at {path or '<root>'} should be {rule_val}, got {type(err.instance).__name__}"
+    elif rule in {"enum"}:
+        # Show the bad value but cap; enum violations need the bad value to be useful.
+        bad = repr(err.instance)
+        if len(bad) > 80:
+            bad = bad[:80] + "…"
+        compact = f"value at {path or '<root>'} not in enum: {bad}"
+    else:
+        # Generic fallback: take the underlying message but cap it. The
+        # repr embedded by jsonschema can be arbitrarily large.
+        raw = (err.message or "")
+        compact = raw if len(raw) <= msg_cap else raw[:msg_cap] + "… [truncated]"
+    return {
+        "kind": "schema_error",
+        "path": path,
+        "rule": rule,
+        "message": compact,
+    }

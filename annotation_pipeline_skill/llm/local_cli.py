@@ -188,8 +188,27 @@ def isolated_codex_home(
                 encoding="utf-8",
             )
         else:
-            # Default path: copy user's codex auth
-            for filename in ("auth.json", "config.toml", "credentials.json"):
+            # Default path: copy user's codex auth + OAuth state.
+            # Files to preserve for OAuth (ChatGPT-mode) authentication:
+            #   - auth.json: {auth_mode, OPENAI_API_KEY?, tokens{id,access,refresh}, last_refresh}
+            #   - config.toml: gets overwritten below by _write_isolated_codex_config, but
+            #     copy first so any non-overwritten fields (mcp configs, etc.) survive
+            #   - credentials.json: legacy key-mode credentials (rare)
+            #   - .credentials.json: hidden file some codex versions use (current ~/.codex
+            #     observed at 1071 bytes)
+            #   - installation_id: OAuth client identifier; some refresh flows fail
+            #     silently without it
+            # NOT copied (would leak user state / are transient):
+            #   - history.jsonl, log/, logs_2.sqlite*, cache/, .tmp/ — user history & runtime state
+            #   - app-server-control/, app-server-daemon/ — IPC socket dirs
+            #   - memories/ — user-curated memory store
+            for filename in (
+                "auth.json",
+                "config.toml",
+                "credentials.json",
+                ".credentials.json",
+                "installation_id",
+            ):
                 source_file = source_home / filename
                 if source_file.exists():
                     shutil.copy2(source_file, isolated_home / filename)
@@ -225,7 +244,19 @@ def isolated_claude_home(
     """Per-task isolated HOME for `claude --bare`. Never copies real ~/.claude;
     auth comes from ANTHROPIC_API_KEY in the env. Defense-in-depth on top of
     --bare so any path that bypasses --bare (skill plugin dirs, settings
-    lookup, history files) still cannot reach the user's real .claude tree."""
+    lookup, history files) still cannot reach the user's real .claude tree.
+
+    OAuth fallback: when no ``provider_api_key`` is supplied AND the user has
+    a Claude Code Pro / Max subscription (``~/.claude/.credentials.json``
+    contains a ``claudeAiOauth.accessToken``), reuse that OAuth access token
+    as ``ANTHROPIC_API_KEY``. This mirrors what bare-shell ``claude`` does
+    when launched directly: the binary looks up the OAuth credentials and
+    sends them as the bearer token. With ``--bare`` the binary itself won't
+    read the credentials file (verified via strace — it opens it but still
+    reports ``Not logged in``), so we inject the token into env explicitly.
+    Lets users run Anthropic claude_sonnet / claude_haiku targets without
+    needing a separate sk-ant-... API key.
+    """
     runtime_root = Path(env.get("ANNOTATION_CLAUDE_HOME_ROOT") or Path.cwd() / ".annotation-pipeline-claude-homes")
     runtime_root.mkdir(parents=True, exist_ok=True)
 
@@ -239,12 +270,50 @@ def isolated_claude_home(
 
     isolated_env = codex_shell_environment(env)
     isolated_env["HOME"] = str(isolated_home)
-    if provider_api_key:
-        isolated_env["ANTHROPIC_API_KEY"] = provider_api_key
+
+    # OAuth fallback BEFORE applying explicit provider_api_key so a real
+    # provider key always wins.
+    resolved_api_key = provider_api_key
+    if not resolved_api_key:
+        oauth_token = _read_claude_oauth_token(env)
+        if oauth_token:
+            resolved_api_key = oauth_token
+
+    if resolved_api_key:
+        isolated_env["ANTHROPIC_API_KEY"] = resolved_api_key
     if provider_base_url:
         isolated_env["ANTHROPIC_BASE_URL"] = provider_base_url
 
     yield isolated_env, isolated_home, home_id
+
+
+def _read_claude_oauth_token(env: Mapping[str, str]) -> str | None:
+    """Return the Claude Code Pro / Max OAuth access token from the user's
+    ``~/.claude/.credentials.json`` if present, else None.
+
+    Resolves the user HOME from the input ``env`` mapping (not ``os.environ``)
+    so tests and callers passing a synthetic HOME hit a predictable path.
+    Returns None on any read/parse error — caller falls back to the no-key
+    code path and the subsequent claude call will surface its own auth
+    failure with the proper error.
+    """
+    home_str = env.get("HOME")
+    if not home_str:
+        return None
+    creds_path = Path(home_str) / ".claude" / ".credentials.json"
+    if not creds_path.exists():
+        return None
+    try:
+        data = json.loads(creds_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    return token if isinstance(token, str) and token else None
 
 
 def parse_codex_json_events(
@@ -481,6 +550,17 @@ class LocalCLIClient:
             provider_api_key=api_key,
             provider_base_url=self.profile.base_url,
         ) as (env, _home, resolved_home_id):
+            # Sticky-routing hint: forward task_id to the gateway so a
+            # LiteLLM router can pin every turn/retry of one task to the
+            # same vLLM instance and let prefix-cache hits accumulate.
+            # Merge with any preexisting ANTHROPIC_CUSTOM_HEADERS so we
+            # don't clobber user-supplied headers.
+            if request.task_id:
+                header_line = f"x-task-id: {request.task_id}"
+                existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+                env["ANTHROPIC_CUSTOM_HEADERS"] = (
+                    f"{existing}\n{header_line}" if existing else header_line
+                )
             # Materialize the per-invocation mcp-config.json inside the
             # isolated home. The home is persistent across invocations
             # (needed for session resume); this file is simply overwritten

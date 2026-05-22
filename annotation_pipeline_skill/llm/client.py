@@ -24,6 +24,13 @@ class LLMGenerateRequest:
     # but preserved on the request for callers that already populate it and
     # for future runtimes that may honor it.
     response_format: dict[str, Any] | None = None
+    # Stable identifier (e.g. pipeline task_id) that runtimes may forward to
+    # the gateway as a sticky-routing hint. claude_cli surfaces it as the
+    # ``x-task-id`` HTTP header via ``ANTHROPIC_CUSTOM_HEADERS`` so a
+    # LiteLLM router can pin every retry/turn for one task to the same
+    # vLLM instance, letting that instance's prefix-cache fill up across
+    # the multi-turn annotation conversation.
+    task_id: str | None = None
 
 
 @dataclass(frozen=True)

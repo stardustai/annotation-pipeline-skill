@@ -165,9 +165,9 @@ export function ProvidersPanel() {
             </label>
           ))}
           <NumberField
-            label="Local CLI Global Concurrency"
-            value={snapshot.limits.local_cli_global_concurrency}
-            onChange={(value) => setSnapshot({ ...snapshot, limits: { local_cli_global_concurrency: value } })}
+            label="Max Concurrent Tasks"
+            value={snapshot.limits.max_concurrent_tasks}
+            onChange={(value) => setSnapshot({ ...snapshot, limits: { max_concurrent_tasks: value } })}
           />
         </div>
       </div>
@@ -231,6 +231,12 @@ export function ProvidersPanel() {
                 <NumberField label="Max Retries" value={selected.max_retries} onChange={(value) => updateSelected({ max_retries: value })} />
                 <NumberField label="Concurrency Limit" value={selected.concurrency_limit} onChange={(value) => updateSelected({ concurrency_limit: value })} />
                 <NumberField label="No Progress Timeout" value={selected.no_progress_timeout_seconds} onChange={(value) => updateSelected({ no_progress_timeout_seconds: value })} />
+                <BoolField
+                  label="Disable Continuity"
+                  hint="Off (default) replays the conversation via claude --resume so vLLM's prefix cache stays warm. On = every turn opens a fresh session (no cache reuse). Only set on if continuity is causing context overflow that delta-prompt can't contain."
+                  value={selected.disable_continuity}
+                  onChange={(value) => updateSelected({ disable_continuity: value })}
+                />
               </div>
 
               <div className="provider-diagnostics">
@@ -298,6 +304,35 @@ function NumberField(props: { label: string; value: number | null; onChange: (va
         value={props.value ?? ""}
         onChange={(event) => props.onChange(event.target.value ? Number(event.target.value) : null)}
       />
+    </label>
+  );
+}
+
+function BoolField(props: {
+  label: string;
+  value: boolean | null;
+  hint?: string;
+  onChange: (value: boolean | null) => void;
+}) {
+  // Tri-state: null = "inherit/unset", true/false = explicit. Stored as null
+  // when the operator clears it so the YAML stays sparse (no `disable_continuity: false`
+  // noise on every profile).
+  const display = props.value === null || props.value === undefined ? "" : props.value ? "true" : "false";
+  return (
+    <label>
+      <span>{props.label}</span>
+      <select
+        value={display}
+        onChange={(event) => {
+          const next = event.target.value;
+          props.onChange(next === "" ? null : next === "true");
+        }}
+      >
+        <option value="">(unset)</option>
+        <option value="false">false</option>
+        <option value="true">true</option>
+      </select>
+      {props.hint ? <small className="provider-field-hint">{props.hint}</small> : null}
     </label>
   );
 }

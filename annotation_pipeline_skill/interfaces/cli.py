@@ -128,8 +128,6 @@ targets:
   qc: local_claude
   coordinator: local_claude
 
-limits:
-  local_cli_global_concurrency: 4
 """,
 }
 
@@ -1230,6 +1228,8 @@ def handle_runtime_run(args: argparse.Namespace) -> int:
     import asyncio
     import signal
 
+    from annotation_pipeline_skill.runtime.local_scheduler import SchedulerAlreadyRunningError
+
     context = _runtime_context(args.project_root)
     scheduler = _build_runtime_scheduler(context)
 
@@ -1241,11 +1241,22 @@ def handle_runtime_run(args: argparse.Namespace) -> int:
                 loop.add_signal_handler(getattr(signal, signame), stop.set)
             except (NotImplementedError, RuntimeError):
                 pass
-        completed = await scheduler.run_forever(
-            stage_target=args.stage_target,
-            stop_event=stop,
-            max_tasks=args.max_tasks,
-        )
+        try:
+            completed = await scheduler.run_forever(
+                stage_target=args.stage_target,
+                stop_event=stop,
+                max_tasks=args.max_tasks,
+            )
+        except SchedulerAlreadyRunningError as exc:
+            # Singleton guard rejected this start. Emit a structured error so
+            # operators see the conflicting PID/host directly instead of
+            # tailing logs to figure out why two processes are running.
+            print(json.dumps({
+                "error": "scheduler_already_running",
+                "message": str(exc),
+                "owner": exc.owner,
+            }, sort_keys=True, indent=2))
+            return 2
         print(json.dumps({"completed": completed}, sort_keys=True, indent=2))
         return 0
 
@@ -1586,13 +1597,9 @@ def _build_runtime_scheduler(
         runtime_config = config
     return LocalRuntimeScheduler(
         store=context.store,
-        client_factory=lambda target: _build_llm_client(context.registry.resolve(target)),
+        client_factory=lambda target: LocalCLIClient(context.registry.resolve(target)),
         config=runtime_config,
     )
-
-
-def _build_llm_client(profile):
-    return LocalCLIClient(profile)
 
 
 if __name__ == "__main__":

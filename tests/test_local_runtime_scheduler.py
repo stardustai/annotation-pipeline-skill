@@ -505,3 +505,135 @@ def test_stop_mid_task_exits_fast_and_does_not_bump_bail_counter(tmp_path):
     # Lease/active_run released cleanly so next runtime can re-claim.
     assert store.list_runtime_leases() == []
     assert store.list_active_runs() == []
+
+
+def test_singleton_owner_is_acquired_and_released_around_run_forever(tmp_path):
+    """A continuous run_forever invocation writes scheduler_owner.json on
+    entry and removes it on clean shutdown. Operators (and the next start
+    attempt) can read this file to identify the live owner."""
+    import asyncio
+
+    store = SqliteStore.open(tmp_path)
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=passing_client_factory,
+        config=RuntimeConfig(max_concurrent_tasks=1),
+    )
+    owner_path = scheduler._singleton_owner_path
+
+    async def drive():
+        stop = asyncio.Event()
+
+        async def stopper():
+            # Let the scheduler's setup write the owner file before we stop.
+            await asyncio.sleep(0.05)
+            assert owner_path.exists(), "owner sentinel not written on startup"
+            stop.set()
+
+        await asyncio.gather(
+            scheduler.run_forever(stage_target="annotation", stop_event=stop),
+            stopper(),
+        )
+
+    asyncio.run(drive())
+
+    # Clean shutdown deletes the owner file so the next start isn't blocked.
+    assert not owner_path.exists(), "owner sentinel not removed on shutdown"
+
+
+def test_run_forever_rejects_second_instance_when_first_is_alive(tmp_path):
+    """When a fresh owner sentinel already exists, a second run_forever
+    raises SchedulerAlreadyRunningError before workers are spawned. The
+    error carries the owner record so the CLI can print PID/host."""
+    import asyncio
+    import json
+    import os
+
+    from annotation_pipeline_skill.runtime.local_scheduler import (
+        SchedulerAlreadyRunningError,
+    )
+
+    store = SqliteStore.open(tmp_path)
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=passing_client_factory,
+        config=RuntimeConfig(max_concurrent_tasks=1, snapshot_interval_seconds=30),
+    )
+    # Plant a fresh owner sentinel as if another scheduler is alive.
+    owner_path = scheduler._singleton_owner_path
+    owner_path.parent.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    owner_path.write_text(
+        json.dumps({
+            "pid": os.getpid() + 1,  # pretend another process owns it
+            "hostname": "test-host",
+            "started_at": now_iso,
+            "last_heartbeat_at": now_iso,
+        }),
+        encoding="utf-8",
+    )
+
+    try:
+        asyncio.run(scheduler.run_forever(stage_target="annotation", stop_when_idle=True))
+    except SchedulerAlreadyRunningError as exc:
+        assert exc.owner.get("hostname") == "test-host"
+        # Did not commit suicide on the planted sentinel.
+        assert owner_path.exists()
+        return
+    # stop_when_idle bypasses the guard, so this call should NOT raise.
+    # Run again in continuous mode to confirm the guard fires.
+    async def drive_continuous():
+        with __import__("pytest").raises(SchedulerAlreadyRunningError) as caught:
+            await scheduler.run_forever(stage_target="annotation")
+        return caught.value
+    err = asyncio.run(drive_continuous())
+    assert err.owner.get("hostname") == "test-host"
+    assert owner_path.exists()
+
+
+def test_stale_owner_sentinel_is_overwritten(tmp_path):
+    """An owner sentinel older than the staleness threshold (max(2*interval,
+    120s)) is presumed to belong to a dead scheduler — the new scheduler
+    overwrites it and starts."""
+    import asyncio
+    import json
+    import os
+    from datetime import datetime, timedelta, timezone
+
+    store = SqliteStore.open(tmp_path)
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=passing_client_factory,
+        config=RuntimeConfig(max_concurrent_tasks=1, snapshot_interval_seconds=30),
+    )
+    owner_path = scheduler._singleton_owner_path
+    owner_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_iso = (datetime.now(timezone.utc) - timedelta(seconds=3600)).isoformat()
+    owner_path.write_text(
+        json.dumps({
+            "pid": os.getpid() + 1,
+            "hostname": "ghost-host",
+            "started_at": stale_iso,
+            "last_heartbeat_at": stale_iso,
+        }),
+        encoding="utf-8",
+    )
+
+    async def drive():
+        stop = asyncio.Event()
+
+        async def stopper():
+            await asyncio.sleep(0.05)
+            # By now this scheduler should have claimed the sentinel.
+            payload = json.loads(owner_path.read_text(encoding="utf-8"))
+            assert payload["pid"] == os.getpid()
+            assert payload["hostname"] != "ghost-host"
+            stop.set()
+
+        await asyncio.gather(
+            scheduler.run_forever(stage_target="annotation", stop_event=stop),
+            stopper(),
+        )
+
+    asyncio.run(drive())

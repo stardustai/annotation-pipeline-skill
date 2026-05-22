@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+import socket
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
@@ -13,6 +17,16 @@ from annotation_pipeline_skill.llm.client import LLMClient
 from annotation_pipeline_skill.runtime.snapshot import build_runtime_snapshot
 from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+
+class SchedulerAlreadyRunningError(RuntimeError):
+    """Raised when a continuous scheduler tries to start while another live
+    scheduler owns this project's store. Carries the owner record so the
+    caller can surface PID/hostname/age in an operator-facing message."""
+
+    def __init__(self, message: str, *, owner: dict | None = None) -> None:
+        super().__init__(message)
+        self.owner = owner or {}
 
 
 class LocalRuntimeScheduler:
@@ -193,7 +207,7 @@ class LocalRuntimeScheduler:
         can dedup on (target, api_error_status) if it cares.
         """
         import sys
-        import json as _json
+        from annotation_pipeline_skill.runtime.alerts import append_alert
         banner = (
             f"\n🚨 PROVIDER HEALTH  target={target}  status={api_error_status}  "
             f"class={exc_class or 'is_error'}\n   {str(message)[:300]}\n"
@@ -203,20 +217,14 @@ class LocalRuntimeScheduler:
             print(banner, file=sys.stderr, flush=True)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            alerts_path = self.store.root / "alerts.jsonl"
-            with open(alerts_path, "a", encoding="utf-8") as f:
-                f.write(_json.dumps({
-                    "ts": self._now_fn().isoformat(),
-                    "kind": "provider_health",
-                    "target": target,
-                    "api_error_status": api_error_status,
-                    "exception_class": exc_class,
-                    "message": str(message)[:500],
-                }) + "\n")
-        except Exception:  # noqa: BLE001 — best-effort
-            pass
-
+        append_alert(self.store.root, {
+            "ts": self._now_fn().isoformat(),
+            "kind": "provider_health",
+            "target": target,
+            "api_error_status": api_error_status,
+            "exception_class": exc_class,
+            "message": str(message)[:500],
+        })
     def _delayed_sweep_unclaimed_orphans(self) -> None:
         """Catch ANNOTATING / QC tasks that no worker claimed during the
         settle window. Called periodically by the observer coroutine.
@@ -330,6 +338,15 @@ class LocalRuntimeScheduler:
 
         Returns the number of tasks processed.
         """
+        # Singleton guard: only one continuous scheduler per project store.
+        # Skip for on-demand modes (stop_when_idle=True is used by the
+        # dashboard "run once" button and by tests, which legitimately
+        # co-exist with a long-running scheduler — the SQLite lease layer
+        # handles their race).
+        owns_singleton = not stop_when_idle
+        if owns_singleton:
+            self._acquire_singleton()
+
         stop = stop_event or asyncio.Event()
         runtime = SubagentRuntime(
             store=self.store,
@@ -580,6 +597,12 @@ class LocalRuntimeScheduler:
                                 backoff_seconds = min(base * bails, 600)
                                 next_retry_at = self._now_fn() + timedelta(seconds=backoff_seconds)
                                 latest.next_retry_at = next_retry_at
+                                # Clear annotation session handles so the next
+                                # attempt sends a full prompt rather than a
+                                # context-free delta against a lost KV cache
+                                # (e.g. after a vllm restart mid-annotation).
+                                latest.metadata.pop("continuity_handle", None)
+                                latest.metadata.pop("_ann_sent_feedback_ids", None)
                                 try:
                                     event = transition_task(
                                         latest, TaskStatus.PENDING,
@@ -644,17 +667,23 @@ class LocalRuntimeScheduler:
                 except Exception:  # noqa: BLE001 — never let probe failure tank observer
                     pass
                 self._write_snapshot()
+                if owns_singleton:
+                    self._refresh_singleton()
 
         worker_tasks = [
             asyncio.create_task(worker()) for _ in range(self.config.max_concurrent_tasks)
         ]
         observer_task = asyncio.create_task(observer())
         try:
-            await asyncio.gather(*worker_tasks, observer_task)
-        except asyncio.CancelledError:
-            stop.set()
-            await asyncio.gather(*worker_tasks, observer_task, return_exceptions=True)
-            raise
+            try:
+                await asyncio.gather(*worker_tasks, observer_task)
+            except asyncio.CancelledError:
+                stop.set()
+                await asyncio.gather(*worker_tasks, observer_task, return_exceptions=True)
+                raise
+        finally:
+            if owns_singleton:
+                self._release_singleton()
         return completed
 
     def run_until_idle(self, stage_target: str = "annotation", *, max_tasks: int | None = None) -> RuntimeSnapshot:
@@ -693,6 +722,27 @@ class LocalRuntimeScheduler:
         """
         candidates = self.store.list_tasks_by_status(
             {TaskStatus.PENDING, TaskStatus.QC, TaskStatus.ARBITRATING, TaskStatus.ANNOTATING}
+        )
+        # Re-prioritize so downstream stages drain first. Without this,
+        # workers see PENDING candidates (typically thousands) before
+        # ARBITRATING candidates (handfuls), so newly-injected arbitrating
+        # tasks pile up indefinitely while PENDING keeps refilling the
+        # in-flight pool. The fix: pick the most-advanced stage first so
+        # task-progress flows toward terminal states instead of backlogging
+        # at arbitration. Tie-break order matches workflow direction:
+        #   ARBITRATING > QC (resume) > ANNOTATING > PENDING
+        # The arbiter_cap below still limits parallel arbitration to
+        # ARBITER_SLOT_FRACTION; with PENDING starvation prevented by that
+        # cap (workers can always fall through to PENDING once arbiter slots
+        # are full), this only changes pickup ORDER, not the slot quota.
+        _STAGE_PRIORITY = {
+            TaskStatus.ARBITRATING: 0,
+            TaskStatus.QC: 1,
+            TaskStatus.ANNOTATING: 2,
+            TaskStatus.PENDING: 3,
+        }
+        candidates.sort(
+            key=lambda t: (_STAGE_PRIORITY.get(t.status, 99), t.created_at)
         )
         # Skip tasks that another worker is already running. Without this,
         # the ANNOTATING resume branch below would bounce a live in-flight
@@ -830,6 +880,97 @@ class LocalRuntimeScheduler:
         snapshot = build_runtime_snapshot(self.store, self.config, now=now)
         self.store.save_runtime_snapshot(snapshot)
         return snapshot
+
+    # ----- Singleton-owner sentinel ------------------------------------------------
+    # A continuous (run_forever, stop_when_idle=False) scheduler claims the
+    # project's store by writing scheduler_owner.json with its pid, hostname,
+    # start time, and a refreshed last_heartbeat_at. A second `runtime run`
+    # invocation reads this file and refuses to start if the heartbeat is still
+    # fresh. The threshold mirrors snapshot.py's stale-heartbeat convention
+    # (2× snapshot_interval_seconds, floored at 120s) so a process whose
+    # observer loop has died for two ticks is treated as gone.
+    #
+    # On-demand callers (`run_until_idle` from the dashboard "run once" button,
+    # tests, smoke scripts) bypass acquisition: their race with a long-running
+    # scheduler is already bounded by the SQLite lease IntegrityError.
+    @property
+    def _singleton_owner_path(self) -> Path:
+        return self.store.root / "runtime" / "scheduler_owner.json"
+
+    def _singleton_stale_threshold_seconds(self) -> int:
+        return max(self.config.snapshot_interval_seconds * 2, 120)
+
+    def _load_singleton_owner(self) -> dict | None:
+        path = self._singleton_owner_path
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _write_singleton_owner(self, *, started_at: datetime, heartbeat_at: datetime) -> None:
+        payload = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "started_at": started_at.isoformat(),
+            "last_heartbeat_at": heartbeat_at.isoformat(),
+        }
+        path = self._singleton_owner_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _acquire_singleton(self) -> None:
+        existing = self._load_singleton_owner()
+        if existing is not None:
+            last_heartbeat_raw = existing.get("last_heartbeat_at")
+            if isinstance(last_heartbeat_raw, str):
+                try:
+                    last_heartbeat = datetime.fromisoformat(last_heartbeat_raw)
+                except ValueError:
+                    last_heartbeat = None
+            else:
+                last_heartbeat = None
+            if last_heartbeat is not None:
+                age = (self._now_fn() - last_heartbeat).total_seconds()
+                threshold = self._singleton_stale_threshold_seconds()
+                if age < threshold:
+                    raise SchedulerAlreadyRunningError(
+                        f"another scheduler is already running on this project: "
+                        f"pid={existing.get('pid')} host={existing.get('hostname')} "
+                        f"heartbeat {age:.0f}s ago (threshold {threshold}s). "
+                        f"If you believe it is dead, wait {threshold - age:.0f}s for "
+                        f"the heartbeat to age out, or delete "
+                        f"{self._singleton_owner_path}.",
+                        owner=existing,
+                    )
+        # Either no prior owner, or its heartbeat is stale → overwrite.
+        now = self._now_fn()
+        self._write_singleton_owner(started_at=now, heartbeat_at=now)
+
+    def _refresh_singleton(self) -> None:
+        # Preserve started_at across heartbeats so operators can see uptime.
+        existing = self._load_singleton_owner() or {}
+        started_at_raw = existing.get("started_at")
+        try:
+            started_at = (
+                datetime.fromisoformat(started_at_raw)
+                if isinstance(started_at_raw, str)
+                else self._now_fn()
+            )
+        except ValueError:
+            started_at = self._now_fn()
+        self._write_singleton_owner(started_at=started_at, heartbeat_at=self._now_fn())
+
+    def _release_singleton(self) -> None:
+        # Only release if WE own it; otherwise we'd clobber a different live
+        # scheduler that might exist after a crash-during-acquire scenario.
+        existing = self._load_singleton_owner()
+        if existing and existing.get("pid") == os.getpid():
+            try:
+                self._singleton_owner_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _lease_for(self, task: Task, acquired_at: datetime) -> RuntimeLease:
         lease_id = f"lease-{uuid4().hex}"

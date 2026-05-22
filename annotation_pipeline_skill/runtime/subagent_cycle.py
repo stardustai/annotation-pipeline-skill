@@ -307,6 +307,7 @@ class SubagentRuntime:
                 prompt=self._annotation_prompt(task, continuation_handle=continuation_handle),
                 continuity_handle=continuation_handle,
                 response_format={"type": "json_object"},
+                task_id=task.task_id,
             ),
         )
         annotation_finished_at = utc_now()
@@ -635,6 +636,7 @@ class SubagentRuntime:
                 prompt=self._qc_prompt(task, annotation_artifact),
                 continuity_handle=self._read_pinned_handle(task, "qc_continuity_handle", "qc"),
                 response_format={"type": "json_object"},
+                task_id=task.task_id,
             ),
         )
         qc_finished_at = utc_now()
@@ -1177,18 +1179,15 @@ class SubagentRuntime:
             print(banner, file=sys.stderr, flush=True)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            alerts_path = self.store.root / "alerts.jsonl"
-            with open(alerts_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "ts": utc_now().isoformat(),
-                    "target": target,
-                    "api_error_status": status,
-                    "exception_class": type(exc).__name__,
-                    "message": message,
-                }) + "\n")
-        except Exception:  # noqa: BLE001 — alerts are best-effort
-            pass
+        from annotation_pipeline_skill.runtime.alerts import append_alert
+        append_alert(self.store.root, {
+            "ts": utc_now().isoformat(),
+            "kind": "provider_alert",
+            "target": target,
+            "api_error_status": status,
+            "exception_class": type(exc).__name__,
+            "message": message,
+        })
 
     def _merge_unchanged_rows_into_correction(
         self, task: Task, corrected: dict[str, Any]
@@ -1250,17 +1249,13 @@ class SubagentRuntime:
         Not deduped by cooldown — these are per-task data points that
         matter for the rolling-up dashboard, not floods.
         """
-        try:
-            alerts_path = self.store.root / "alerts.jsonl"
-            with open(alerts_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "ts": utc_now().isoformat(),
-                    "kind": "arbiter_enum_coerce",
-                    "task_id": task.task_id,
-                    "dropped": dropped,
-                }) + "\n")
-        except Exception:  # noqa: BLE001 — best-effort
-            pass
+        from annotation_pipeline_skill.runtime.alerts import append_alert
+        append_alert(self.store.root, {
+            "ts": utc_now().isoformat(),
+            "kind": "arbiter_enum_coerce",
+            "task_id": task.task_id,
+            "dropped": dropped,
+        })
 
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         try:
@@ -2920,6 +2915,7 @@ class SubagentRuntime:
                     prompt=prompt,
                     continuity_handle=None,
                     response_format={"type": "json_object"},
+                    task_id=task.task_id,
                 ))
             except Exception as exc:  # noqa: BLE001
                 # Tag with the underlying class — some clients raise empty-
@@ -2958,6 +2954,7 @@ class SubagentRuntime:
                             prompt=prompt,
                             continuity_handle=None,
                             response_format={"type": "json_object"},
+                            task_id=task.task_id,
                         ))
                         # fallback succeeded — continue to JSON parse step
                         # without raising. (Drop out of the except block.)
