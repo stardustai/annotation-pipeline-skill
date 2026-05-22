@@ -421,6 +421,12 @@ def build_parser() -> argparse.ArgumentParser:
     reject_parser.add_argument("--project-root", type=Path, default=Path.cwd())
     reject_parser.set_defaults(handler=handle_reject)
 
+    merge_parser = subparsers.add_parser("merge", help="Export accepted tasks to JSONL")
+    merge_parser.add_argument("--pipeline-id", required=True)
+    merge_parser.add_argument("--output", type=Path, default=None, help="Output directory (default: exports/<timestamp>)")
+    merge_parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    merge_parser.set_defaults(handler=handle_merge)
+
     _register_db_commands(subparsers)
 
     return parser
@@ -1333,6 +1339,24 @@ def handle_export_training_data(args: argparse.Namespace) -> int:
         enqueue_external_submit=args.enqueue_external_submit,
     )
     print(json.dumps(manifest.to_dict(), sort_keys=True, indent=2))
+    return 0
+
+
+def handle_merge(args: argparse.Namespace) -> int:
+    import datetime
+
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    output_dir = args.output or (args.project_root / "exports" / f"merged-{timestamp}")
+    manifest = TrainingDataExportService(store).export_jsonl(
+        project_id=args.pipeline_id,
+        output_dir=output_dir,
+    )
+    store.close()
+    print(json.dumps({
+        "output_dir": str(output_dir),
+        "export_id": manifest.export_id,
+    }, indent=2))
     return 0
 
 

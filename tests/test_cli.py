@@ -1650,6 +1650,50 @@ def test_approve_prints_event_id(tmp_path, capsys):
     assert "event_id" in data
 
 
+def test_merge_creates_output_dir_and_returns_zero(tmp_path):
+    """merge runs without error and creates the output directory."""
+    from annotation_pipeline_skill.interfaces.cli import main
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+    from annotation_pipeline_skill.core.transitions import transition_task
+
+    config_root = tmp_path / ".annotation-pipeline"
+    config_root.mkdir()
+    store = SqliteStore.open(config_root)
+    task = Task.new(
+        task_id="merge-t-001",
+        pipeline_id="merge-pipe",
+        source_ref={"kind": "jsonl", "payload": {"rows": [{"input": "hello"}]}},
+        modality="text",
+        annotation_requirements={"annotation_types": ["extraction"]},
+        metadata={},
+    )
+    e0 = transition_task(task, TaskStatus.PENDING, actor="test", reason="init", stage="prepare")
+    store.save_task(task)
+    store.append_event(e0)
+    e1 = transition_task(task, TaskStatus.ANNOTATING, actor="test", reason="start", stage="annotation")
+    store.save_task(task)
+    store.append_event(e1)
+    e2 = transition_task(task, TaskStatus.QC, actor="test", reason="qc", stage="qc")
+    store.save_task(task)
+    store.append_event(e2)
+    e3 = transition_task(task, TaskStatus.ACCEPTED, actor="test", reason="done", stage="approve")
+    store.save_task(task)
+    store.append_event(e3)
+    store.close()
+
+    output_dir = tmp_path / "out"
+    result = main([
+        "merge",
+        "--pipeline-id", "merge-pipe",
+        "--output", str(output_dir),
+        "--project-root", str(tmp_path),
+    ])
+    assert result == 0
+    assert output_dir.exists()
+
+
 def test_cli_import_does_not_inject_qc_policy_into_task_metadata(tmp_path):
     """After the QC-config lift, ``apl import jsonl-prelabeled`` must NOT write
     per-task ``metadata.qc_policy`` — the policy now lives at project level in
