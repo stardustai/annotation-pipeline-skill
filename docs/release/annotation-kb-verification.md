@@ -53,7 +53,14 @@ profiles:
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
-    permission_mode: dontAsk
+    # bypassPermissions is REQUIRED for the agent to actually invoke MCP
+    # tools in non-interactive (`--print`) mode. Other modes (`default`,
+    # `dontAsk`, `acceptEdits`) deny MCP tool calls because they're not on
+    # claude's built-in allow list, and `--print` has no interactive
+    # approval channel. The MCP server itself is sandboxed (read-only SQL
+    # against the project's own DB; no shell, no file writes), so giving
+    # it permission is safe.
+    permission_mode: bypassPermissions
     mcp_servers:
       - name: annotation-kb
         command: python

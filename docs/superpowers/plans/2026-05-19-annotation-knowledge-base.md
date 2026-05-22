@@ -1863,7 +1863,7 @@ profiles:
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
-    permission_mode: dontAsk
+    permission_mode: bypassPermissions  # required for MCP tools in --print mode
     mcp_servers:
       - name: annotation-kb
         command: python

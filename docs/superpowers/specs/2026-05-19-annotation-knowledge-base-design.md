@@ -275,7 +275,11 @@ profiles:
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
-    permission_mode: dontAsk
+    # bypassPermissions is required to actually invoke MCP tools in
+    # non-interactive (`--print`) mode — every other mode denies them.
+    # The MCP server is sandboxed (read-only SQL on the project DB), so
+    # granting it permission is safe.
+    permission_mode: bypassPermissions
     mcp_servers:
       - name: annotation-kb
         command: python
@@ -294,6 +298,7 @@ profiles:
     model: deepseek-v4-flash
     base_url: https://api.deepseek.com/anthropic
     api_key_env: DEEPSEEK_API_KEY
+    permission_mode: bypassPermissions
     mcp_servers:
       - name: annotation-kb
         command: python
