@@ -1902,6 +1902,19 @@ class SubagentRuntime:
             validate_payload_against_task_schema(task, corrected, store=self.store)
         except SchemaValidationError:
             return None
+        # Use the masked task for verbatim and row-coverage checks. The arbiter
+        # prompt was built from masked_task (masked rows excluded), so the
+        # corrected_annotation won't include those rows. Checking against the
+        # full unmasked task would fail both checks for tasks with masked rows:
+        #   verbatim: merged-in masked rows might have paraphrased spans
+        #   coverage: masked row IDs absent from corrected_annotation
+        # _merge_unchanged_rows_into_correction already filled in unchanged
+        # *non-masked* rows; masked rows are intentionally absent and must be
+        # excluded from the coverage requirement.
+        from annotation_pipeline_skill.services.row_mask_service import (
+            apply_masks_to_task as _apply_masks_to_task,
+        )
+        _masked_task = _apply_masks_to_task(self.store, task)
         # Verbatim check — arbiter sometimes paraphrases / normalizes spans
         # (e.g., traditional→simplified Chinese, dropped articles) that pass
         # schema but break the input.text substring guarantee. Without this
@@ -1909,7 +1922,7 @@ class SubagentRuntime:
         # (5% audit found ~11% violation rate). On failure, return None so
         # _terminal_from_arbiter falls through to HUMAN_REVIEW instead of
         # saving a bad corrected_annotation as the final artifact.
-        verbatim_failure = self._check_verbatim_spans(task, corrected)
+        verbatim_failure = self._check_verbatim_spans(_masked_task, corrected)
         if verbatim_failure is not None:
             return None
         # Cross-type collision — same span tagged as two entity types. Block
@@ -1925,11 +1938,14 @@ class SubagentRuntime:
         # validation path. Arbiter should fix this in retries.
         if find_trailing_punctuation_spans(task, corrected):
             return None
-        # Row coverage — all source rows must appear in the corrected annotation,
-        # same as the annotator validation path. Arbiter sometimes returns only
-        # the corrected rows, leaving others absent.
+        # Row coverage — all *non-masked* source rows must appear in the
+        # corrected annotation. Masked rows are excluded from the LLM prompt
+        # (both annotation and arbitration), so neither the annotator nor the
+        # arbiter includes them; _merge_unchanged_rows_into_correction cannot
+        # fill them in either. Use _masked_task.source_ref to build source_ids
+        # so masked row IDs are naturally absent from the requirement.
         try:
-            source_rows = task.source_ref["payload"]["rows"]
+            source_rows = _masked_task.source_ref["payload"]["rows"]
             if isinstance(source_rows, list) and source_rows:
                 source_ids = {r["row_id"] for r in source_rows if isinstance(r, dict) and "row_id" in r}
                 if source_ids:
@@ -2822,12 +2838,41 @@ class SubagentRuntime:
                     elif isinstance(defn.get("enum"), list):
                         slim_schema[dst_key] = [{"name": v, "desc": ""} for v in defn["enum"]]
         # Slim disputed_items: drop annotator's disputed_points/agreed_points
-        # which duplicate qc.message + annotator.message content. Saves ~25%
-        # per item on long tasks.
+        # (duplicate qc.message + annotator.message). Also cap
+        # qc.target.errors[].message — schema_invalid feedbacks serialize
+        # the ENTIRE annotation payload into the error message as a
+        # Python repr, which undoes the row filter above and reintroduces
+        # all rows by another path. Empirical: one schema_invalid item
+        # bloated a 1-row slim_input case back from ~22KB to ~40KB.
+        ERR_MSG_CAP = 400
+        def _slim_qc(qc_dict: Any) -> Any:
+            if not isinstance(qc_dict, dict):
+                return qc_dict
+            tgt = qc_dict.get("target")
+            if not isinstance(tgt, dict):
+                return qc_dict
+            errs = tgt.get("errors")
+            if not isinstance(errs, list) or not errs:
+                return qc_dict
+            new_errs: list[Any] = []
+            for e in errs:
+                if not isinstance(e, dict):
+                    new_errs.append(e)
+                    continue
+                m = e.get("message", "")
+                if isinstance(m, str) and len(m) > ERR_MSG_CAP:
+                    new_errs.append({
+                        **e,
+                        "message": m[:ERR_MSG_CAP]
+                        + "… [truncated — full payload elided to keep prompt slim]",
+                    })
+                else:
+                    new_errs.append(e)
+            return {**qc_dict, "target": {**tgt, "errors": new_errs}}
         slim_items = [{
             "feedback_id": it.get("feedback_id"),
             "category": it.get("category"),
-            "qc": it.get("qc"),
+            "qc": _slim_qc(it.get("qc")),
             "annotator_reply": {
                 "message": (it.get("annotator") or {}).get("message", ""),
                 "confidence": (it.get("annotator") or {}).get("confidence"),
@@ -3435,6 +3480,21 @@ def _annotation_instructions(
         "  proposed_resolution: str, optional\n"
         "  stance:      str, optional — for human readability only. The label drives the decision.\n"
         "Omit discussion_replies on a first attempt with no prior feedback. Never set consensus yourself."
+        "\n\n"
+        "KNOWLEDGE BASE TOOL: when the `mcp__annotation-kb__check_past_experience` tool appears in your "
+        "tools list, the project has an accumulated annotation history you can consult before guessing. "
+        "Call it for any candidate entity/phrase whose type is genuinely ambiguous in this row — typically: "
+        "named-entity spans (proper nouns, products, organizations, technologies), tokens that could "
+        "plausibly map to multiple types in the schema, or unfamiliar terms. The tool returns the current "
+        "convention (status `active` / `disputed` / `none`), the distribution of past type proposals, up "
+        "to 3 representative example sentences per type with `[task_id/row_id]` trace prefixes, and a "
+        "wordfreq Zipf score. Prefer matching the project's established `active` convention. When the "
+        "convention is `disputed`, use the per-type example sentences as analogies and pick whichever "
+        "type's examples best match this row's surrounding context. When `meta.generic_word` is true with "
+        "little evidence, the span is likely a function word and should usually be left untagged. Do NOT "
+        "call the tool for tokens that are clearly not entities (function words, punctuation, common "
+        "verbs) or for spans whose schema mapping is already obvious — over-calling wastes tokens and "
+        "the tool has no useful information for spans you can already handle."
         f"\n\nModality: {task.modality}. Requirements: {json.dumps(task.annotation_requirements, sort_keys=True)}."
     )
     parts = [base, _SHARED_SPAN_RULES]
@@ -3514,6 +3574,15 @@ def _build_qc_instructions(
         "(2) labels are equal → re-evaluate; if still defective keep the failure (same label); if you've "
         "changed your mind, ack it.\n"
         "(3) annotator label is LOWER than yours → keep the failure.\n"
+        "\n\n"
+        "KNOWLEDGE BASE TOOL: when `mcp__annotation-kb__check_past_experience` is in your tools list, "
+        "call it for any span where you're uncertain whether the annotator's type choice matches "
+        "project convention — pass the span text as `entry`. The tool returns the established "
+        "convention (if any) and example sentences from past tasks. Use the convention as the "
+        "ground truth: if the annotator chose a type that contradicts an `active` convention with "
+        "high evidence_count, flag it; if the convention is `disputed` or `none`, fall back to "
+        "your own judgement and the per-type examples. Skip the tool for spans whose type is "
+        "obvious from the schema and surrounding text — over-calling wastes tokens."
         "\n\n"
         f"qc_policy (informational): {json.dumps(resolved_policy, sort_keys=True)}. "
         f"Modality: {task.modality}. Requirements: {json.dumps(task.annotation_requirements, sort_keys=True)}."
