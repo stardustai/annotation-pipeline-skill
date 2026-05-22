@@ -263,6 +263,7 @@ def isolated_claude_home(
     home_id: str | None,
     provider_api_key: str | None = None,
     provider_base_url: str | None = None,
+    user_id_override: str | None = None,
 ) -> Iterator[tuple[dict[str, str], Path, str]]:
     """Per-task isolated HOME for `claude --bare`. Never copies real ~/.claude;
     auth comes from ANTHROPIC_API_KEY in the env. Defense-in-depth on top of
@@ -279,6 +280,18 @@ def isolated_claude_home(
     reports ``Not logged in``), so we inject the token into env explicitly.
     Lets users run Anthropic claude_sonnet / claude_haiku targets without
     needing a separate sk-ant-... API key.
+
+    ``user_id_override`` (typically the pipeline ``task_id``) is written into
+    ``<HOME>/.claude.json``'s ``userID`` field BEFORE the claude subprocess
+    starts. The claude binary reads that field and packs it into
+    ``body.metadata.user_id`` as the ``device_id`` component (verified by
+    capturing live POST /v1/messages traffic). That body.user/device_id is
+    what gateways like LiteLLM use for sticky routing — without the override
+    every isolated home's userID is a stable hash that doesn't change per
+    task, so cross-task requests hash to a small number of buckets and
+    prefix-cache locality collapses. Passing task_id here makes the
+    device_id per-task, so a sticky-on-body.user routing config naturally
+    pins all turns of one task to one upstream instance.
     """
     runtime_root = Path(env.get("ANNOTATION_CLAUDE_HOME_ROOT") or Path.cwd() / ".annotation-pipeline-claude-homes")
     runtime_root.mkdir(parents=True, exist_ok=True)
@@ -290,6 +303,9 @@ def isolated_claude_home(
         home_id = str(uuid.uuid4())
         isolated_home = runtime_root / home_id
         isolated_home.mkdir(parents=True, exist_ok=True)
+
+    if user_id_override:
+        _write_claude_user_id(isolated_home, user_id_override)
 
     isolated_env = codex_shell_environment(env)
     isolated_env["HOME"] = str(isolated_home)
@@ -308,6 +324,39 @@ def isolated_claude_home(
         isolated_env["ANTHROPIC_BASE_URL"] = provider_base_url
 
     yield isolated_env, isolated_home, home_id
+
+
+def _write_claude_user_id(home: Path, user_id: str) -> None:
+    """Overwrite ``<home>/.claude.json`` 's ``userID`` field with the given
+    value, preserving any other fields claude has cached there (growth-book
+    feature flags, migration markers, etc.). claude reads this field on
+    startup and uses it as the ``device_id`` component of the body.metadata
+    .user_id JSON object it sends with every /v1/messages request — so by
+    writing task_id here we get per-task sticky-routing for free, without
+    a proxy.
+
+    Best-effort: any read/write/parse failure leaves the file as-is and the
+    next claude call falls back to its default behaviour (a stable hashed
+    device_id derived once per home). We don't want this to crash a worker
+    over a non-essential routing optimisation.
+    """
+    path = home / ".claude.json"
+    data: dict
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    else:
+        data = {}
+    if data.get("userID") == user_id:
+        return
+    data["userID"] = user_id
+    try:
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _read_claude_oauth_token(env: Mapping[str, str]) -> str | None:
@@ -578,6 +627,7 @@ class LocalCLIClient:
             home_id=home_id,
             provider_api_key=api_key,
             provider_base_url=self.profile.base_url,
+            user_id_override=request.task_id,
         ) as (env, _home, resolved_home_id):
             # Sticky-routing hint: forward task_id to the gateway so a
             # LiteLLM router can pin every turn/retry of one task to the

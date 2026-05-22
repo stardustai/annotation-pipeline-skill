@@ -227,6 +227,71 @@ def test_isolated_claude_home_reuses_home_id(tmp_path: Path):
         assert (isolated_home / "marker").read_text(encoding="utf-8") == "hi"
 
 
+def test_isolated_claude_home_writes_task_id_into_userID(tmp_path: Path):
+    """user_id_override (= the pipeline task_id) must be written to
+    <HOME>/.claude.json:userID. claude packs that field into
+    body.metadata.user_id as the device_id component, which is the
+    sticky-routing key gateways like LiteLLM hash on. Without the override,
+    every isolated home gets a stable random-looking userID that doesn't
+    correlate with task identity → cross-task requests collide on a small
+    number of routing buckets and prefix-cache locality collapses."""
+    import json
+    runtime_root = tmp_path / "runtime"
+
+    with isolated_claude_home(
+        {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
+        home_id="task-home-1",
+        user_id_override="v3_initial_deployment-000342",
+    ) as (_env, isolated_home, _home_id):
+        data = json.loads((isolated_home / ".claude.json").read_text(encoding="utf-8"))
+        assert data["userID"] == "v3_initial_deployment-000342"
+
+
+def test_isolated_claude_home_preserves_existing_claude_json_fields(tmp_path: Path):
+    """Writing the userID override must merge — claude caches feature flags,
+    migration markers, etc. in .claude.json across runs. Wiping those
+    fields would force claude to re-initialise on every call (extra startup
+    cost, lost growth-book state)."""
+    import json
+    runtime_root = tmp_path / "runtime"
+    home_dir = runtime_root / "task-home-2"
+    home_dir.mkdir(parents=True)
+    (home_dir / ".claude.json").write_text(
+        json.dumps({
+            "userID": "old-device-hash",
+            "cachedGrowthBookFeatures": {"flag_a": True},
+            "firstStartTime": "2026-05-21T12:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+
+    with isolated_claude_home(
+        {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
+        home_id="task-home-2",
+        user_id_override="v3_initial_deployment-000999",
+    ) as (_env, isolated_home, _home_id):
+        data = json.loads((isolated_home / ".claude.json").read_text(encoding="utf-8"))
+        assert data["userID"] == "v3_initial_deployment-000999"
+        # Non-userID fields must survive the rewrite.
+        assert data["cachedGrowthBookFeatures"] == {"flag_a": True}
+        assert data["firstStartTime"] == "2026-05-21T12:00:00Z"
+
+
+def test_isolated_claude_home_skip_user_id_when_none(tmp_path: Path):
+    """No override → don't touch .claude.json. Profiles without task_id wired
+    through (anything other than the annotation pipeline) keep the old
+    behaviour of letting claude generate its stable per-home userID."""
+    runtime_root = tmp_path / "runtime"
+
+    with isolated_claude_home(
+        {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
+        home_id="task-home-3",
+        user_id_override=None,
+    ) as (_env, isolated_home, _home_id):
+        # No file touched on entry; claude will write it on first run.
+        assert not (isolated_home / ".claude.json").exists()
+
+
 def test_parse_claude_stream_events_extracts_text_and_usage():
     result = parse_claude_stream_events(
         [
@@ -329,10 +394,11 @@ async def test_local_claude_client_propagates_continuity_handle(tmp_path: Path, 
         return ["claude", "--bare", "-p", "-"]
 
     @contextmanager
-    def fake_isolated_claude_home(env, *, home_id, provider_api_key=None, provider_base_url=None):
+    def fake_isolated_claude_home(env, *, home_id, provider_api_key=None, provider_base_url=None, user_id_override=None):
         captured["home_id"] = home_id
         captured["provider_api_key"] = provider_api_key
         captured["provider_base_url"] = provider_base_url
+        captured["user_id_override"] = user_id_override
         resolved = home_id or "fake-home-id"
         yield {"PATH": env.get("PATH", "")}, tmp_path, resolved
 
