@@ -1,7 +1,7 @@
 # Annotation Knowledge Base — Design Spec
 
-**Date:** 2026-05-19
-**Status:** Draft
+**Date:** 2026-05-19 (revised 2026-05-21)
+**Status:** Shipped
 
 ---
 
@@ -34,6 +34,117 @@ The `memory-ner` project accumulates merge-derived guidance in `ANNOTATION_GUIDE
 - **No automated pattern rules.** We do *not* synthesize `annotation_rules.yaml` entries from merge events. Pattern learning is example-driven, left to the agent.
 - **No Codex CLI MCP integration in this phase.** First pass targets Claude CLI; Codex parity is a follow-up.
 - **No replacement of existing `find_matches_in_text` auto-injection.** It continues to operate; the new tool is additive.
+
+---
+
+## Design Rationale
+
+These were the load-bearing decisions from the brainstorming session, in the order they were resolved.
+
+### 1. Agent-pull (MCP tool) instead of prompt-push (auto-injection)
+
+The starting point was `EntityConventionService.find_matches_in_text` — it scans every annotator prompt for convention-matching spans and prepends them. Two problems compounded the longer the project ran: the prompt grew with the convention table (regardless of relevance to *this* row), and the agent had no signal that a convention even existed for a span until the runtime had already paid for shipping the full block.
+
+The reverse — exposing the conventions as a **tool** the agent calls when it wants to — flips both:
+
+- **Token cost scales with curiosity, not history.** A row whose spans are all obvious skips the lookup entirely. A row with one ambiguous span pays for one tool round-trip.
+- **The agent decides what's ambiguous.** It already does this internally to produce annotations; surfacing the decision as "do I need to ask?" is a more honest interface than "here's everything you might need."
+
+MCP was the natural plumbing because Claude CLI already supports it via `--mcp-config`, and the tool/result round-trip is part of the assistant's normal protocol — no prompt-engineered "if you want X, output Y" hack.
+
+### 2. No new domain table — compose at query time
+
+The first design draft included a `SpanKnowledge` table with denormalized fields (`convention_type`, `type_distribution`, etc.) populated by writes from `EntityConventionService` and the posterior audit job. The user pushed back: these values are derived from data we *already store* (`entity_conventions.proposals`, `posterior_audit` cache, `wordfreq`), and a denormalized table introduces two failure modes — write paths that forget to update, and staleness windows after backfill operations.
+
+The shipped design composes the response at query time inside `mcp.check_past_experience`:
+
+- `convention` ← read `entity_conventions`
+- `distribution` ← aggregate `entity_conventions.proposals[*].type`
+- `examples_by_type` ← group `proposals[*].context_snippet` by type, then diversity-sample
+- `meta.wordfreq_zipf` ← live call to `wordfreq.zipf_frequency`
+
+The only schema change is **extending `proposals_json`** with two optional fields (`row_id`, `context_snippet`). Since `proposals_json` was already a free-form JSON blob, this is migration-free — legacy proposals lack the keys and the tool gracefully omits them from `examples_by_type`.
+
+### 3. Sentence-level per-type examples over statistical summaries
+
+An earlier draft returned `type_entropy`, `top_share`, `runner_up_share` for contested spans. The user flagged that these are *describing* the problem, not *helping* solve it. An agent told "this span has entropy 0.85" still has no idea *when* to pick which type.
+
+The shipped design returns up to 3 verbatim context snippets per type, e.g.:
+
+```
+"Apple": {
+  organization: [
+    "[task_019/row_18452] ...Apple's customer support helped me...",
+    "[task_022/row_22310] ...Apple announced a new privacy policy..."
+  ],
+  product: [
+    "[task_021/row_21100] ...My Apple iPad keeps crashing..."
+  ]
+}
+```
+
+This is the mode-matching pattern LLMs are good at: "which of these example contexts looks most like the row I'm annotating?" Statistics get pruned out of the response entirely (except the bare `evidence_count`, which is useful as a confidence signal).
+
+### 4. Why MinHash + farthest-first for example selection
+
+The naive options for picking 3 examples out of N proposals:
+
+| Approach | Problem |
+|---|---|
+| First N (chronological) | Recent rows tend to share context (same batch, same source). Returned examples are near-duplicates. |
+| Random N | No guarantee of coverage; can return three near-duplicates by chance on small N. |
+| Most-recent N | Same chronological-clustering problem as above. |
+| Embedding-based clustering | Adds a heavyweight dependency (sentence encoder) and a vector store. Overkill for ≤50-snippet buckets. |
+
+MinHash + farthest-first traversal gives us coverage of the snippet space with $O(N \cdot k)$ pairwise Jaccard comparisons — cheap at this scale — and `datasketch` was already a project dependency for `row_dedup`. The seed is the lex-smallest snippet (deterministic on repeated calls) and the tie-break is also lex-smallest, so the output is reproducible.
+
+### 5. Why no row-level BM25 index (yet)
+
+The brainstorming considered a parallel feature: an inverted index over `context_snippet` text so the agent could query "show me rows similar to *this row's text*" rather than "show me rows for *this span*". We rejected it for v1:
+
+- The per-span pull (`check_past_experience(entry)`) already covers the dominant case where the agent has a specific candidate span in mind and wants prior context.
+- BM25 adds a rebuild cadence, freshness invariants, and a jieba-tokenized index for CJK — meaningful operational cost.
+- We have no evidence yet that per-span examples are *insufficient*. Adding BM25 before that signal would be speculative complexity.
+
+This is explicit in Non-Goals so future readers don't reopen the discussion without new data.
+
+### 6. CJK gate in `shingle()`, not a unified jieba path
+
+The MinHash diversity sampler needs meaningful tokens on CJK text. Unconditionally jieba-segmenting *all* input was rejected after testing: jieba splits English contractions (`Apple's → apple / ' / s`) and emits apostrophe-bearing 3-grams that don't appear in the whitespace-tokenized version. The empirical measurement on a typical app-review row was 4 split-based 3-grams vs 6 jieba-based 3-grams with only 3 shared — enough to shift `row_dedup_service`'s Jaccard scores and break every project's already-calibrated `jaccard_threshold`.
+
+The CJK gate (`_CJK_RE.search(text)` → jieba path; else → `text.split()` path) leaves pure-ASCII inputs untouched (so `row_dedup` is unaffected) and upgrades CJK inputs from "degenerate single shingle" to "meaningful n-grams" (so the KB sampler and CJK-row dedup both improve). Pre-existing thresholds in projects with mixed CJK + ASCII may want re-verification because CJK rows used to be effectively unmatched — this is a known one-time recalibration, called out in Risks.
+
+### 7. `base_url` profile field → subprocess env, never operator shell
+
+To run annotators against non-Anthropic endpoints (DeepSeek, MiniMax, GLM), the runtime must put `ANTHROPIC_BASE_URL` somewhere Claude CLI reads it. Three options were on the table:
+
+1. **`export ANTHROPIC_BASE_URL=...`** in the operator's shell. **Rejected** because it pollutes the parent process — any subsequent Claude Code session the operator launches in the same shell would also hit the third-party endpoint. Verified empirically: there is no shell-variable scope that protects a long-running parent session.
+2. **A `settings.json` field** loaded via Claude CLI's `--settings`. **Rejected** after testing six candidate field names (`baseURL`, `baseUrl`, `base_url`, `anthropicBaseUrl`, `apiBaseURL`, `endpoint`) — none are honored. The `env` block inside `settings.json` is also not applied to Claude's own API config. `apiKeyHelper` works but only for the API key, not the endpoint.
+3. **`isolated_claude_home` injects into `subprocess.Popen(env=...)`**. **Shipped.** The runtime constructs a fresh env dict, sets `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` from the profile, and passes it only to the spawned claude subprocess. `os.environ` of the parent process is never modified — Unix process model guarantees subprocess env is a copy. Operator's shell sees nothing.
+
+The operator's profile carries `base_url` and `api_key_env` as plain YAML fields; the env-var name is an implementation detail of the runtime.
+
+### 8. `bypassPermissions` is required for MCP profiles
+
+Claude CLI's `--permission-mode` controls how it handles tool calls that aren't on its built-in allow list. We tested all relevant modes in non-interactive (`--print`) annotation runs:
+
+| Mode | MCP tool call |
+|---|---|
+| `default` | Asks interactively → no TTY → denied |
+| `dontAsk` | Denies non-allowed tools by default |
+| `acceptEdits` | Auto-accepts edits but asks for others → denied |
+| `bypassPermissions` | Allows |
+
+`bypassPermissions` is the only mode where the agent can actually call `mcp__annotation-kb__check_past_experience` in batch mode. The mode is safe in this context: the MCP server's only capability is read-only SQL against the project's own DB (no shell, no file writes, no network). Profiles using KB-aware annotation should set `permission_mode: bypassPermissions` — the spec's profile YAML examples and the verification guide both do.
+
+### 9. System-level prompt for the KB tool, not per-project rules
+
+The agent needs to know *when* to call the tool. Two places to put that instruction:
+
+- **`annotation_rules.yaml`** (per-project) — would force every project that wants KB-aware annotation to copy in the same boilerplate. Easy to drift, easy to forget.
+- **`_annotation_instructions()` in `subagent_cycle.py`** (runtime-level) — every annotator subagent gets the instruction unconditionally. The block is conditional in content (`"when the mcp__annotation-kb__check_past_experience tool appears in your tools list…"`), so profiles without an MCP server attached read the same paragraph but no-op on it.
+
+The runtime-level placement matches where the tool itself is wired — both come from the framework, not from per-project configuration. A parallel block in `_build_qc_instructions()` handles the QC verifier path.
 
 ---
 
