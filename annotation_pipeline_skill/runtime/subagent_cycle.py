@@ -196,9 +196,15 @@ class SubagentRuntime:
         # Extracted prompt builder (Task 8). Old method bodies in this class
         # remain intact for now; this wires the new module in for future use.
         from annotation_pipeline_skill.runtime.prompt_builder import AnnotationPromptBuilder
+        # SubagentRuntime is store-scoped, not pipeline-scoped; tasks carry
+        # their own pipeline_id which AnnotationPromptBuilder resolves at call
+        # time (e.g. task.pipeline_id in build_conventions_block).  Pass "" as
+        # the instance-level project_id — the hasattr guard that existed here
+        # previously always evaluated to "" anyway (no _project_id attribute is
+        # set on this class), but the guard was misleading.
         self._prompt_builder = AnnotationPromptBuilder(
             store=self.store,
-            project_id=self._project_id if hasattr(self, "_project_id") else "",
+            project_id="",
             config=self.config,
         )
 
