@@ -1190,6 +1190,54 @@ class SubagentRuntime:
         except Exception:  # noqa: BLE001 — alerts are best-effort
             pass
 
+    def _merge_unchanged_rows_into_correction(
+        self, task: Task, corrected: dict[str, Any]
+    ) -> None:
+        """Fill `corrected.rows` with the unchanged rows from the latest
+        annotation_result so the row-coverage check downstream still
+        passes after the slim-prompt diet. In-place no-op when:
+          - the arbiter already emitted ALL rows (legacy / already-full
+            correction)
+          - there is no annotation artifact to merge from
+
+        Identity is by ``row_index``. Rows the arbiter included win; the
+        rest are copied verbatim from the latest annotation_result.
+        """
+        if not isinstance(corrected, dict):
+            return
+        rows = corrected.get("rows")
+        if not isinstance(rows, list):
+            return
+        try:
+            ann_artifact = self._latest_annotation_artifact(task.task_id)
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            ann_payload = self._slim_annotation_payload(ann_artifact)
+        except Exception:  # noqa: BLE001
+            return
+        ann_rows = ann_payload.get("rows", []) if isinstance(ann_payload, dict) else []
+        if not isinstance(ann_rows, list) or not ann_rows:
+            return
+        present_indexes = {
+            r.get("row_index") for r in rows
+            if isinstance(r, dict) and isinstance(r.get("row_index"), int)
+        }
+        merged_in = 0
+        for r in ann_rows:
+            if not isinstance(r, dict):
+                continue
+            ri = r.get("row_index")
+            if isinstance(ri, int) and ri not in present_indexes:
+                # Copy as-is; arbiter chose not to touch this row, so we
+                # carry forward the annotator's existing values.
+                rows.append(r)
+                present_indexes.add(ri)
+                merged_in += 1
+        if merged_in:
+            # Sort by row_index for stable artifact output.
+            rows.sort(key=lambda r: r.get("row_index", 0) if isinstance(r, dict) else 0)
+
     def _emit_enum_coerce_alert(
         self, task: Task, dropped: dict[str, int]
     ) -> None:
@@ -1826,6 +1874,13 @@ class SubagentRuntime:
             resolve_output_schema,
             validate_payload_against_task_schema,
         )
+
+        # SLIM-PROMPT MERGE: the arbiter only sees disputed rows (see the
+        # SLIM-PROMPT CONTRACT in _call_arbiter_target) so corrected_annotation
+        # may include only the rows it changed. Merge in the unchanged rows
+        # from the latest annotation_result before validation, otherwise the
+        # row-coverage check below would reject every slim-prompt response.
+        self._merge_unchanged_rows_into_correction(task, corrected)
 
         # Enum coerce: arbiters occasionally invent entity/structure types
         # (e.g. "attribute", "system") alongside legitimate ones. Strict
@@ -2670,16 +2725,23 @@ class SubagentRuntime:
             "  - If ALL verdicts are 'annotator' (the annotation stands as-is), set corrected_annotation = null.\n"
             "There is no 'rejected' outcome.\n\n"
             "Shape of corrected_annotation when non-null: a {\"rows\": [{\"row_index\": int, "
-            "\"output\": {entities, json_structures}}, ...]} object that "
-            "preserves every row from current_annotation.\n"
-            "MUST CONFORM TO output_schema (provided in the prompt). In particular: entity types are "
-            "limited to the enum in $defs.entityType — do NOT invent new entity types like 'attribute' "
-            "or 'system'. json_structures keys are limited to the enum in $defs.jsonStructureType. "
-            "Each entity / phrase is a bare VERBATIM string copied from the corresponding row's "
-            "input.text (no character offsets, just the text itself). Pipeline validates: every span "
-            "must appear in input.text via substring match.\n"
-            "Preserve fields the annotator already had right; only change what your verdicts say "
-            "needs changing.\n\n"
+            "\"row_id\": str, \"output\": {entities, json_structures}}, ...]} object.\n"
+            "SLIM-PROMPT CONTRACT: the input + current_annotation in this prompt are "
+            "FILTERED down to only the rows referenced by disputed_items (see "
+            "`_omitted_unchanged_rows` markers). Your corrected_annotation should "
+            "ONLY include the rows you actually changed; the runtime auto-merges "
+            "the unchanged rows from the latest annotation_result before validation. "
+            "Do NOT echo back unchanged rows — that wastes tokens.\n"
+            "Entity / structure type names: use ONLY the values listed in "
+            "`output_schema.entity_types[*].name` and `output_schema.json_structure_types[*].name`. "
+            "Inventing types like 'attribute' or 'system' causes silent drops "
+            "(runtime coerces invented keys out before validation, but you've "
+            "wasted the verdict by emitting them).\n"
+            "Each entity / phrase value is a bare VERBATIM string copied from the corresponding "
+            "row's input.text (no character offsets, just the text itself). Pipeline validates: "
+            "every span must appear in input.text via substring match.\n"
+            "Preserve fields the annotator already had right WITHIN the rows you do change; "
+            "only modify what your verdicts say needs changing.\n\n"
             "Return raw JSON only, no markdown fences."
         )
         # All three agents (annotator, QC, arbiter) share the same cross-cutting
@@ -2695,19 +2757,90 @@ class SubagentRuntime:
         # corrected_annotation. Without this constraint, gpt-5.5 was emitting
         # entity names like "attribute" / "system" that the schema validator
         # rejected, causing the fix to silently fall back to HR.
-        from annotation_pipeline_skill.core.schema_validation import resolve_output_schema
+        from annotation_pipeline_skill.core.schema_validation import (
+            _schema_type_enums,
+            resolve_output_schema,
+        )
         from annotation_pipeline_skill.services.row_mask_service import apply_masks_to_task
         output_schema = resolve_output_schema(task, self.store)
         # Apply mask filter so the arbiter never sees (and never tries
         # to correct annotations for) rows the operator has masked.
         masked_task = apply_masks_to_task(self.store, task)
+
+        # SLIM PROMPT: see SLIM-PROMPT CONTRACT in the instructions block.
+        # Measured on a typical 10-row 17-dispute task: full prompt was
+        # 37.9KB, slimmed is 22.4KB (-41%) — mostly from dropping the 7
+        # unchanged rows' input.text + current_annotation entries plus
+        # collapsing the full JSON Schema down to its two enum lists.
+        # The runtime merges unchanged rows back into corrected_annotation
+        # in _apply_arbiter_correction so the row-coverage check still
+        # passes.
+        ref_rows: set[int] = set()
+        for it in items:
+            target_dict = (it.get("qc") or {}).get("target") or {}
+            ri = target_dict.get("row_index")
+            if isinstance(ri, int):
+                ref_rows.add(ri)
+        full_payload = masked_task.source_ref.get("payload", {}) or {}
+        full_rows = full_payload.get("rows", []) if isinstance(full_payload, dict) else []
+        slim_input_rows = [r for r in full_rows
+                           if isinstance(r, dict) and r.get("row_index") in ref_rows]
+        slim_input = {**{k: v for k, v in full_payload.items() if k != "rows"},
+                      "rows": slim_input_rows,
+                      "_omitted_unchanged_rows": max(0, len(full_rows) - len(slim_input_rows))}
+        # Slim current_annotation analogously
+        ann_rows = current_annotation.get("rows", []) if isinstance(current_annotation, dict) else []
+        slim_ann_rows = [r for r in ann_rows
+                         if isinstance(r, dict) and r.get("row_index") in ref_rows]
+        slim_ann = {"rows": slim_ann_rows,
+                    "_omitted_unchanged_rows": max(0, len(ann_rows) - len(slim_ann_rows))}
+        # Compact schema: just the {name, desc} list per enum. Strict
+        # validation still runs server-side after merge — this is just
+        # the model-facing contract.
+        slim_schema: dict[str, Any] = {
+            "_note": "corrected_annotation entity keys must be drawn from entity_types[*].name; "
+                     "json_structures keys from json_structure_types[*].name. Runtime re-validates "
+                     "the full JSON Schema after merging unchanged rows.",
+            "entity_types": [],
+            "json_structure_types": [],
+        }
+        if isinstance(output_schema, dict):
+            defs = output_schema.get("$defs") or output_schema.get("definitions") or {}
+            for src_key, dst_key in (
+                ("entityType", "entity_types"),
+                ("jsonStructureType", "json_structure_types"),
+            ):
+                defn = defs.get(src_key) if isinstance(defs, dict) else None
+                if isinstance(defn, dict):
+                    one_of = defn.get("oneOf")
+                    if isinstance(one_of, list):
+                        slim_schema[dst_key] = [
+                            {"name": x.get("const"), "desc": (x.get("description") or "")[:120]}
+                            for x in one_of
+                            if isinstance(x, dict) and isinstance(x.get("const"), str)
+                        ]
+                    elif isinstance(defn.get("enum"), list):
+                        slim_schema[dst_key] = [{"name": v, "desc": ""} for v in defn["enum"]]
+        # Slim disputed_items: drop annotator's disputed_points/agreed_points
+        # which duplicate qc.message + annotator.message content. Saves ~25%
+        # per item on long tasks.
+        slim_items = [{
+            "feedback_id": it.get("feedback_id"),
+            "category": it.get("category"),
+            "qc": it.get("qc"),
+            "annotator_reply": {
+                "message": (it.get("annotator") or {}).get("message", ""),
+                "confidence": (it.get("annotator") or {}).get("confidence"),
+            },
+        } for it in items]
+
         prompt = json.dumps(
             {
                 "task_id": task.task_id,
-                "input": masked_task.source_ref.get("payload", {}),
-                "current_annotation": current_annotation,
-                "output_schema": output_schema,
-                "disputed_items": items,
+                "input": slim_input,
+                "current_annotation": slim_ann,
+                "output_schema": slim_schema,
+                "disputed_items": slim_items,
             },
             indent=2,
             sort_keys=True,
