@@ -156,6 +156,15 @@ def build_claude_command(
         "stream-json",
         "--model",
         model,
+        # Pin per-machine bits (cwd, env, git status, memory paths) out of
+        # the system prompt and into the first user message. claude's
+        # default system prompt embeds those sections inline, which means
+        # every call from the same worker has a slightly different system
+        # prompt and vLLM's prefix cache misses on byte 1. claude
+        # documents this flag specifically for "cross-user prompt-cache
+        # reuse" (per --help). For our workload it also gives "cross-call
+        # prompt-cache reuse" on the same worker.
+        "--exclude-dynamic-system-prompt-sections",
     ])
     # Default to bypassPermissions when the profile doesn't specify a mode:
     # --bare -p auto-approves built-in tools (Bash/Read/etc.) but MCP tools

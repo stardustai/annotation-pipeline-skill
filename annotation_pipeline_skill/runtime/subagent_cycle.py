@@ -1316,7 +1316,10 @@ class SubagentRuntime:
             if target == "fallback":
                 raise
             if _is_provider_transient_error(exc):
-                return await self._call_client("fallback", request)
+                try:
+                    return await self._call_client("fallback", request)
+                except Exception:  # noqa: BLE001 — fallback unavailable/failed; re-raise original
+                    raise exc from None
             if _is_provider_permanent_error(exc):
                 # Operator-actionable error (auth/balance/wrong model).
                 # Alert + try fallback once. If fallback also fails, raise
@@ -2813,16 +2816,22 @@ class SubagentRuntime:
             },
         } for it in items]
 
+        # Key order matters for vLLM prefix-cache: stable fields head, volatile
+        # tail. task_id + input + output_schema are stable across the arbiter's
+        # verbatim-retry loop (max 3 attempts within a single arbiter call,
+        # same prompt body); current_annotation + disputed_items change per
+        # arbiter dispatch. Without this ordering sort_keys=True puts
+        # current_annotation at the head and the retry-loop calls share no
+        # prefix-cache prefix at all.
         prompt = json.dumps(
             {
                 "task_id": task.task_id,
                 "input": slim_input,
-                "current_annotation": slim_ann,
                 "output_schema": slim_schema,
+                "current_annotation": slim_ann,
                 "disputed_items": slim_items,
             },
             indent=2,
-            sort_keys=True,
         )
         # Up to ``arbiter_verbatim_retries`` retry rounds if the arbiter's
         # corrected_annotation contains a non-verbatim span. After retries
@@ -3442,18 +3451,61 @@ def _parse_qc_decision(text: str) -> dict[str, Any]:
 def _parse_llm_json(text: str) -> Any:
     """Robust JSON parser for LLM-emitted text.
 
-    Backed by the ``robust-json-parser`` library, which handles:
+    Primary path: ``robust-json-parser`` library, which handles:
       - <think>...</think> reasoning blocks (minimax / deepseek-reasoner / qwen-r1)
       - markdown code fences (```json ... ```)
       - prose preambles ("I'm rebuilding the annotations..." from codex CLI)
       - single quotes instead of doubles, trailing commas, inline comments
       - truncated / partial JSON (auto-closes braces)
 
+    Fallback path (when the library fails): scan for top-level ``{`` and
+    use ``json.JSONDecoder.raw_decode`` to extract the first balanced JSON
+    object, ignoring trailing prose. This covers the case where the LLM
+    interleaves CoT prose and the JSON output — the library tripped on
+    stray ``{`` chars inside the prose and returned "No JSON payload"
+    even when valid JSON followed at the end.
+
     Raises ``ValueError`` (the base class of ``json.JSONDecodeError``) on
     unrecoverable input — call sites already catching ``json.JSONDecodeError``
     keep working because ``JSONDecodeError`` is a subclass.
     """
-    return _robust_json_loads(text)
+    try:
+        return _robust_json_loads(text)
+    except (ValueError, TypeError) as primary_err:
+        # Fallback: scan for every "{" position and try ``raw_decode``;
+        # collect successfully-parsed candidates, then pick the one most
+        # likely to be the actual payload. Picking the FIRST candidate
+        # (the obvious approach) is wrong when the LLM interleaves prose
+        # and JSON — ``raw_decode`` might land on an inner ``{...}`` (e.g.
+        # one row's ``output`` field) before the outer ``{"rows": [...]}``.
+        #
+        # Selection rule:
+        #   1. Prefer the candidate whose top-level dict contains key
+        #      ``rows`` (annotation/correction shape) or ``verdicts``
+        #      (arbiter shape) — these are the canonical envelopes.
+        #   2. Otherwise pick the candidate with the largest text span
+        #      (end - start), which is almost always the outer object.
+        decoder = json.JSONDecoder()
+        candidates: list[tuple[Any, int]] = []  # (parsed, span_len)
+        for opener in ("{", "["):
+            for i in range(len(text)):
+                if text[i] != opener:
+                    continue
+                try:
+                    obj, end = decoder.raw_decode(text, i)
+                except json.JSONDecodeError:
+                    continue
+                candidates.append((obj, end - i))
+        # Only accept candidates that look like a real envelope. Falling
+        # back to "largest random dict" would silently substitute one
+        # row's `output` for the whole `{"rows": [...]}` envelope —
+        # validator then complains about missing rows, masking the actual
+        # truncated-JSON bug. Better to raise so the worker retries.
+        ENVELOPE_KEYS = ("rows", "verdicts", "corrected_annotation")
+        for obj, _span in sorted(candidates, key=lambda c: -c[1]):
+            if isinstance(obj, dict) and any(k in obj for k in ENVELOPE_KEYS):
+                return obj
+        raise primary_err
 
 
 def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:

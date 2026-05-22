@@ -60,36 +60,53 @@ class AnnotationPromptBuilder:
         artifacts. When a handle is supplied the model already has the
         full context in its KV cache, so only the incremental feedback
         delta is sent.
+
+        Key ordering matters for vLLM prefix-cache locality: same-task
+        multi-turn calls (annotator-rerun loop) must share a byte-stable
+        prefix or the cache never warms. We put STABLE content (task
+        source rows, output_schema) at the head of the JSON and the
+        per-turn mutating content (prior_artifacts, feedback_bundle) at
+        the tail, and we drop sort_keys so the insertion order is
+        preserved. With sort_keys=True the alphabetical first key was
+        `feedback_bundle` — the most volatile section — busting any
+        prefix-cache hit from the very first byte.
         """
         if continuation_handle is None:
             return json.dumps(
                 {
+                    # Stable per task (source rows, task_id, annotator id).
                     "task": self._task_payload(task),
-                    "feedback_bundle": build_feedback_bundle(self._store, task.task_id),
-                    "prior_artifacts": self._artifact_context(task.task_id),
+                    # Stable per project.
                     "output_schema": resolve_output_schema(task, self._store),
+                    # Mutating per turn — kept at the tail so the head stays
+                    # bytes-identical across turns of the same task.
+                    "prior_artifacts": self._artifact_context(task.task_id),
+                    "feedback_bundle": build_feedback_bundle(self._store, task.task_id),
                 },
-                sort_keys=True,
             )
         # Continuation turn: only send unseen feedback items.
         return json.dumps(
             {"feedback_bundle": {"items": self.delta_feedback_items(task)}},
-            sort_keys=True,
         )
 
     def build_qc_prompt(self, task: Task, annotation_artifact: ArtifactRef) -> str:
-        """Build the QC prompt JSON string."""
+        """Build the QC prompt JSON string.
+
+        Same prefix-cache ordering rule as ``build_annotation_prompt``:
+        stable fields first (task, output_schema), volatile last
+        (annotation_artifact — which is what's being QC'd, different
+        every turn; feedback_bundle — grows monotonically).
+        """
         return json.dumps(
             {
                 "task": self._task_payload(task),
+                "output_schema": resolve_output_schema(task, self._store),
                 "annotation_artifact": {
                     **annotation_artifact.to_dict(),
                     "payload": self.slim_annotation_payload(annotation_artifact),
                 },
                 "feedback_bundle": build_feedback_bundle(self._store, task.task_id),
-                "output_schema": resolve_output_schema(task, self._store),
             },
-            sort_keys=True,
         )
 
     def build_conventions_block(self, task: Task) -> str | None:
@@ -190,18 +207,40 @@ class AnnotationPromptBuilder:
     # Private helpers (duplicated from SubagentRuntime — only use self._store)
     # ------------------------------------------------------------------
 
+    # Allowlist of task.metadata keys that are stable across the multi-turn
+    # lifetime of a task and that the LLM might plausibly use. Every other
+    # metadata key mutates per turn (bail counts, retry counters, continuity
+    # handles, scheduler state, exception classes, ...) and would defeat
+    # vLLM's prefix cache if we leaked it into the prompt. The annotator /
+    # QC instructions do not read any of those mutating fields anyway, so
+    # the whitelist is essentially "what an LLM could conceivably need to
+    # know" — currently just qc_policy and prelabeled.
+    _STABLE_METADATA_KEYS = frozenset({"qc_policy", "prelabeled"})
+
     def _task_payload(self, task: Task) -> dict[str, Any]:
-        """Build the prompt input dict for a task, masking filtered rows."""
+        """Build the prompt input dict for a task, masking filtered rows.
+
+        ``task.metadata`` is filtered to ``_STABLE_METADATA_KEYS`` — leaking
+        the full metadata dict in would inject scheduler counters
+        (worker_bail_count, arbiter_mechanical_retries, continuity_handle,
+        _ann_sent_feedback_ids, ...) that mutate every turn, busting the
+        prefix-cache prefix from the very first bytes of the task payload.
+        """
         from annotation_pipeline_skill.services.row_mask_service import (
             apply_masks_to_task,
         )
         masked = apply_masks_to_task(self._store, task)
         sref = masked.source_ref
+        stable_metadata = {
+            k: task.metadata[k]
+            for k in self._STABLE_METADATA_KEYS
+            if k in task.metadata
+        }
         return {
             "task_id": task.task_id,
             "source_ref": sref,
             "selected_annotator_id": task.selected_annotator_id,
-            "metadata": task.metadata,
+            "metadata": stable_metadata,
         }
 
     def _artifact_context(
