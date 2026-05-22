@@ -831,7 +831,7 @@ api_key > OAuth fallback > 不注入（runtime 报正常 auth 错）。
 
 本地模型（`qwen3.6-35b-a3b`、`qwen3.6-27b`、`gemma-4` 等）通过 vLLM 服务，
 但 runtime 用的是同一个 `claude_cli` provider 来调用——即 worker 子进程是
-`claude --bare`，base_url 指向本地 gateway。请求要在两层之间翻译协议，每一
+`claude --bare`，base_url 指向本地 gateway。请求在三层之间翻译协议，每一
 跳的 path 都不同：
 
 ```
@@ -846,48 +846,80 @@ gateway :8900  (Projects/llm-gateway/gateway.py)
     │
     │  POST /v1/messages?beta=true
     ▼
-litellm :8901  (Projects/llm-gateway/config.yaml)
-    │  Anthropic → OpenAI 协议翻译。litellm_params.model 是 openai/qwen3.6-35b-a3b
-    │  → openai provider 默认调 chat completions（不是 responses）
+litellm :8901  (Projects/llm-gateway/config.yaml — `store_responses: true`)
+    │  Anthropic → OpenAI Responses API 翻译（不是 Chat Completions）。
+    │  litellm 1.83+ 在 `store_responses: true` 时对支持 Responses API 的
+    │  上游优先走 /v1/responses 端点，便于 `previous_response_id` 关联。
     │
-    │  POST /v1/chat/completions
+    │  POST /v1/responses                    ← OpenAI Responses API
     ▼
 model_manager :8002  (Projects/llm-gateway/model_manager.py)
-    │  sticky routing 层。从 request header / body 抽 task_id（`x-task-id`
-    │  或 OpenAI 标准 `user` 字段），把同一 task 的所有 turn 钉到同一个
-    │  vLLM slot，让 prefix cache 在多轮 annotation/QC 对话间复用
+    │  sticky routing 层。`_handle_responses_api`（model_manager.py:1328）
+    │  专门处理 /v1/responses：抽 sticky key（body.user / previous_response_id
+    │  推演的会话链）选 slot；然后调 `_responses_to_completions` 把
+    │  Responses 格式转回 Chat Completions，再 POST 给上游 vLLM。
     │
-    │  POST /v1/chat/completions    (透传给选中的 vLLM slot)
+    │  POST /v1/chat/completions             (mm 重发给上游，UA = aiohttp)
     ▼
-vLLM :9000  (RedHatAI/Qwen3.6-35B-A3B-NVFP4 等)
+vLLM :9000  (RedHatAI/Qwen3.6-35B-A3B-NVFP4 等；reasoning-parser=qwen3)
 ```
+
+mm 同时也实现了 `/v1/chat/completions` 的入口（line 1436 通用 backend.proxy
+路径，跟 sticky logic 共享 task_id 抽取）。生产 annotation 流量**只走
+`/v1/responses`**（LiteLLM 选择），见下文「外部消费者」对 chat completions
+入口的说明。
 
 #### 关键认知
 
-- **`/v1/responses` 不在这条链路上**。vLLM 本身支持，model_manager 也有专门
-  的 `_handle_responses_api` 处理，但 LiteLLM 的 `openai/` provider 默认翻译
-  到 `/v1/chat/completions`。要切到 Responses API 需要换 provider 类型（如
-  `openai_responses/...` 或自定义 hook）。
-- **sticky routing 走 task_id header，不走 `previous_response_id`**。后者要
-  Responses API 才有；前者是 model_manager 自定义的协议，由
-  `LLMGenerateRequest.task_id` 注入到 `ANTHROPIC_CUSTOM_HEADERS` 的
-  `x-task-id` header（commit `68c272d`）。同一 task 的 annotation → QC →
-  arbitration 多轮调用会命中同一 vLLM slot，KV cache 命中率从 0% 升到稳态
-  >50%。
-- **协议层的 `beta=true`** 是 claude CLI 自己加的。LiteLLM 接得住，会把对应
-  的 `anthropic-beta` header 转成 OpenAI 端没有概念的功能（如 prompt
-  caching）做 best-effort 适配。
+- **production 走 `/v1/responses`，不是 `/v1/chat/completions`**。实测
+  mm access log 同期 9155 条来自 `litellm/1.83.3` UA 的请求**全部命中
+  `/v1/responses`**。触发开关是 LiteLLM 配置里的 `store_responses: true`。
+- **mm 的 sticky logic 两条 path 都加了**（responses + chat completions），
+  no-harm 设计，避免协议切换造成断档。但**生产实际生效的是 responses 那条**。
+- **`x-task-id` header 当前没被 mm 读取，sticky key 实际是 `body.user`**。
+  runtime 在 `local_cli.py:571` 通过 `ANTHROPIC_CUSTOM_HEADERS` 注入了
+  `x-task-id: <task_id>`，但 mm 的 sticky routing 读 `body.user`——而
+  claude CLI 塞进去的是 **device_id**（每个 isolated_claude_home 的稳定
+  ID），不是 per-task ID。mm log 实测：
+
+  ```
+  Sticky responses: task_id={"device_id":"0748617ebf7bf6919da94974...
+  Sticky responses: task_id={"device_id":"4d84f0082822f2a4daac294fce...
+  ```
+
+  所有从同一 isolated_claude_home 发出的 task 共享 device_id，sticky 把它
+  们钉到同一个 slot —— **prefix cache 的复用粒度是 home，不是 task**。
+  Multi-turn annotation/QC/arbiter 同一个 task 跨多个 home（每次 worker
+  调用走不同 home），各自被钉到不同 slot，跨调用 KV cache **基本不命中**。
+
+  **正解**：让 mm 优先读 `x-task-id` header（runtime 已经塞了），fallback
+  `body.user`，最后才到 `device_id`；或者把 claude CLI 的 `body.user` 设
+  成 `x-task-id` 的值。这是已知性能问题，需要 mm 侧改一行（sticky key 提取
+  逻辑）。
+- **`beta=true`** 是 claude CLI 自加的 query 参数，对应 `anthropic-beta`
+  header（prompt caching 等）。LiteLLM 接住后会 best-effort 适配到 OpenAI 端。
+
+#### 外部消费者
+
+mm access log 里另有 **219 条 `POST /v1/chat/completions` 来自
+`AsyncOpenAI/Python 2.30.0`**——**不经过 LiteLLM**。来源是 memory-connector
+项目（graphiti / knowledge-graph 集成）直接用 openai SDK 把 mm 当
+OpenAI-兼容后端调用，跳过了 LiteLLM 这一层。
+
+这部分流量走 mm 的 `/v1/chat/completions` 入口（line 1436 generic
+backend.proxy），sticky logic 命中——但 task_id 是 memory-connector 那边
+决定的，与本 annotation pipeline 独立。
 
 #### 何时这条链路出问题
 
-- gateway 起来但 litellm 没起：每个 POST 返 500，gateway log 里只看到
-  HEAD / 健康探活。
-- litellm 起来但 model_manager 没起：litellm 5xx；access log 里能看到
-  upstream connection refused。
-- model_manager 起但 vLLM slot 全冷：model_manager 选择 spawn 而非 503，
-  worker 看起来"卡住"几十秒（vLLM 启动 + 加载权重耗时）。
-- 本地 API key 错（`local-qwen36` mismatch）：vLLM 直接返 401，沿链路传回
-  worker，新 instrumentation 会捕获并写 `provider_alert` 到 alerts.jsonl。
+| 症状 | 实际位置 |
+|------|---------|
+| 每个 POST 返 500，gateway log 只见 HEAD 探活 | litellm 没起 |
+| litellm 5xx，upstream connection refused | model_manager 没起 |
+| worker 卡住几十秒后才有响应 | mm 触发冷启动（vLLM 加载权重） |
+| `provider_alert` 写到 alerts.jsonl with `api_status=401` | 本地 API key (`local-qwen36`) 不对 |
+| `provider_alert` with `api_status=402` | 第三方 vendor (DeepSeek/MiniMax/GLM) 余额耗尽 |
+| 同 task 多轮 prefix cache 0% 命中 | mm sticky 用 device_id，不是 task_id（已知问题，见上） |
 
 
 ## 11. 执行模型
