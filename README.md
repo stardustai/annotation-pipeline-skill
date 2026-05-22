@@ -123,6 +123,7 @@ Implemented in the first backend foundation slice:
 - Configurable subagent runtime through `llm_profiles.yaml`.
 - OpenAI Responses API, OpenAI-compatible API, Codex CLI, and Claude CLI provider profiles.
 - Backend Kanban snapshot data shape.
+- Annotation knowledge base: `check_past_experience` MCP tool that annotator / QC subagents call autonomously to consult past convention decisions for ambiguous spans. Per-span context-snippet examples are diversity-selected via MinHash farthest-first; CJK rows are jieba-segmented; LLM provider switching uses `LLMProfile.base_url` injected into the subprocess by `isolated_claude_home` (operator's shell env is never touched). See `docs/release/annotation-kb-verification.md` for end-to-end setup.
 
 Not implemented yet:
 
@@ -139,6 +140,8 @@ Not implemented yet:
 - Algorithm engineer user story: `docs/algorithm-engineer-user-story.md`
 - Current spec: `docs/superpowers/specs/2026-04-24-annotation-pipeline-skill-design.md`
 - Active learning/RL workflow design: `docs/superpowers/specs/2026-05-05-active-learning-rl-workflow-design.md`
+- Annotation knowledge base (MCP `check_past_experience` tool): `docs/superpowers/specs/2026-05-19-annotation-knowledge-base-design.md`
+- Annotation knowledge base e2e verification guide: `docs/release/annotation-kb-verification.md`
 - Current implementation plan: `docs/superpowers/plans/2026-04-24-core-foundation.md`
 
 ## Run Tests

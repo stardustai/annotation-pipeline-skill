@@ -5,7 +5,8 @@
 ### Added
 
 - **Annotation knowledge base MCP tool (`check_past_experience`).** Annotator / QC / arbiter subagents launched via Claude CLI can now query the project's accumulated convention history on demand. The tool returns: current convention status + type, type distribution from past proposals, up to 3 diversity-selected sentence-level examples per type (via MinHash farthest-first sampling), and Zipf wordfreq metadata. Wired via `--mcp-config` and exposed by a stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`).
-- **`LLMProfile` schema additions:** `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring per-profile MCP server configurations and locking down built-in tools. LLM provider switching continues to use the existing `base_url` field — `isolated_claude_home` injects it into each subagent subprocess in isolation, leaving the operator's shell untouched.
+- **Annotator + QC system prompt updates.** The runtime-level `_annotation_instructions()` and `_build_qc_instructions()` now include a conditional `KNOWLEDGE BASE TOOL:` paragraph that fires when `mcp__annotation-kb__check_past_experience` is present in the agent's tools list — directs the agent to consult it for ambiguous named-entity spans, prefer the active convention, use per-type examples as analogies for `disputed` spans, and skip the tool for obvious tokens. Lives at the framework layer, not in per-project `annotation_rules.yaml`.
+- **`LLMProfile` schema additions:** `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring per-profile MCP server configurations and locking down built-in tools. Profiles attaching an MCP server should set `permission_mode: bypassPermissions` so the agent can actually invoke MCP tools in non-interactive (`--print`) mode (every other mode denies them; the MCP server itself is sandboxed to read-only SQL on the project DB). LLM provider switching continues to use the existing `base_url` field — `isolated_claude_home` injects it into each subagent subprocess in isolation, leaving the operator's shell untouched.
 - **CJK fallback in `similarity.shingle()`.** Rows containing CJK Unified Ideographs (U+4E00–U+9FFF) or Extension A (U+3400–U+4DBF) are now segmented with jieba instead of degenerating to a single shingle. Improves both the knowledge-base diversity sampling and existing row_dedup precision on Chinese text.
 - **`annotation_pipeline_skill.text.wordfreq_utils.wordfreq_score`** shared helper, replacing a duplicate inline function previously in `interfaces/api.py`.
 - **`annotation_pipeline_skill.similarity.diverse.select_diverse_examples`** — MinHash-based farthest-first traversal sampler used to pick representative context snippets per (span, type) bucket.
@@ -13,6 +14,10 @@
 ### Changed
 
 - **`EntityConventionService.record_decision()`** accepts two new optional kwargs: `row_id: str | None` and `row_content: str | None`. Proposals now carry a `context_snippet` window (±80 chars around the span, with ellipsis markers) and the originating `row_id`. The QC consensus path (`runtime/subagent_cycle.py`) and HR correction path (`services/human_review_service.py`) thread the trace data through automatically; operator-declared sites leave `row_id` and `row_content` unset.
+
+### Fixed
+
+- **`SubagentRuntime._profile_name_for_target` no longer constructs a throwaway client per call.** The old implementation called `client_factory(target)` purely to read `.profile.name` and discarded the client. Cheap in production but in finite-list test stubs each probe consumed one client per call, breaking retry flows (one test would assert `failed=1` on the rerun, another would loop forever in QC because `local_scheduler.py`'s bail-counter only resets ANNOTATING tasks). Replaced with a cache populated as a side-effect of `_call_client`, keyed by `result.provider` so the cache and pinned-handle profile column agree.
 
 ### Dependencies
 
