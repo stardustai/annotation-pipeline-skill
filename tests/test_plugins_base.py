@@ -92,3 +92,35 @@ def test_jsonl_adapter_implements_protocol():
     from annotation_pipeline_skill.plugins.base import DatasetAdapter
 
     assert isinstance(JsonlDatasetAdapter(), DatasetAdapter)
+
+
+def test_jsonl_adapter_make_batches_group_by_non_consecutive():
+    """Non-consecutive rows with the same key must be merged into one group."""
+    from annotation_pipeline_skill.plugins.jsonl_adapter import JsonlDatasetAdapter
+
+    adapter = JsonlDatasetAdapter()
+    rows = [
+        {"doc": "a", "text": "row1"},
+        {"doc": "b", "text": "row2"},
+        {"doc": "a", "text": "row3"},  # non-consecutive repeat of 'a'
+    ]
+    # With batch_size=10, both 'a' rows end up in one batch; 'b' in its own
+    batches = adapter.make_batches(rows, batch_size=10, group_by=["doc"])
+    assert len(batches) == 2, f"expected 2 batches, got {len(batches)}: {batches}"
+    a_batch = next(b for b in batches if b[0]["doc"] == "a")
+    assert len(a_batch) == 2, "both 'a' rows must be in the same batch"
+    b_batch = next(b for b in batches if b[0]["doc"] == "b")
+    assert len(b_batch) == 1
+
+
+def test_jsonl_adapter_make_batches_group_by_chunking():
+    """Within a group, rows are still split into chunks of batch_size."""
+    from annotation_pipeline_skill.plugins.jsonl_adapter import JsonlDatasetAdapter
+
+    adapter = JsonlDatasetAdapter()
+    rows = [{"doc": "x", "n": i} for i in range(5)]
+    batches = adapter.make_batches(rows, batch_size=2, group_by=["doc"])
+    # 5 rows / batch_size=2 → 3 batches (2, 2, 1)
+    assert len(batches) == 3
+    assert len(batches[0]) == 2
+    assert len(batches[2]) == 1

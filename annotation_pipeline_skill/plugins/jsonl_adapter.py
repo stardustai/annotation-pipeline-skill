@@ -35,20 +35,19 @@ class JsonlDatasetAdapter:
         """
         if not group_by:
             return [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
-        # Group consecutive rows with same group_by values
-        batches: list[list[dict]] = []
-        current: list[dict] = []
-        current_key: tuple | None = None
+        # Global bucketing: collect all rows per key, then chunk each group.
+        # Non-consecutive rows with the same key values are merged into one
+        # group, matching the semantics of cli.py:build_batches.
+        buckets: dict[tuple, list[dict]] = {}
+        order: list[tuple] = []
         for row in rows:
-            key = tuple(row.get(k) for k in group_by)
-            if current_key is not None and key != current_key and len(current) >= batch_size:
-                batches.append(current)
-                current = []
-            if len(current) >= batch_size:
-                batches.append(current)
-                current = []
-            current.append(row)
-            current_key = key
-        if current:
-            batches.append(current)
+            key = tuple(str(row.get(k) or "") for k in group_by)
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append(row)
+        batches: list[list[dict]] = []
+        for key in order:
+            group = buckets[key]
+            batches.extend(group[i : i + batch_size] for i in range(0, len(group), batch_size))
         return batches

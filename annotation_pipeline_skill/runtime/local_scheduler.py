@@ -757,7 +757,7 @@ class LocalRuntimeScheduler:
         # is hit. Falls through to PENDING/QC candidates, keeping
         # annotation work flowing even when the arbiter queue is deep.
         arbiter_cap = (
-            int(self.config.max_concurrent_tasks * self.ARBITER_SLOT_FRACTION)
+            max(1, int(self.config.max_concurrent_tasks * self.ARBITER_SLOT_FRACTION))
             if self.ARBITER_SLOT_FRACTION > 0
             else self.config.max_concurrent_tasks
         )
