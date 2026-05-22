@@ -1484,9 +1484,6 @@ class SubagentRuntime:
                 "message": "Annotation result was empty.",
                 "reason": "deterministic validation failed",
             }
-        schema = resolve_output_schema(task, self.store)
-        if schema is None:
-            return None
         try:
             payload = _parse_llm_json(final_text)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -1495,141 +1492,10 @@ class SubagentRuntime:
                 "message": f"Annotation result is not valid JSON: {exc}",
                 "reason": "schema validation failed",
             }
-        if isinstance(payload, dict):
-            # Strip discussion_replies before schema validation: it's a
-            # side-channel for QC dialogue, not part of the output schema.
-            # May appear at top level or nested inside each row.
-            payload.pop("discussion_replies", None)
-            rows = payload.get("rows")
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, dict):
-                        row.pop("discussion_replies", None)
-        try:
-            validate_payload_against_task_schema(task, payload, store=self.store)
-        except SchemaValidationError as exc:
-            return {
-                "category": "schema_invalid",
-                "message": f"Annotation result failed schema validation: {exc}",
-                "reason": "schema validation failed",
-                "target": {"errors": exc.errors},
-            }
-        # Enforce row coverage: all source row_ids must appear in the output.
-        # Catches the case where the annotator silently skips rows with no
-        # entities instead of emitting them with empty dicts.
-        try:
-            source_rows = task.source_ref["payload"]["rows"]
-            if isinstance(source_rows, list) and source_rows:
-                source_ids = {r["row_id"] for r in source_rows if isinstance(r, dict) and "row_id" in r}
-                if source_ids:
-                    ann_rows = payload.get("rows", []) if isinstance(payload, dict) else []
-                    ann_ids = {r["row_id"] for r in ann_rows if isinstance(r, dict) and "row_id" in r}
-                    missing = source_ids - ann_ids
-                    if missing:
-                        missing_sorted = sorted(missing)[:5]
-                        return {
-                            "category": "missing_rows",
-                            "message": (
-                                f"Annotation is missing {len(source_ids - ann_ids)} of "
-                                f"{len(source_ids)} expected rows. "
-                                f"First missing row_ids: {missing_sorted}. "
-                                f"Every input row must appear in the output, even rows with no "
-                                f"entities (emit them with empty dicts)."
-                            ),
-                            "reason": "missing rows in annotation output",
-                        }
-        except (KeyError, TypeError):
-            pass
-        # After the schema check, enforce verbatim — every annotated entity /
-        # phrase string must exist in the corresponding input row's text.
-        # Catches "annotator hallucinated a span" failures at validation time
-        # instead of waiting for QC.
-        verbatim_failure = self._check_verbatim_spans(task, payload)
-        if verbatim_failure is not None:
-            return verbatim_failure
-        # Cross-type entity collision: same span tagged under two entity
-        # types in the same row. Blocking — annotator must pick one.
-        # json_structures collisions are NOT blocked (phrases can legitimately
-        # play multiple roles).
-        from annotation_pipeline_skill.core.schema_validation import (
-            find_cross_type_collisions,
-            find_trailing_punctuation_spans,
-        )
-        collisions = find_cross_type_collisions(payload)
-        if collisions:
-            first = collisions[0]
-            return {
-                "category": "cross_type_collision",
-                "message": (
-                    f"Row {first['row_index']} entity span {first['span']!r} is tagged as "
-                    f"both {first['types'][0]!r} and {first['types'][1]!r}. Pick one type "
-                    f"per span — the schema allows separate keys but a single occurrence "
-                    f"should resolve to a single entity type."
-                ),
-                "reason": "cross-type entity collision",
-                "target": {"row_index": first["row_index"], "span": first["span"], "types": first["types"]},
-            }
-        # Trailing-punctuation span boundary check: blocks "Mitul Mallik."
-        # when "Mitul Mallik" is also in input. The entity is the name,
-        # not the sentence boundary.
-        trailing = find_trailing_punctuation_spans(task, payload)
-        if trailing:
-            first = trailing[0]
-            return {
-                "category": "trailing_punctuation_span",
-                "message": (
-                    f"Row {first['row_index']} {first['field']} span {first['span']!r} ends "
-                    f"with sentence-ending punctuation that should not be part of the entity. "
-                    f"Re-emit as {first['trimmed']!r} — the trimmed form is also verbatim in "
-                    f"input.text and that's where the entity boundary belongs."
-                ),
-                "reason": "trailing-punctuation span boundary",
-                "target": {"row_index": first["row_index"], "field": first["field"],
-                           "span": first["span"], "trimmed": first["trimmed"]},
-            }
-        # Shared-type cross-field consistency: ``technology`` is the only
-        # type defined in BOTH entityType and jsonStructureType. Single-word
-        # tech goes in entities.technology; multi-word in
-        # json_structures.technology. Auto-fix relocates these in place; if
-        # any survive past auto-fix, surface a feedback.
-        from annotation_pipeline_skill.core.schema_validation import (
-            find_shared_type_field_violations,
-        )
-        shared_violations = find_shared_type_field_violations(payload)
-        if shared_violations:
-            first = shared_violations[0]
-            return {
-                "category": "shared_type_wrong_field",
-                "message": (
-                    f"Row {first['row_index']} span {first['span']!r} (type "
-                    f"{first['shared_type']!r}) is in {first['current_field']} but the "
-                    f"word-count rule requires {first['correct_field']} (single-word "
-                    f"goes to entities, multi-word goes to json_structures)."
-                ),
-                "reason": "shared-type field placement",
-                "target": first,
-            }
-        return None
+        return self._annotation_validator.validate(task, payload)
 
     def _check_verbatim_spans(self, task: Task, payload: Any) -> dict | None:
-        """Wrap the shared ``find_verbatim_violations`` helper in the
-        validation-failure dict shape the pipeline uses (first mismatch only,
-        so retry feedback stays focused on one issue at a time).
-        """
-        from annotation_pipeline_skill.core.schema_validation import find_verbatim_violations
-        violations = find_verbatim_violations(task, payload)
-        if not violations:
-            return None
-        first = violations[0]
-        return {
-            "category": "non_verbatim_span",
-            "message": (
-                f"Row {first['row_index']} {first['field']}: span {first['span']!r} "
-                f"is not a verbatim substring of the input text."
-            ),
-            "reason": "verbatim check failed",
-            "target": first,
-        }
+        return self._annotation_validator.check_verbatim_spans(task, payload)
 
     def _auto_align_corrected_annotation(self, task: Task, corrected: dict) -> int:
         """Wrapper kept for callers in the arbiter retry loop. Delegates to
@@ -3213,204 +3079,30 @@ class SubagentRuntime:
         )
 
     def _build_conventions_block(self, task: Task) -> str | None:
-        """Look up entity conventions established for this project that match
-        any span in the task's input text. Returns a prompt block to inject
-        into the annotator / QC / arbiter instructions, or None if no
-        matches.
-        """
-        from annotation_pipeline_skill.services.entity_convention_service import (
-            EntityConventionService,
-        )
-        from annotation_pipeline_skill.services.row_mask_service import (
-            apply_masks_to_task,
-        )
-        try:
-            # Filter masked rows BEFORE concatenating, so masked content
-            # can't surface in the convention-matcher's substring search.
-            mtask = apply_masks_to_task(self.store, task)
-            payload = mtask.source_ref.get("payload") if isinstance(mtask.source_ref, dict) else None
-            rows = payload.get("rows") if isinstance(payload, dict) else None
-            if not isinstance(rows, list):
-                return None
-            # Concatenate the surviving rows' input text for substring search.
-            combined = "\n".join(
-                r.get("input", "") for r in rows if isinstance(r, dict) and isinstance(r.get("input"), str)
-            )
-        except Exception:  # noqa: BLE001 — never let prompt build fail the task
-            return None
-        if not combined.strip():
-            return None
-        svc = EntityConventionService(self.store)
-        try:
-            matches = svc.find_matches_in_text(task.pipeline_id, combined)
-        except Exception:  # noqa: BLE001
-            return None
-        if not matches:
-            return None
-        lines = []
-        for m in matches[:50]:  # cap at 50 to bound prompt size
-            note_suffix = f"  (notes: {m.notes})" if m.notes else ""
-            if m.entity_type == "not_an_entity":
-                lines.append(
-                    f"  - {m.span_original!r} → DO NOT TAG (this span is "
-                    f"intentionally NOT an entity in this project)" + note_suffix
-                )
-            else:
-                lines.append(f"  - {m.span_original!r} → entities.{m.entity_type}" + note_suffix)
-        return (
-            "KNOWN ENTITY CONVENTIONS FOR THIS PROJECT (established by prior "
-            "QC consensus, arbiter rulings, or human review — apply them so "
-            "ambiguous spans get classified consistently across tasks):\n"
-            + "\n".join(lines)
-        )
+        return self._prompt_builder.build_conventions_block(task)
 
     def _annotation_prompt(self, task: Task, *, continuation_handle: str | None = None) -> str:
-        if continuation_handle is None:
-            return json.dumps(
-                {
-                    # Pass store so masked rows are filtered out before the
-                    # annotator sees them — masked = "doesn't exist" at every
-                    # downstream boundary.
-                    "task": _task_payload(task, store=self.store),
-                    "feedback_bundle": build_feedback_bundle(self.store, task.task_id),
-                    "prior_artifacts": self._artifact_context(task.task_id),
-                    "output_schema": resolve_output_schema(task, self.store),
-                },
-                sort_keys=True,
-            )
-        # Continuation turn: the server-side KV cache already holds the full
-        # context from turn 1. Send only feedback items the model hasn't seen
-        # yet so the prompt stays small and the cache prefix stays intact.
-        return json.dumps(
-            {"feedback_bundle": {"items": self._delta_feedback_items(task)}},
-            sort_keys=True,
-        )
+        return self._prompt_builder.build_annotation_prompt(task, continuation_handle=continuation_handle)
 
     def _delta_feedback_items(self, task: Task) -> list[dict]:
-        sent_ids: set[str] = set(task.metadata.get("_ann_sent_feedback_ids", []))
-        bundle = build_feedback_bundle(self.store, task.task_id)
-        return [item for item in bundle.get("items", []) if item["feedback_id"] not in sent_ids]
+        return self._prompt_builder.delta_feedback_items(task)
 
     def _snapshot_sent_feedback(self, task: Task) -> None:
-        bundle = build_feedback_bundle(self.store, task.task_id)
-        task.metadata["_ann_sent_feedback_ids"] = [
-            item["feedback_id"] for item in bundle.get("items", [])
-        ]
+        self._prompt_builder.snapshot_sent_feedback(task)
 
     def _qc_prompt(self, task: Task, annotation_artifact: ArtifactRef) -> str:
-        return json.dumps(
-            {
-                "task": _task_payload(task, store=self.store),
-                "annotation_artifact": {
-                    **annotation_artifact.to_dict(),
-                    "payload": self._slim_annotation_payload(annotation_artifact),
-                },
-                "feedback_bundle": build_feedback_bundle(self.store, task.task_id),
-                "output_schema": resolve_output_schema(task, self.store),
-            },
-            sort_keys=True,
-        )
+        return self._prompt_builder.build_qc_prompt(task, annotation_artifact)
 
     def _slim_annotation_payload(self, artifact: ArtifactRef) -> Any:
-        """Return only the parsed annotation rows, dropping ``raw_response`` and
-        other provider-side metadata that downstream consumers (QC, arbiter)
-        don't read. The minimax HTTP response can be 20 KB on its own — 75% of
-        the QC prompt — and contributes nothing to QC's actual job. The
-        pre-parsed inner JSON also saves QC/arbiter from re-parsing the
-        ``<think>``/markdown-fence wrapper."""
-        raw = self._read_artifact_payload(artifact)
-        if not isinstance(raw, dict):
-            return raw
-        text = raw.get("text")
-        if not isinstance(text, str):
-            # Fallback: keep the dict but drop the bulky raw_response.
-            return {k: v for k, v in raw.items() if k != "raw_response"}
-        try:
-            return _parse_llm_json(text)
-        except (json.JSONDecodeError, ValueError):
-            return {"text": text}
+        return self._prompt_builder.slim_annotation_payload(artifact)
 
     def _artifact_context(
         self, task_id: str, *, per_kind_limit: int = 1
     ) -> list[dict[str, Any]]:
-        """Return artifacts grouped by kind, keeping only the most recent N per kind.
-
-        Default ``per_kind_limit=1``: just the single latest artifact of each
-        kind. The previous 3-per-kind cap was a conservative cushion from
-        early development; in practice the annotator only needs the most
-        recent annotation (to see its own last attempt) and the most recent
-        qc_result (the latest reviewer output). Earlier attempts are stale —
-        the active QC complaints come through feedback_bundle anyway, which
-        names the specific row/target to fix. Cutting 3→1 saves another
-        ~14 KB per prompt on a loop-heavy task.
-
-        Prevents the annotator prompt from growing unbounded when a task loops
-        through repeated annotation/QC retries (the 73-attempt case we hit in
-        production blew past the LLM context window).
-
-        Each artifact is slimmed down to the fields the annotator/QC/arbiter
-        actually read. Things dropped:
-          • wrapper.path, wrapper.content_type — filesystem detail
-          • payload.raw_response — provider HTTP wrapper, single biggest bloat
-          • payload.usage, payload.diagnostics, payload.task_id — runtime
-            telemetry the LLM doesn't read (task_id is already on the wrapper)
-          • payload.decision.raw_response (qc_result, arbiter_result) — the
-            qc/arbiter parser stores its parsed JSON back under
-            ``decision.raw_response`` in addition to lifting fields to the top
-            level. Pure duplicate of decision.{failures,feedback_resolution,
-            message,passed}; dropping saves ~900 chars per qc_result.
-
-        Empirically the annotation prompt drops from 173 KB → ~50 KB after
-        all of these trims on a task with the max 3+3+1 artifacts.
-        """
-        by_kind: dict[str, list[ArtifactRef]] = {}
-        for artifact in self.store.list_artifacts(task_id):
-            by_kind.setdefault(artifact.kind, []).append(artifact)
-        selected: list[ArtifactRef] = []
-        for arts in by_kind.values():
-            # Artifacts are returned in insertion (seq) order — keep tail N
-            selected.extend(arts[-per_kind_limit:])
-        results: list[dict[str, Any]] = []
-        for artifact in selected:
-            payload = self._read_artifact_payload(artifact)
-            if isinstance(payload, dict):
-                payload = {
-                    k: v for k, v in payload.items()
-                    if k not in {"raw_response", "usage", "diagnostics", "task_id"}
-                }
-                # arbiter_result.items is a per-feedback verdict list that
-                # duplicates feedback_bundle.items (same feedback_id keys).
-                # Strip from prompt context — feedback_bundle already carries
-                # the active dispute set, with discussion / consensus state.
-                if artifact.kind == "arbiter_result":
-                    payload = {k: v for k, v in payload.items() if k != "items"}
-                decision = payload.get("decision")
-                if isinstance(decision, dict):
-                    drop_decision_keys = {"raw_response"}
-                    # arbiter_result.decision.corrected_annotation is a full
-                    # re-emission of the annotation JSON (~13 KB on a 10-row
-                    # task). The latest annotation_result.text already carries
-                    # it, so drop the duplicate from arbiter context.
-                    if artifact.kind == "arbiter_result":
-                        drop_decision_keys.add("corrected_annotation")
-                    if any(k in decision for k in drop_decision_keys):
-                        payload = {
-                            **payload,
-                            "decision": {k: v for k, v in decision.items() if k not in drop_decision_keys},
-                        }
-            wrapper = {k: v for k, v in artifact.to_dict().items() if k not in {"path", "content_type"}}
-            results.append({**wrapper, "payload": payload})
-        return results
+        return self._prompt_builder._artifact_context(task_id, per_kind_limit=per_kind_limit)
 
     def _read_artifact_payload(self, artifact: ArtifactRef) -> Any:
-        path = self.store.root / artifact.path
-        if not path.exists():
-            return None
-        text = path.read_text(encoding="utf-8")
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return text
+        return self._prompt_builder._read_artifact_payload(artifact)
 
     def _transition(
         self,
