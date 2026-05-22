@@ -23,6 +23,8 @@ import pytest
 from annotation_pipeline_skill.llm.anthropic_sdk import (
     AnthropicSDKClient,
     LocalCLIExecutionError,
+    _openai_to_anthropic_messages,
+    _anthropic_content_to_openai_assistant,
 )
 from annotation_pipeline_skill.llm.client import LLMGenerateRequest
 from annotation_pipeline_skill.llm.profiles import LLMProfile
@@ -216,6 +218,8 @@ def test_turn_2_messages_extend_turn_1_byte_stable(tmp_path, monkeypatch):
     assert len(turn2_messages) == 3  # user_1, assistant_1, user_2
     assert turn2_messages[0] == turn1_messages[0]  # original user message unchanged
     assert turn2_messages[1]["role"] == "assistant"
+    # assistant content in Anthropic format is a list of content blocks
+    assert isinstance(turn2_messages[1]["content"], list)
     assert turn2_messages[2]["role"] == "user"
     assert turn2_messages[2]["content"] == "user message 2"
 
@@ -307,7 +311,7 @@ def test_stop_reason_pause_turn_loops(tmp_path, monkeypatch):
         LLMGenerateRequest(instructions="i", prompt="p", task_id="t-1")
     ))
     assert r.final_text == "answer"
-    assert r.diagnostics["iterations"] == 2
+    assert r.diagnostics["iterations"] == 1  # pause_turn is handled inside _call_api, not counted as outer iteration
 
 
 # ---- tool dispatch + error breaker ---------------------------------------
@@ -423,8 +427,10 @@ def test_session_persistence_roundtrip(tmp_path, monkeypatch):
     lines = conv_path.read_text().splitlines()
     assert len(lines) == 4  # user1, assistant1, user2, assistant2
     msgs = [json.loads(line) for line in lines]
-    assert msgs[0]["content"] == "msg1"
-    assert msgs[2]["content"] == "msg2"
+    assert msgs[0]["content"] == "msg1"        # user turn 1
+    assert msgs[1]["role"] == "assistant"       # assistant turn 1 (OpenAI format)
+    assert msgs[1]["content"] == "r1"
+    assert msgs[2]["content"] == "msg2"        # user turn 2
 
 
 # ---- timeout --------------------------------------------------------------
@@ -480,3 +486,86 @@ def test_api_error_surfaces_as_local_cli_execution_error(tmp_path, monkeypatch):
         ))
     assert "402" in str(excinfo.value) or "Insufficient" in str(excinfo.value)
     assert excinfo.value.diagnostics["runtime"] == "anthropic_sdk"
+
+
+# --- message format conversion (new after base_sdk_client refactor) ---------
+
+
+def test_openai_to_anthropic_extracts_system():
+    system, msgs = _openai_to_anthropic_messages([
+        {"role": "system", "content": "Be helpful."},
+        {"role": "user", "content": "hello"},
+    ])
+    assert system == "Be helpful."
+    assert len(msgs) == 1
+    assert msgs[0] == {"role": "user", "content": "hello"}
+
+
+def test_openai_to_anthropic_converts_tool_calls():
+    _, msgs = _openai_to_anthropic_messages([
+        {"role": "user", "content": "annotate"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "check", "arguments": '{"task_id": "t-1"}'},
+            }],
+        },
+    ])
+    assert msgs[1]["role"] == "assistant"
+    content = msgs[1]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "tool_use"
+    assert content[0]["id"] == "call_1"
+    assert content[0]["name"] == "check"
+    assert content[0]["input"] == {"task_id": "t-1"}
+
+
+def test_openai_to_anthropic_merges_tool_results():
+    """Consecutive role:tool messages → one role:user with list of tool_result blocks."""
+    _, msgs = _openai_to_anthropic_messages([
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "t1", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "t2", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": '{"ok": 1}'},
+        {"role": "tool", "tool_call_id": "c2", "content": '{"ok": 2}'},
+    ])
+    # user + assistant(tool_use) + user(tool_result x2)
+    assert len(msgs) == 3
+    result_msg = msgs[2]
+    assert result_msg["role"] == "user"
+    assert len(result_msg["content"]) == 2
+    assert result_msg["content"][0]["type"] == "tool_result"
+    assert result_msg["content"][0]["tool_use_id"] == "c1"
+    assert result_msg["content"][1]["tool_use_id"] == "c2"
+
+
+def test_anthropic_text_content_to_openai():
+    block = MagicMock()
+    block.type = "text"
+    block.text = "hello"
+    msg = _anthropic_content_to_openai_assistant([block])
+    assert msg == {"role": "assistant", "content": "hello"}
+
+
+def test_anthropic_tool_use_content_to_openai():
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = "toolu_1"
+    block.name = "check"
+    block.input = {"x": 1}
+    msg = _anthropic_content_to_openai_assistant([block])
+    assert msg["role"] == "assistant"
+    assert len(msg["tool_calls"]) == 1
+    tc = msg["tool_calls"][0]
+    assert tc["id"] == "toolu_1"
+    assert tc["function"]["name"] == "check"
+    assert json.loads(tc["function"]["arguments"]) == {"x": 1}
