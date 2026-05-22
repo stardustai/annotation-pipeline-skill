@@ -185,6 +185,14 @@ class SubagentRuntime:
         self._confidence_history: dict[str, list[float]] = {"qc": [], "annotator": []}
         self._confidence_window = 200
         self._confidence_min_samples = 10
+        # Extracted validator — used in parallel with the inline
+        # _check_annotation_validation for now. Will fully replace the inline
+        # body once the extraction is verified stable.
+        from annotation_pipeline_skill.runtime.annotation_validator import AnnotationValidator
+        self._annotation_validator = AnnotationValidator(
+            output_schema=None,
+            store=self.store,
+        )
 
     def run_once(self, stage_target: str = "annotation", limit: int | None = None) -> SubagentRuntimeResult:
         pending_tasks = self.store.list_tasks_by_status({TaskStatus.PENDING})
