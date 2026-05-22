@@ -23,11 +23,14 @@ def test_build_claude_command_includes_mcp_config_path(tmp_path):
         mcp_config_path=cfg_path, strict_mcp_config=True,
         disallowed_tools=["Bash", "Edit"],
     )
-    assert "--mcp-config" in cmd
-    assert str(cfg_path) in cmd
+    # --mcp-config uses equals-form so the trailing `-` stdin marker can't be
+    # swallowed by claude's multi-path mcp-config parser.
+    assert f"--mcp-config={cfg_path}" in cmd
     assert "--strict-mcp-config" in cmd
     assert "--disallowedTools" in cmd
     assert "Bash,Edit" in cmd
+    # The stdin marker must stay distinct (not collapsed into the mcp-config arg).
+    assert cmd[-1] == "-"
 
 
 def test_build_claude_command_disallowed_tools_only():

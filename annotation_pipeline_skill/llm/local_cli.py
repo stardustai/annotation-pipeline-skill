@@ -147,10 +147,23 @@ def build_claude_command(
         "--model",
         model,
     ])
-    if permission_mode:
-        command.extend(["--permission-mode", permission_mode])
+    # Default to bypassPermissions when the profile doesn't specify a mode:
+    # --bare -p auto-approves built-in tools (Bash/Read/etc.) but MCP tools
+    # still go through the default "prompt for each call" gate, which blocks
+    # every tool_use the agent makes with "Claude requested permissions ...
+    # but you haven't granted it yet." Workers can't answer prompts. The
+    # historical workers all ran under bypassPermissions implicitly; setting
+    # it explicitly when None preserves that behaviour AND unblocks the new
+    # MCP-validator tool path. Profiles that want stricter scoping can set
+    # permission_mode explicitly.
+    command.extend(["--permission-mode", permission_mode or "bypassPermissions"])
     if mcp_config_path is not None:
-        command.extend(["--mcp-config", str(mcp_config_path)])
+        # `--mcp-config=PATH` (single token, equals syntax) — the space form
+        # `--mcp-config PATH` causes claude to greedily consume the trailing
+        # `-` (our stdin-prompt marker, appended below) as a second config
+        # path, producing "MCP config file not found: <cwd>/-". The equals
+        # form binds the path to the flag unambiguously.
+        command.append(f"--mcp-config={mcp_config_path}")
         if strict_mcp_config:
             command.append("--strict-mcp-config")
     if disallowed_tools:
