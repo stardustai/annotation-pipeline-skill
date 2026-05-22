@@ -508,6 +508,25 @@ class SubagentRuntime:
     ) -> None:
         validation_failure = self._check_annotation_validation(task, annotation_final_text)
         if validation_failure is not None:
+            # For verbatim failures specifically: emit ONE feedback per
+            # violation instead of just the first. Otherwise the arbiter
+            # only sees one bad span, fixes that one, and the merge step
+            # in _apply_arbiter_correction brings the OTHER untouched
+            # violations back from the annotator's output — causing the
+            # corrected annotation to fail validation on rows the arbiter
+            # was never asked about. Burns a mechanical retry per missed
+            # violation.
+            extra_violations: list[dict] = []
+            if validation_failure["category"] == "non_verbatim_span":
+                try:
+                    payload = _parse_llm_json(annotation_final_text)
+                    from annotation_pipeline_skill.core.schema_validation import (
+                        find_verbatim_violations,
+                    )
+                    all_violations = find_verbatim_violations(task, payload)
+                    extra_violations = all_violations[1:]  # first is already in validation_failure
+                except (json.JSONDecodeError, ValueError):
+                    pass
             self._record_validation_feedback(
                 task,
                 annotation_attempt_id,
@@ -515,6 +534,17 @@ class SubagentRuntime:
                 message=validation_failure["message"],
                 target=validation_failure.get("target", {}),
             )
+            for v in extra_violations:
+                self._record_validation_feedback(
+                    task,
+                    annotation_attempt_id,
+                    category="non_verbatim_span",
+                    message=(
+                        f"Row {v['row_index']} {v['field']}: span {v['span']!r} "
+                        f"is not a verbatim substring of the input text."
+                    ),
+                    target=v,
+                )
             round_count = self._retry_round_count(task.task_id)
             if round_count >= self.max_qc_rounds:
                 # Last shot before HR: invoke the arbiter even if the
