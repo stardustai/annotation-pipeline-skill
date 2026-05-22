@@ -992,6 +992,170 @@ Operator 点 "Check" 后端扫所有 ACCEPTED：
 和 `runtime/subagent_cycle.py` 的 verifier 注入点。
 
 
+### 11.10 Annotation Knowledge Base（V1.3）
+
+V1.2 把项目经验作为 runtime 自动调用的 verifier。V1.3 把同一份经验额外
+暴露成 **agent 主动调用的 MCP tool**，让 annotator / QC 子 agent 在标注
+前/标注中可以自己决定查询。完整设计：
+`docs/superpowers/specs/2026-05-19-annotation-knowledge-base-design.md`。
+
+#### 组件分层
+
+```
+annotator / qc 子 agent (claude --bare)
+        │ MCP stdio (JSON-RPC over claude --mcp-config)
+        ▼
+annotation_pipeline_skill/mcp/kb_server.py
+        │ 调用 (in-process)
+        ▼
+annotation_pipeline_skill/mcp/check_past_experience.py（纯函数）
+        │
+        ├─ EntityConventionService（已存在，读 entity_conventions）
+        ├─ entity_conventions.proposals_json（扩展两字段）
+        ├─ similarity.diverse.select_diverse_examples（新）
+        ├─ similarity.minhash.shingle（扩展 CJK 路径）
+        └─ text.wordfreq_utils.wordfreq_score（从 api.py 提取）
+```
+
+四层都遵守"零业务状态、查询时组合"的原则。`check_past_experience` 不写
+任何东西；不维护 cache；不订阅事件——每次调用都重新读 SQLite 并 MinHash
+当前 proposals。响应 dict 上限不超过 200 条 proposal 时 < 100 ms。
+
+#### Schema 扩展（唯一的破坏性变更）
+
+`entity_conventions.proposals_json` 里每条 proposal 新增 **两个可选字段**:
+
+```python
+{
+  "type": str, "source": str, "task_id": str | None,
+  "row_id": str | None,           # NEW
+  "context_snippet": str | None,  # NEW: span 周围 ±80 字符的 row 片段
+  "notes": str | None, "at": str,
+}
+```
+
+因为 `proposals_json` 是自由 JSON blob，不需要 ALTER TABLE 也不需要回填。
+旧 proposal 没有这两个字段——`check_past_experience` 把它们当作 `None`
+处理，不影响 distribution 统计，只是没法贡献到 `examples_by_type`。
+
+写入方面：`EntityConventionService.record_decision()` 新增两个 kwargs
+（`row_id`, `row_content`），调用 `_build_context_snippet(span, row_content)`
+生成 snippet。调用站点 (`subagent_cycle._record_conventions_from_qc_consensus`,
+`human_review_service._record_conventions_from_correction`) 通过新增的
+`extract_entity_type_decisions_with_row` 辅助函数把 row 信息带过去。
+operator-declared 的两个写入点（api.py 的 Set Convention 端点和
+posterior_audit_operator 路径）刻意不传——operator 在 UI 上声明 convention
+时本来就没绑定到具体 row，传 `None` 是正确语义。
+
+#### MCP Server 形态
+
+`kb_server.py` 是 thin wrapper：argparse 解析 `--project-root` /
+`--project-id`，构造一个 `Server("annotation-kb")`，注册唯一一个 tool
+（input schema 只声明必填 `entry: string`），把 `tools/call` 转发给
+`check_past_experience` 纯函数。返回值打成单个 `TextContent`（`type:
+"text"` + JSON-encoded payload）。所有错误（`ValueError` 输入错误、
+`sqlite3.OperationalError` 存储错误、`json.JSONDecodeError` 数据损坏）
+都被翻译为 `{"error": "..."}` payload 而非 protocol exception，避免任何
+错误 break MCP 通道。
+
+进程模型：每个 annotator subprocess 启动时由 Claude CLI fork 一个独立
+的 `python -m annotation_pipeline_skill.mcp.kb_server` 子进程，通过 stdio
+通信，subprocess 退出时 Claude CLI 负责清理。SQLite 用单连接（设了
+`check_same_thread=False`），asyncio 单事件循环驱动，不会出现跨线程访问。
+
+#### Diversity Sampling 算法
+
+`select_diverse_examples(snippets, k=3)` 用 Gonzalez farthest-first
+traversal：
+
+1. dedupe snippets（保持插入顺序）
+2. 选 lex-smallest 作为 seed（确保 deterministic）
+3. 循环 (k-1) 次：每次选 candidate i 使得
+   `1 - max(jaccard(i, j) for j in selected)` 最大；tie-break 用 lex
+   比较
+
+MinHash 用 `num_perm=64`（低于 `row_dedup` 的 128，因为我们对 short
+snippets 小规模 pairwise 比较）。Shingle 路径走 `similarity.minhash.shingle`
+（接下来说明的 CJK gate）。
+
+#### CJK Shingle Gate
+
+`similarity.minhash.shingle()` 之前对所有输入做 word-level n-gram
+（whitespace split）。CJK 文本因为没有空格被退化成单 shingle，使
+Jaccard 二值化、`row_dedup` 实质失效、KB 多样性采样失效。
+
+新增 `_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")` gate：
+
+```python
+if _CJK_RE.search(normalized):
+    import jieba   # lazy import — ASCII 项目不付加载成本
+    tokens = [t for t in jieba.cut(normalized) if t.strip()]
+else:
+    tokens = normalized.split(" ")
+```
+
+ASCII 路径完全不变（实测对比："Apple's customer support..." 在统一
+jieba 路径下会拆出 `apple / ' / s` 产生 6 个 3-gram，而 split 路径只
+4 个，3 个共享——会破坏 row_dedup 的已校准 threshold）。CJK 路径从
+"单 shingle 退化" 升级为 "jieba 词级 n-gram"，对 row_dedup 是一次有意
+的精度提升（CJK-heavy 项目可能需要 re-verify `jaccard_threshold`，
+spec Risks 里有说明）。
+
+#### LLM Provider 切换
+
+profile 三个新字段（`mcp_servers`, `strict_mcp_config`, `disallowed_tools`）
+落到 `llm/profiles.py::LLMProfile` 上，validator (`_optional_mcp_servers`,
+`_optional_string_list`) 拒绝结构错误的 yaml。
+
+`llm/local_cli.py::_generate_claude` 在 `isolated_claude_home(...)`
+context 内 materialize 一个 `mcp-config.json` 到 isolated home 目录，然后
+重建 command（`build_claude_command` 接受三个新 kwargs：
+`mcp_config_path`, `strict_mcp_config`, `disallowed_tools`）。临时文件
+随 isolated home 一起被 GC，不需要额外 try/finally。
+
+provider switch 走的是已经存在的 `LLMProfile.base_url` → `isolated_claude_home`
+→ `subprocess.Popen(env={"ANTHROPIC_BASE_URL": ..., ...})` 路径。子进程
+拿到独立 env 字典，parent process 的 `os.environ` 永远不被修改。
+
+#### System-Level Prompt
+
+`runtime/subagent_cycle.py::_annotation_instructions()` 和
+`_build_qc_instructions()` 各嵌入一段 "KNOWLEDGE BASE TOOL:" 段落。措辞
+是 conditional 的（`"when the mcp__annotation-kb__check_past_experience
+tool appears in your tools list..."`），所以没装 MCP server 的 profile
+看到同一段文字但 agent 自然 no-op。指导内容包括：何时调用（ambiguous
+named entities）、如何用返回结果（active convention 优先；disputed 用
+per-type examples 做 analogy；`generic_word` + low evidence 通常不标）、
+何时跳过（明显的非实体、schema 一目了然的 span）。
+
+#### Runtime 路径上的副效应修复
+
+V1.3 重写 `_profile_name_for_target`：旧实现为了拿 `client.profile.name`
+会构造一个 throwaway client 然后扔掉。在 production 几乎免费，但 finite-
+list 测试 stub 里每次调用消耗一个 stub，破坏了 retry 流程的两个测试。
+新实现把 profile-name 改成由 `_call_client` 副作用填的 cache
+（key = `result.provider`，跟 `_write_pinned_handle` 写入的 minted-by
+字段对齐）。无 probe，无 stub 消耗，pin-handle 跨 provider 校验语义
+保持不变。
+
+#### 测试矩阵
+
+| 文件 | 测试数 | 范围 |
+|---|---|---|
+| `tests/test_text_wordfreq_utils.py` | 5 | `wordfreq_score` 行为 |
+| `tests/test_similarity_minhash.py` | 11（+5 新增） | CJK gate + ASCII 不变 |
+| `tests/test_similarity_diverse.py` | 5 | farthest-first 算法 |
+| `tests/test_entity_convention_proposals_schema.py` | 10 | proposal 扩展 + `extract_*_with_row` |
+| `tests/test_mcp_check_past_experience.py` | 7 | 纯函数所有分支 |
+| `tests/test_mcp_kb_server.py` | 3 | stdio MCP 协议（含错误路径） |
+| `tests/test_llm_profiles_mcp.py` | 5 | profile schema + validator |
+| `tests/test_local_cli_claude_mcp.py` | 4 | `build_claude_command` MCP 标志 |
+
+50/50 通过。E2E 验证（`docs/release/annotation-kb-verification.md`）走真实
+Claude CLI + DeepSeek endpoint，证明 agent 在 disputed span 上自主调用
+工具并根据 per-type examples 正确消歧。
+
+
 ## 12. 错误模型
 
 所有 in-flight 错误都是非致命的，由三层兜住：
