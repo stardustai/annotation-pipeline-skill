@@ -130,6 +130,7 @@ def build_claude_command(
     mcp_config_path: Path | None = None,
     strict_mcp_config: bool = False,
     disallowed_tools: list[str] | None = None,
+    persist_session: bool = True,
 ) -> list[str]:
     # --bare: never read OAuth / keychain / ~/.claude credentials. Auth is
     # strictly ANTHROPIC_API_KEY (no token writeback can clobber real creds).
@@ -138,7 +139,16 @@ def build_claude_command(
     command = [binary, "--bare", "-p"]
     if session_id:
         command.extend(["--resume", session_id])
-    else:
+    elif not persist_session:
+        # Only suppress session persistence when the profile has explicitly
+        # disabled continuity. Previously we ALWAYS added this flag whenever
+        # session_id was None — which meant turn 1 of a continuity-enabled
+        # task generated a session_id but never wrote the session file, so
+        # turn 2's `--resume <id>` silently started a fresh session instead
+        # of replaying history. Net effect: claimed continuity was broken
+        # end-to-end and vLLM prefix-cache hit rate stayed at 0%.
+        # Documented behaviour (claude --help): "Disable session persistence
+        # - sessions will not be saved to disk and cannot be resumed."
         command.append("--no-session-persistence")
     command.extend([
         "--verbose",
@@ -545,6 +555,11 @@ class LocalCLIClient:
         handle = None if self.profile.disable_continuity else request.continuity_handle
         home_id, session_id = _parse_claude_handle(handle)
         api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
+        # persist_session=True for continuity-enabled profiles so turn 1 of a
+        # task actually writes its session file to disk; turn 2's --resume
+        # would otherwise miss and silently start a fresh session, breaking
+        # the entire multi-turn continuity chain.
+        persist_session = not self.profile.disable_continuity
         command = build_claude_command(
             binary="claude",
             model=self.profile.model,
@@ -553,6 +568,7 @@ class LocalCLIClient:
             mcp_config_path=None,  # set inside the isolated_claude_home block below
             strict_mcp_config=bool(self.profile.strict_mcp_config),
             disallowed_tools=self.profile.disallowed_tools,
+            persist_session=persist_session,
         )
         prompt = request.prompt or _messages_to_prompt(request.input_items)
         if request.instructions:
@@ -597,6 +613,7 @@ class LocalCLIClient:
                     session_id=session_id,
                     mcp_config_path=mcp_config_path,
                     strict_mcp_config=bool(self.profile.strict_mcp_config),
+                    persist_session=persist_session,
                     disallowed_tools=self.profile.disallowed_tools,
                 )
             process = await asyncio.create_subprocess_exec(

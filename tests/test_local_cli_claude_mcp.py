@@ -4,14 +4,54 @@ from annotation_pipeline_skill.llm.local_cli import build_claude_command
 
 
 def test_build_claude_command_without_mcp_unchanged():
+    # Explicit persist_session=False (continuity disabled, first turn) — this
+    # matches the disable_continuity=True profile case, where no session file
+    # should be written to disk.
     cmd = build_claude_command(
         binary="claude", model="sonnet", permission_mode=None,
+        persist_session=False,
     )
     assert "--mcp-config" not in cmd
     assert "--strict-mcp-config" not in cmd
     assert "--disallowedTools" not in cmd
     # Existing flags must still be there.
     assert "--bare" in cmd
+    assert "--no-session-persistence" in cmd
+
+
+def test_first_turn_with_continuity_omits_no_session_persistence():
+    """Continuity-enabled profile, turn 1 (no session_id yet). MUST NOT pass
+    --no-session-persistence — that would prevent claude from writing the
+    session file, breaking the next turn's --resume and silently zeroing
+    out the entire multi-turn continuity chain (vLLM prefix-cache regression)."""
+    cmd = build_claude_command(
+        binary="claude", model="sonnet", permission_mode=None,
+        session_id=None, persist_session=True,
+    )
+    assert "--no-session-persistence" not in cmd
+    assert "--resume" not in cmd
+
+
+def test_resume_path_omits_no_session_persistence():
+    """When a session_id is provided we --resume it; --no-session-persistence
+    must not also appear (mutually exclusive — claude would refuse)."""
+    cmd = build_claude_command(
+        binary="claude", model="sonnet", permission_mode=None,
+        session_id="sess-abc", persist_session=True,
+    )
+    assert "--resume" in cmd
+    assert "sess-abc" in cmd
+    assert "--no-session-persistence" not in cmd
+
+
+def test_no_session_with_disable_continuity_still_persists_flag():
+    """First turn under disable_continuity=True must keep
+    --no-session-persistence — otherwise the disk fills with one-shot
+    session files for profiles that explicitly opt out of resume."""
+    cmd = build_claude_command(
+        binary="claude", model="sonnet", permission_mode=None,
+        session_id=None, persist_session=False,
+    )
     assert "--no-session-persistence" in cmd
 
 

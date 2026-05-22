@@ -146,10 +146,15 @@ def test_parse_codex_json_events_extracts_thread_and_final_text():
 
 
 def test_build_claude_command_uses_stream_json_and_stdin_prompt():
+    # persist_session=False mirrors the disable_continuity=True profile case;
+    # without that, the new default omits --no-session-persistence (so
+    # continuity-enabled profiles' turn-1 calls actually write the session
+    # file for turn-2 to resume).
     command = build_claude_command(
         binary="claude",
         model="claude-sonnet-4-5",
         permission_mode="dontAsk",
+        persist_session=False,
     )
 
     assert command[:3] == ["claude", "--bare", "-p"]
