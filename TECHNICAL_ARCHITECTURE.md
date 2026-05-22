@@ -316,17 +316,22 @@ AuditEvent:
 
 ### 6.1 Task 状态
 
-当前实现使用 7 个 task status（`core/states.py:TaskStatus`）：
+当前实现使用 10 个 task status（`core/states.py:TaskStatus`）：
 
 | Status | 含义 |
 |---|---|
+| `draft` | task 已创建，等待 manifest 生成 |
 | `pending` | 等待 worker claim |
 | `annotating` | 标注 LLM 调用进行中 |
-| `qc` | 验证已通过，QC 进行中（或恢复中） |
-| `arbitrating` | 仲裁 LLM 调用进行中，或 mechanical retry 等待重新 pickup |
-| `accepted` | 终态 — 标注通过所有检查 |
-| `human_review` | 准终态 — arbiter 真正不确定，或 retry 上限触发 |
-| `rejected` | 保留给手动 reject |
+| `qc` | validation 通过，QC 进行中 |
+| `arbitrating` | 仲裁 LLM 调用进行中，或 mechanical retry 等待 pickup |
+| `human_review` | 需要人工判断或 arbiter 不确定 |
+| `accepted` | 终态 — 通过所有检查 |
+| `rejected` | 终态 — 人工拒绝 |
+| `blocked` | 需要人工介入才能继续 |
+| `cancelled` | 已取消 |
+
+> `validating` 是 inline 步骤（annotation 写完后立刻执行），不是独立 task status；失败后 task 回 `pending` 重试，写 BLOCKING FeedbackRecord。
 
 整体流向：
 
@@ -669,6 +674,20 @@ StageRoute:
 - 在 stage transition 后写入 external status outbox
 - 在 accepted / rejected / merged 后提交结果或失败原因
 - 处理外部 API 幂等冲突、临时失败和 dead-letter
+
+### 当前代码中存在但文档未覆盖的服务
+
+- `coordinator_service` — 跨 pipeline 协调调度，生成统一 report
+- `distribution_service` — span/entity 类型分布统计与缓存，供看板的 DistributionPanel 使用
+- `entity_convention_service` — 高确定性约定读写，用于向 annotator/QC prompt 注入 KNOWN ENTITY CONVENTIONS
+- `entity_statistics_service` — 所有 ACCEPTED 决策的统计分布，供 prior verifier 查询
+- `export_service` (`TrainingDataExportService`) — 将 ACCEPTED task 的 annotation_result 导出为 JSONL
+- `human_review_service` — HR 阶段决策写入（accept/reject）和 operator 修正提交
+- `outbox_dispatch_service` — 外部状态回传和结果提交的 outbox drain，可靠重试
+- `provider_config_service` — provider profile 读取、校验和 stage target 更新
+- `readiness_service` — 项目就绪度检查（环境、配置、schema）
+- `row_dedup_service` — 输入行去重检测，防止重复标注
+- `row_mask_service` — 屏蔽低质量或重复行，在 annotation 和 export 前过滤
 
 
 ## 10. Runtime 设计
@@ -1529,6 +1548,34 @@ MVP 需要只读、少量控制、settings 和外部任务接入接口：
 - `POST /tasks/<task_id>/feedback/<feedback_id>/decision`
 - `POST /external/tasks/pull`
 - `POST /external/tasks/status`
+
+### 文档路径 → 实际路径
+
+| 文档描述 | 实际路径 |
+|---|---|
+| `GET /dashboard` | `GET /api/kanban` + `GET /api/dashboard-stats` |
+| `GET /settings` | `GET /api/config` + `GET /api/providers` + `GET /api/annotators` |
+| `POST /settings/validate` | 未实现 |
+| `POST /providers/test` | 未实现 |
+| `POST /tasks/<id>/retry` | `POST /api/tasks/<id>/move` (body: `{"to": "pending"}`) |
+| `POST /tasks/<id>/approve` | `POST /api/tasks/<id>/move` (body: `{"to": "accepted"}`) |
+| `POST /tasks/<id>/reject` | `POST /api/tasks/<id>/move` (body: `{"to": "rejected"}`) |
+| `GET /tasks/<id>/feedback` | 包含在 `GET /api/tasks/<id>` 响应体内 |
+
+### 代码中存在但文档未提及的端点
+
+`GET /api/conventions`, `POST /api/conventions`, `DELETE /api/conventions/clear`,
+`GET /api/posterior-audit`, `POST /api/posterior-audit`, `POST /api/posterior-audit/retroactive-fix`,
+`GET /api/distribution`, `POST /api/distribution/scan`, `POST /api/distribution/reject`,
+`GET /api/row-dedup`, `POST /api/row-dedup/scan`, `POST /api/row-dedup/mask`, `DELETE /api/row-dedup/mask`,
+`GET /api/type-statistics`, `POST /api/type-statistics`,
+`GET /api/entity-statistics`, `POST /api/entity-statistics/recount`,
+`GET /api/typical-text`, `GET /api/alerts`, `GET /api/coordinator`,
+`GET /api/readiness`, `GET /api/export-file`,
+`GET /api/annotation-rules-document`, `POST /api/annotation-rules-document/versions`,
+`GET /api/documents`, `POST /api/documents`,
+`GET /api/runtime/monitor`, `POST /api/runtime/run-once`,
+`GET /api/jobs/<id>`
 
 API 设计原则：
 
