@@ -716,6 +716,16 @@ helped me…" 标为 organization；同一行的 Android 因为 active conventio
 
 建议通用状态机：
 
+> **当前实现说明**（与通用状态机的偏差）：
+> - `validating` 是 annotation worker 内部的 inline 步骤，不是独立 task status；失败后 task 回 `pending` 并写 BLOCKING FeedbackRecord。
+> - `repair_needed` 在当前实现中通过 `pending` 重试循环 + `arbitrating` 仲裁状态覆盖，没有独立状态。
+> - `ready` 等同于 `pending`（draft 写完即直接变 pending）。
+> - `merged` 通过 `ExportService` 实现为操作而非状态；accepted task 的 status 不改变。
+> - `retry_scheduled` 由 `next_retry_at` 字段在 task metadata 里表达，不是独立状态。
+> - `arbitrating` 是当前实现特有的仲裁状态，对应通用模型中"进入 repair/arbiter 判断"这一阶段。
+>
+> 上述偏差反映了当前 NER 项目驱动的实现选择；通用框架扩展时可以重新建模这些为独立状态。
+
 `draft -> ready -> annotating -> validating -> qc -> human_review -> accepted/rejected/repair_needed -> merged`
 
 补充状态：
