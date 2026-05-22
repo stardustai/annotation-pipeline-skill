@@ -1190,6 +1190,30 @@ class SubagentRuntime:
         except Exception:  # noqa: BLE001 — alerts are best-effort
             pass
 
+    def _emit_enum_coerce_alert(
+        self, task: Task, dropped: dict[str, int]
+    ) -> None:
+        """Append a structured row to alerts.jsonl when the arbiter
+        invented entity / structure types that had to be dropped before
+        schema validation. Helps build a corpus of frequently-hallucinated
+        types so we can either teach the model not to invent them or
+        promote a heavily-used invention to the real enum.
+
+        Not deduped by cooldown — these are per-task data points that
+        matter for the rolling-up dashboard, not floods.
+        """
+        try:
+            alerts_path = self.store.root / "alerts.jsonl"
+            with open(alerts_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": utc_now().isoformat(),
+                    "kind": "arbiter_enum_coerce",
+                    "task_id": task.task_id,
+                    "dropped": dropped,
+                }) + "\n")
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         try:
             return await self._call_client(target, request)
@@ -1799,9 +1823,24 @@ class SubagentRuntime:
         """
         from annotation_pipeline_skill.core.schema_validation import (
             SchemaValidationError,
+            resolve_output_schema,
             validate_payload_against_task_schema,
         )
 
+        # Enum coerce: arbiters occasionally invent entity/structure types
+        # (e.g. "attribute", "system") alongside legitimate ones. Strict
+        # schema validation then rejects the WHOLE correction, including
+        # the valid spans. Drop only the invented keys, keep the rest. If
+        # anything was coerced, record a one-shot alert so we can see how
+        # often the arbiter hallucinates types (and which ones).
+        try:
+            schema_resolved = resolve_output_schema(task, self.store)
+        except Exception:  # noqa: BLE001
+            schema_resolved = None
+        dropped = _coerce_to_enum_in_place(corrected, schema_resolved)
+        if dropped:
+            arb.setdefault("enum_coerce_dropped", {}).update(dropped)
+            self._emit_enum_coerce_alert(task, dropped)
         # Schema check the corrected annotation up front. If it fails we punt
         # back to HR rather than save a bad artifact.
         try:
@@ -3466,6 +3505,56 @@ def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
         return json.dumps(parsed, ensure_ascii=False)
     except (ValueError, TypeError):
         return text
+
+
+def _coerce_to_enum_in_place(payload: Any, schema: Any) -> dict[str, int]:
+    """Drop entity / json_structure entries whose TYPE KEY is not in the
+    resolved output_schema enum. Returns a summary of what was dropped:
+    ``{"entities/<bad_type>": N, "json_structures/<bad_type>": M, ...}``.
+
+    Arbiters (esp. gpt-5.5 + DeepSeek) occasionally invent types like
+    "attribute" or "system" that pass the model's own coherence check
+    but fail strict schema validation downstream — that fail routes the
+    whole correction to HR, including the parts the arbiter got right.
+    Coercing keeps the valid types and discards only the invented ones,
+    salvaging corrections that would otherwise be wholly rejected.
+
+    Safe no-op when payload doesn't conform, or when the schema can't
+    be resolved into enum sets (we leave the data alone and let the
+    strict validator make the call instead of silently passing through).
+    """
+    from annotation_pipeline_skill.core.schema_validation import _schema_type_enums
+    if not isinstance(payload, dict):
+        return {}
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return {}
+    entity_enum, phrase_enum = _schema_type_enums(schema)
+    if not entity_enum and not phrase_enum:
+        # Schema couldn't be resolved — don't coerce, let downstream
+        # validation handle whatever is there.
+        return {}
+    dropped: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        for field_key, allowed in (
+            ("entities", entity_enum),
+            ("json_structures", phrase_enum),
+        ):
+            field = output.get(field_key)
+            if not isinstance(field, dict) or not allowed:
+                continue
+            for bad_type in [t for t in field.keys() if t not in allowed]:
+                spans = field.pop(bad_type)
+                count = len(spans) if isinstance(spans, list) else 1
+                dropped[f"{field_key}/{bad_type}"] = dropped.get(
+                    f"{field_key}/{bad_type}", 0
+                ) + count
+    return dropped
 
 
 def _dedupe_within_type_spans(payload: Any) -> None:

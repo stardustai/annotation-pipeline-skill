@@ -129,11 +129,13 @@ def try_align_to_verbatim(span: str, input_text: str) -> str | None:
     safely.
 
     Safety contract — alignment may ONLY remove characters from either end
-    of ``span`` (whitespace / sentence punctuation / quote chars). It may
-    NOT change letters, digits, or any internal character. This guarantees
-    we never silently rewrite the semantic content of an entity. The
-    caller can show the alignment to an auditor and trust it didn't change
-    what the span means — only where the span starts/ends.
+    of ``span`` (whitespace / sentence punctuation / quote chars) OR
+    re-insert whitespace that's literally present in ``input_text`` at the
+    matching position. It may NOT change letters, digits, or any internal
+    non-whitespace character. This guarantees we never silently rewrite the
+    semantic content of an entity. The caller can show the alignment to an
+    auditor and trust it didn't change what the span means — only where the
+    span starts/ends or how internal whitespace breaks up the characters.
 
     Aligned result must be a non-empty substring of ``input_text``.
     """
@@ -144,6 +146,62 @@ def try_align_to_verbatim(span: str, input_text: str) -> str | None:
     stripped = span.strip(_VERBATIM_ALIGN_TRIM_CHARS)
     if stripped and stripped != span and stripped in input_text:
         return stripped
+    # Internal-whitespace recovery: the LLM collapsed whitespace inside the
+    # span (common when the input is space-separated for visual layout, e.g.
+    # CJK OCR output "1 7 6 4"). Re-insert exactly the whitespace that's in
+    # the input. SAFE because:
+    #   (a) we never add a non-whitespace char that's not already in input
+    #   (b) the result is by construction a substring of input_text
+    #   (c) the non-whitespace character sequence is preserved end-to-end
+    aligned = _align_collapsing_whitespace(stripped or span, input_text)
+    if aligned is not None:
+        return aligned
+    return None
+
+
+def _align_collapsing_whitespace(span: str, input_text: str) -> str | None:
+    """If ``span`` is the whitespace-collapsed form of some substring of
+    ``input_text``, return that substring (with input's whitespace preserved).
+    Otherwise return ``None``.
+
+    Example: span="1764", input_text="...年（1 7 6 4 年）..." → "1 7 6 4"
+
+    Determinism: returns the FIRST match in input_text.
+    Safety: by construction the returned string is a slice of input_text,
+    and its non-whitespace characters equal those of ``span``.
+    """
+    # Strip whitespace from span to get the character sequence we need to
+    # match (ignoring all whitespace).
+    span_no_ws = "".join(ch for ch in span if not ch.isspace())
+    if not span_no_ws:
+        return None
+    n = len(input_text)
+    target = span_no_ws
+    tlen = len(target)
+    for start in range(n):
+        if input_text[start].isspace():
+            continue
+        # Try to match target starting here, skipping whitespace in input.
+        i = start
+        j = 0
+        last_nonws = start - 1
+        while i < n and j < tlen:
+            ch = input_text[i]
+            if ch.isspace():
+                i += 1
+                continue
+            if ch != target[j]:
+                break
+            last_nonws = i
+            i += 1
+            j += 1
+        if j == tlen:
+            # Matched all of target. The span is input_text[start : last_nonws+1].
+            candidate = input_text[start:last_nonws + 1]
+            # Sanity: don't return the original if it happens to equal span
+            # (then it'd be verbatim already and we wouldn't have been called).
+            if candidate and candidate != span:
+                return candidate
     return None
 
 
@@ -375,15 +433,35 @@ def _schema_type_enums(schema: Any) -> tuple[set[str], set[str]]:
     output_schema. Returns empty sets if the schema is missing or not
     structured as expected. Used by apply-path routing to decide which
     field a (span, type) decision should land in.
+
+    Handles two shapes:
+      - ``{"enum": ["person", "organization", ...]}``
+      - ``{"oneOf": [{"const": "person", "description": "..."}, ...]}``
+    The schema authoring tool emits the oneOf form so model-facing
+    descriptions ride along; earlier versions used the bare enum form.
     """
     if not isinstance(schema, dict):
         return set(), set()
     defs = schema.get("$defs") or schema.get("definitions") or {}
     entity_def = defs.get("entityType") if isinstance(defs, dict) else None
     phrase_def = defs.get("jsonStructureType") if isinstance(defs, dict) else None
-    entity_enum = set(entity_def.get("enum", [])) if isinstance(entity_def, dict) else set()
-    phrase_enum = set(phrase_def.get("enum", [])) if isinstance(phrase_def, dict) else set()
-    return entity_enum, phrase_enum
+
+    def _values(defn: Any) -> set[str]:
+        if not isinstance(defn, dict):
+            return set()
+        bare = defn.get("enum")
+        if isinstance(bare, list):
+            return {v for v in bare if isinstance(v, str)}
+        one_of = defn.get("oneOf")
+        if isinstance(one_of, list):
+            return {
+                item["const"]
+                for item in one_of
+                if isinstance(item, dict) and isinstance(item.get("const"), str)
+            }
+        return set()
+
+    return _values(entity_def), _values(phrase_def)
 
 
 def resolve_apply_field(
