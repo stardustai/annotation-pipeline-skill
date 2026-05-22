@@ -42,6 +42,16 @@ class LocalRuntimeScheduler:
     # transition out of ANNOTATING.
     TOTAL_BAIL_CAP: int = 25
 
+    # Provider health probe: every PROBE_INTERVAL the observer sends a minimal
+    # ping ("ok") through each common target. If a target returns a permanent
+    # error (4xx), write a provider_health alert to alerts.jsonl. Catches
+    # things like the 2026-05-21 DeepSeek 402 "Insufficient Balance" outage
+    # an hour BEFORE the queue would have surfaced it through HR.
+    PROBE_INTERVAL_SECONDS: int = 300
+    PROBE_TARGETS: tuple[str, ...] = (
+        "annotation", "qc", "arbiter", "arbiter_secondary", "fallback",
+    )
+
     def __init__(
         self,
         store: SqliteStore,
@@ -54,6 +64,12 @@ class LocalRuntimeScheduler:
         self.client_factory = client_factory
         self.config = config
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        # Per-target cooldown for the provider health probe — once the
+        # observer ticks at PROBE_INTERVAL_SECONDS it walks PROBE_TARGETS
+        # in order; this tracks last successful probe timestamps so a
+        # single observer tick doesn't re-fire all targets in a tight
+        # loop after restart.
+        self._last_provider_probe: float = 0.0
         # Pre-flight cleanup at init: clear stale leases/active_runs from
         # a previous (dead) scheduler. In-flight tasks (ANNOTATING / QC /
         # ARBITRATING) are NOT touched here — _try_claim_task picks them up
@@ -92,6 +108,105 @@ class LocalRuntimeScheduler:
                 f"{cleared_runs} stale active_runs",
                 file=sys.stderr,
             )
+
+    async def _probe_providers(self) -> None:
+        """Ping each configured target with a 1-token request. If the
+        provider returns ``is_error=true`` with a 4xx api_error_status,
+        append a ``provider_health`` row to ``<store_root>/alerts.jsonl``.
+        Runs at ``PROBE_INTERVAL_SECONDS`` cadence; idempotent if called
+        more often (returns early).
+
+        Catches the case the 2026-05-21 outage made painful: DeepSeek
+        returned 402 silently on every arbiter call, no operator alert,
+        ~200 tasks misrouted to HR before anyone noticed. With this
+        probe an alert lands ~5 min after the wallet empties, regardless
+        of whether any task happens to invoke that target.
+        """
+        import time
+        import json as _json
+        now = time.time()
+        if now - self._last_provider_probe < self.PROBE_INTERVAL_SECONDS:
+            return
+        self._last_provider_probe = now
+
+        from annotation_pipeline_skill.llm.client import LLMGenerateRequest
+
+        # We import here, not at module-top, to dodge a circular import
+        # (subagent_cycle imports local_scheduler indirectly).
+        ping_request = LLMGenerateRequest(
+            instructions="Respond with exactly the JSON object {\"ok\":true} and nothing else.",
+            prompt="ping",
+            continuity_handle=None,
+            response_format={"type": "json_object"},
+        )
+        for target in self.PROBE_TARGETS:
+            try:
+                client = self.client_factory(target)
+            except Exception:  # noqa: BLE001 — target may not be configured
+                continue
+            try:
+                result = await client.generate(ping_request)
+            except Exception as exc:  # noqa: BLE001
+                diag = getattr(exc, "diagnostics", None) or {}
+                err_ev = diag.get("error_event") if isinstance(diag, dict) else None
+                status = err_ev.get("api_error_status") if isinstance(err_ev, dict) else None
+                msg = (err_ev.get("result_text") if isinstance(err_ev, dict) else None) or str(exc)[:200]
+                self._write_health_alert(target, status, msg, exc_class=type(exc).__name__)
+                continue
+            finally:
+                close = getattr(client, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            # Successful subprocess BUT result may carry an error event
+            # (claude CLI exits rc=0 ONLY on success; rc=1 raises above,
+            # so if we got here result is clean. Still defensively check.)
+            diag = getattr(result, "diagnostics", None) or {}
+            err_ev = diag.get("error_event") if isinstance(diag, dict) else None
+            if isinstance(err_ev, dict):
+                status = err_ev.get("api_error_status")
+                msg = err_ev.get("result_text") or "(no message)"
+                self._write_health_alert(target, status, msg, exc_class=None)
+
+    def _write_health_alert(
+        self,
+        target: str,
+        api_error_status: Any,
+        message: str,
+        *,
+        exc_class: str | None,
+    ) -> None:
+        """Best-effort write to <store_root>/alerts.jsonl. Also prints to
+        stderr so an operator tailing the runtime log sees the banner.
+        Not deduped — each probe failure is one line; downstream tooling
+        can dedup on (target, api_error_status) if it cares.
+        """
+        import sys
+        import json as _json
+        banner = (
+            f"\n🚨 PROVIDER HEALTH  target={target}  status={api_error_status}  "
+            f"class={exc_class or 'is_error'}\n   {str(message)[:300]}\n"
+            f"   (probe fired by scheduler; operator action required)\n"
+        )
+        try:
+            print(banner, file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            alerts_path = self.store.root / "alerts.jsonl"
+            with open(alerts_path, "a", encoding="utf-8") as f:
+                f.write(_json.dumps({
+                    "ts": self._now_fn().isoformat(),
+                    "kind": "provider_health",
+                    "target": target,
+                    "api_error_status": api_error_status,
+                    "exception_class": exc_class,
+                    "message": str(message)[:500],
+                }) + "\n")
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
     def _delayed_sweep_unclaimed_orphans(self) -> None:
         """Catch ANNOTATING / QC tasks that no worker claimed during the
@@ -319,11 +434,10 @@ class LocalRuntimeScheduler:
                     last_exception_was_permanent = _is_provider_permanent_error(worker_exc)
                     # Mirror of the arbiter wrap site: LocalCLIExecutionError
                     # only stringifies to "local CLI provider failed"; the
-                    # actual cause (auth, model name, OOM, API 5xx, 402) is in
-                    # .diagnostics (returncode + last 4KB of stderr + parsed
-                    # error_event from stream-json is_error). Without this
-                    # tail, last_provider_error stored on tasks gives operators
-                    # no clue what to fix when annotation/qc bail.
+                    # actual cause (auth, model name, OOM, API 5xx) is in
+                    # .diagnostics (returncode + last 4KB of stderr). Without
+                    # this the `last_provider_error` task metadata gives
+                    # operators no clue what to fix.
                     diag = getattr(worker_exc, "diagnostics", None)
                     tail = ""
                     if isinstance(diag, dict):
@@ -331,10 +445,7 @@ class LocalRuntimeScheduler:
                         err = (diag.get("stderr") or "")
                         if isinstance(err, str):
                             err = err.strip().replace("\n", " | ")[-300:]
-                        err_ev = diag.get("error_event") or {}
-                        api_status = err_ev.get("api_error_status") if isinstance(err_ev, dict) else None
-                        api_msg = err_ev.get("result_text") if isinstance(err_ev, dict) else None
-                        tail = f" rc={rc} api_status={api_status} api_msg={str(api_msg)[:200]!r} stderr={err!r}"
+                        tail = f" rc={rc} stderr={err!r}"
                     last_exception_summary = (
                         f"{type(worker_exc).__name__}: {str(worker_exc)[:200]}{tail}"
                     )
@@ -515,6 +626,14 @@ class LocalRuntimeScheduler:
                 # a worker picking them up.
                 self._reap_stale_leases()
                 self._delayed_sweep_unclaimed_orphans()
+                # Provider health probe — cheap 1-token pings every
+                # PROBE_INTERVAL_SECONDS to surface auth/balance issues
+                # ahead of the queue. Internally rate-limited so calling
+                # at every observer tick is safe.
+                try:
+                    await self._probe_providers()
+                except Exception:  # noqa: BLE001 — never let probe failure tank observer
+                    pass
                 self._write_snapshot()
 
         worker_tasks = [
