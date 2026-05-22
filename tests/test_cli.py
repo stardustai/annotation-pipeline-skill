@@ -1529,7 +1529,7 @@ def test_cli_pipeline_delete_nonexistent_returns_1(tmp_path, capsys):
     assert payload == {"error": "pipeline_not_found", "pipeline_id": "does-not-exist"}
 
 
-def test_inspect_prints_task_summary(tmp_path):
+def test_inspect_prints_task_summary(tmp_path, capsys):
     """inspect prints status, attempts, and feedback for a task."""
     from annotation_pipeline_skill.interfaces.cli import main
     from annotation_pipeline_skill.store.sqlite_store import SqliteStore
@@ -1555,6 +1555,17 @@ def test_inspect_prints_task_summary(tmp_path):
 
     result = main(["inspect", "test-000001", "--project-root", str(tmp_path)])
     assert result == 0
+
+    # Also verify output content
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data["task_id"] == "test-000001"
+    assert data["status"] == "pending"
+    assert "current_attempt" in data
+    assert "recent_attempts" in data
+    assert "open_feedback" in data
+    assert "created_at" in data
+    assert "updated_at" in data
 
 
 def test_cli_import_does_not_inject_qc_policy_into_task_metadata(tmp_path):
