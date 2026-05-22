@@ -409,6 +409,18 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--project-root", type=Path, default=Path.cwd())
     inspect_parser.set_defaults(handler=handle_inspect)
 
+    approve_parser = subparsers.add_parser("approve", help="Accept a task")
+    approve_parser.add_argument("task_id")
+    approve_parser.add_argument("--reason", default="approved via CLI")
+    approve_parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    approve_parser.set_defaults(handler=handle_approve)
+
+    reject_parser = subparsers.add_parser("reject", help="Reject a task")
+    reject_parser.add_argument("task_id")
+    reject_parser.add_argument("--reason", default="rejected via CLI")
+    reject_parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    reject_parser.set_defaults(handler=handle_reject)
+
     _register_db_commands(subparsers)
 
     return parser
@@ -1457,6 +1469,64 @@ def handle_inspect(args: argparse.Namespace) -> int:
     }
     print(json.dumps(result, sort_keys=True, indent=2))
     store.close()
+    return 0
+
+
+def handle_approve(args: argparse.Namespace) -> int:
+    from annotation_pipeline_skill.core.transitions import InvalidTransition
+
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    try:
+        task = store.load_task(args.task_id)
+    except KeyError:
+        print(json.dumps({"error": "task_not_found", "task_id": args.task_id}))
+        store.close()
+        return 1
+    try:
+        event = transition_task(
+            task,
+            TaskStatus.ACCEPTED,
+            actor="cli",
+            reason=args.reason,
+            stage="approve",
+        )
+    except InvalidTransition as exc:
+        print(json.dumps({"error": str(exc), "task_id": args.task_id, "status": task.status.value}))
+        store.close()
+        return 2
+    store.save_task(task)
+    store.append_event(event)
+    store.close()
+    print(json.dumps({"task_id": task.task_id, "status": task.status.value, "event_id": event.event_id}))
+    return 0
+
+
+def handle_reject(args: argparse.Namespace) -> int:
+    from annotation_pipeline_skill.core.transitions import InvalidTransition
+
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    try:
+        task = store.load_task(args.task_id)
+    except KeyError:
+        print(json.dumps({"error": "task_not_found", "task_id": args.task_id}))
+        store.close()
+        return 1
+    try:
+        event = transition_task(
+            task,
+            TaskStatus.REJECTED,
+            actor="cli",
+            reason=args.reason,
+            stage="reject",
+        )
+    except InvalidTransition as exc:
+        print(json.dumps({"error": str(exc), "task_id": args.task_id, "status": task.status.value}))
+        store.close()
+        return 2
+    store.save_task(task)
+    store.append_event(event)
+    store.close()
+    print(json.dumps({"task_id": task.task_id, "status": task.status.value, "event_id": event.event_id}))
     return 0
 
 

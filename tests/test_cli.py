@@ -1568,6 +1568,88 @@ def test_inspect_prints_task_summary(tmp_path, capsys):
     assert "updated_at" in data
 
 
+def _make_task_at_status(tmp_path, task_id, status):
+    """Helper: create a task and advance it to the given status.
+
+    The state machine requires stepping through intermediate states:
+    PENDING -> ANNOTATING -> QC or HUMAN_REVIEW
+    """
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+    from annotation_pipeline_skill.core.transitions import transition_task
+
+    config_root = tmp_path / ".annotation-pipeline"
+    config_root.mkdir(exist_ok=True)
+    store = SqliteStore.open(config_root)
+    task = Task.new(
+        task_id=task_id,
+        pipeline_id="pipe",
+        source_ref={"kind": "jsonl", "payload": {"rows": []}},
+        modality="text",
+        annotation_requirements={"annotation_types": ["extraction"]},
+        metadata={},
+    )
+    e0 = transition_task(task, TaskStatus.PENDING, actor="test", reason="init", stage="prepare")
+    store.save_task(task)
+    store.append_event(e0)
+    if status == TaskStatus.PENDING:
+        store.close()
+        return
+    # Must go through ANNOTATING to reach QC or HUMAN_REVIEW
+    e_ann = transition_task(task, TaskStatus.ANNOTATING, actor="test", reason="start", stage="annotation")
+    store.save_task(task)
+    store.append_event(e_ann)
+    if status == TaskStatus.ANNOTATING:
+        store.close()
+        return
+    e1 = transition_task(task, status, actor="test", reason="setup", stage="test")
+    store.save_task(task)
+    store.append_event(e1)
+    store.close()
+
+
+def test_approve_transitions_task_to_accepted(tmp_path):
+    from annotation_pipeline_skill.interfaces.cli import main
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    _make_task_at_status(tmp_path, "t-001", TaskStatus.QC)
+    result = main(["approve", "t-001", "--project-root", str(tmp_path)])
+    assert result == 0
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    task = store.load_task("t-001")
+    store.close()
+    assert task.status == TaskStatus.ACCEPTED
+
+
+def test_reject_transitions_task_to_rejected(tmp_path):
+    from annotation_pipeline_skill.interfaces.cli import main
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    _make_task_at_status(tmp_path, "t-002", TaskStatus.HUMAN_REVIEW)
+    result = main(["reject", "t-002", "--project-root", str(tmp_path)])
+    assert result == 0
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    task = store.load_task("t-002")
+    store.close()
+    assert task.status == TaskStatus.REJECTED
+
+
+def test_approve_prints_event_id(tmp_path, capsys):
+    import json as _json
+    from annotation_pipeline_skill.interfaces.cli import main
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    _make_task_at_status(tmp_path, "t-003", TaskStatus.QC)
+    result = main(["approve", "t-003", "--project-root", str(tmp_path)])
+    assert result == 0
+    out = capsys.readouterr().out
+    data = _json.loads(out)
+    assert "event_id" in data
+
+
 def test_cli_import_does_not_inject_qc_policy_into_task_metadata(tmp_path):
     """After the QC-config lift, ``apl import jsonl-prelabeled`` must NOT write
     per-task ``metadata.qc_policy`` — the policy now lives at project level in
