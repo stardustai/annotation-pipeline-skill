@@ -808,6 +808,68 @@ api_key > OAuth fallback > 不注入（runtime 报正常 auth 错）。
 第三方 Anthropic-兼容 vendor（DeepSeek / GLM / MiniMax）的 profile 必须显
 式设 `api_key` 和 `base_url`，走第三方端点；不会触发 OAuth fallback。
 
+### 10.7 本地 qwen / gemma 模型的路径翻译链
+
+本地模型（`qwen3.6-35b-a3b`、`qwen3.6-27b`、`gemma-4` 等）通过 vLLM 服务，
+但 runtime 用的是同一个 `claude_cli` provider 来调用——即 worker 子进程是
+`claude --bare`，base_url 指向本地 gateway。请求要在两层之间翻译协议，每一
+跳的 path 都不同：
+
+```
+worker (claude --bare, profile.base_url=http://127.0.0.1:8900)
+    │
+    │  POST /v1/messages?beta=true           ← Anthropic Messages API
+    │  (claude CLI 总是发这个；beta=true 开 prompt caching 等扩展)
+    ▼
+gateway :8900  (Projects/llm-gateway/gateway.py)
+    │  透明反代——path / headers / body 不动，唯一目的是给 LiteLLM
+    │  套一层稳定的 base_url 并集中处理 /v1/ocr 等特殊端点
+    │
+    │  POST /v1/messages?beta=true
+    ▼
+litellm :8901  (Projects/llm-gateway/config.yaml)
+    │  Anthropic → OpenAI 协议翻译。litellm_params.model 是 openai/qwen3.6-35b-a3b
+    │  → openai provider 默认调 chat completions（不是 responses）
+    │
+    │  POST /v1/chat/completions
+    ▼
+model_manager :8002  (Projects/llm-gateway/model_manager.py)
+    │  sticky routing 层。从 request header / body 抽 task_id（`x-task-id`
+    │  或 OpenAI 标准 `user` 字段），把同一 task 的所有 turn 钉到同一个
+    │  vLLM slot，让 prefix cache 在多轮 annotation/QC 对话间复用
+    │
+    │  POST /v1/chat/completions    (透传给选中的 vLLM slot)
+    ▼
+vLLM :9000  (RedHatAI/Qwen3.6-35B-A3B-NVFP4 等)
+```
+
+#### 关键认知
+
+- **`/v1/responses` 不在这条链路上**。vLLM 本身支持，model_manager 也有专门
+  的 `_handle_responses_api` 处理，但 LiteLLM 的 `openai/` provider 默认翻译
+  到 `/v1/chat/completions`。要切到 Responses API 需要换 provider 类型（如
+  `openai_responses/...` 或自定义 hook）。
+- **sticky routing 走 task_id header，不走 `previous_response_id`**。后者要
+  Responses API 才有；前者是 model_manager 自定义的协议，由
+  `LLMGenerateRequest.task_id` 注入到 `ANTHROPIC_CUSTOM_HEADERS` 的
+  `x-task-id` header（commit `68c272d`）。同一 task 的 annotation → QC →
+  arbitration 多轮调用会命中同一 vLLM slot，KV cache 命中率从 0% 升到稳态
+  >50%。
+- **协议层的 `beta=true`** 是 claude CLI 自己加的。LiteLLM 接得住，会把对应
+  的 `anthropic-beta` header 转成 OpenAI 端没有概念的功能（如 prompt
+  caching）做 best-effort 适配。
+
+#### 何时这条链路出问题
+
+- gateway 起来但 litellm 没起：每个 POST 返 500，gateway log 里只看到
+  HEAD / 健康探活。
+- litellm 起来但 model_manager 没起：litellm 5xx；access log 里能看到
+  upstream connection refused。
+- model_manager 起但 vLLM slot 全冷：model_manager 选择 spawn 而非 503，
+  worker 看起来"卡住"几十秒（vLLM 启动 + 加载权重耗时）。
+- 本地 API key 错（`local-qwen36` mismatch）：vLLM 直接返 401，沿链路传回
+  worker，新 instrumentation 会捕获并写 `provider_alert` 到 alerts.jsonl。
+
 
 ## 11. 执行模型
 
