@@ -166,3 +166,15 @@ targets:
     profile = load_llm_registry(p).resolve("annotation")
     assert profile.resolve_api_key({"PRESENT_KEY": "val"}) == "val"
     assert profile.resolve_api_key({}) == ""
+
+
+def test_openai_sdk_profile_is_valid_runtime(tmp_path):
+    from annotation_pipeline_skill.llm.profiles import _parse_profile
+    profile = _parse_profile("qwen-test", {
+        "runtime": "openai_sdk",
+        "model": "qwen3.6-35b-a3b",
+        "base_url": "http://127.0.0.1:8900",
+        "api_key": "sk-local",
+    })
+    assert profile.runtime == "openai_sdk"
+    assert profile.model == "qwen3.6-35b-a3b"

@@ -194,7 +194,7 @@ def test_isolated_claude_home_creates_home_and_forces_HOME(tmp_path: Path):
         home_id=None,
         provider_api_key="sk-provider",
         provider_base_url="https://api.example.com/anthropic",
-    ) as (env, isolated_home, home_id):
+    ) as (env, isolated_home, home_id, _oauth_mode):
         assert isolated_home.is_dir()
         assert isolated_home.is_relative_to(runtime_root)
         assert env["HOME"] == str(isolated_home)
@@ -215,7 +215,7 @@ def test_isolated_claude_home_reuses_home_id(tmp_path: Path):
     with isolated_claude_home(
         {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
         home_id="stable-id",
-    ) as (_env, isolated_home, home_id):
+    ) as (_env, isolated_home, home_id, _oauth_mode):
         assert home_id == "stable-id"
         assert isolated_home == runtime_root / "stable-id"
         (isolated_home / "marker").write_text("hi", encoding="utf-8")
@@ -223,7 +223,7 @@ def test_isolated_claude_home_reuses_home_id(tmp_path: Path):
     with isolated_claude_home(
         {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
         home_id="stable-id",
-    ) as (_env, isolated_home, _home_id):
+    ) as (_env, isolated_home, _home_id, _oauth_mode):
         assert (isolated_home / "marker").read_text(encoding="utf-8") == "hi"
 
 
@@ -242,7 +242,7 @@ def test_isolated_claude_home_writes_task_id_into_userID(tmp_path: Path):
         {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
         home_id="task-home-1",
         user_id_override="v3_initial_deployment-000342",
-    ) as (_env, isolated_home, _home_id):
+    ) as (_env, isolated_home, _home_id, _oauth_mode):
         data = json.loads((isolated_home / ".claude.json").read_text(encoding="utf-8"))
         assert data["userID"] == "v3_initial_deployment-000342"
 
@@ -269,7 +269,7 @@ def test_isolated_claude_home_preserves_existing_claude_json_fields(tmp_path: Pa
         {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
         home_id="task-home-2",
         user_id_override="v3_initial_deployment-000999",
-    ) as (_env, isolated_home, _home_id):
+    ) as (_env, isolated_home, _home_id, _oauth_mode):
         data = json.loads((isolated_home / ".claude.json").read_text(encoding="utf-8"))
         assert data["userID"] == "v3_initial_deployment-000999"
         # Non-userID fields must survive the rewrite.
@@ -287,7 +287,7 @@ def test_isolated_claude_home_skip_user_id_when_none(tmp_path: Path):
         {"ANNOTATION_CLAUDE_HOME_ROOT": str(runtime_root)},
         home_id="task-home-3",
         user_id_override=None,
-    ) as (_env, isolated_home, _home_id):
+    ) as (_env, isolated_home, _home_id, _oauth_mode):
         # No file touched on entry; claude will write it on first run.
         assert not (isolated_home / ".claude.json").exists()
 
@@ -400,7 +400,7 @@ async def test_local_claude_client_propagates_continuity_handle(tmp_path: Path, 
         captured["provider_base_url"] = provider_base_url
         captured["user_id_override"] = user_id_override
         resolved = home_id or "fake-home-id"
-        yield {"PATH": env.get("PATH", "")}, tmp_path, resolved
+        yield {"PATH": env.get("PATH", "")}, tmp_path, resolved, False
 
     class FakeProcess:
         returncode = 0
@@ -520,3 +520,44 @@ async def test_generate_claude_does_not_touch_real_credentials(tmp_path: Path, m
     # And the real credentials file is untouched.
     assert creds.stat().st_mtime_ns == original_mtime_ns
     assert creds.read_text(encoding="utf-8") == '{"do":"not-touch"}'
+
+
+def test_local_cli_client_routes_openai_sdk(tmp_path, monkeypatch):
+    """LocalCLIClient with runtime=openai_sdk dispatches to OpenAISDKClient."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    import annotation_pipeline_skill.llm.openai_sdk as mod
+    from annotation_pipeline_skill.llm.client import LLMGenerateRequest
+    from annotation_pipeline_skill.llm.local_cli import LocalCLIClient
+    from annotation_pipeline_skill.llm.profiles import LLMProfile
+
+    fake_resp = MagicMock()
+    fake_resp.choices = [MagicMock(
+        finish_reason="stop",
+        message=MagicMock(content="routed ok", tool_calls=None),
+    )]
+    fake_resp.usage = MagicMock(prompt_tokens=1, completion_tokens=1, model_extra={})
+
+    # Patch before constructing LocalCLIClient so the AsyncOpenAI instance picks it up.
+    monkeypatch.setattr(mod, "AsyncOpenAI", lambda *a, **k: MagicMock(
+        chat=MagicMock(completions=MagicMock(create=AsyncMock(return_value=fake_resp))),
+    ))
+    monkeypatch.chdir(tmp_path)
+
+    profile = LLMProfile(
+        name="qwen-test",
+        runtime="openai_sdk",
+        model="qwen3.6-35b-a3b",
+        base_url="http://127.0.0.1:9999",
+        api_key="sk-test",
+        timeout_seconds=30,
+    )
+    client = LocalCLIClient(profile)
+    assert client._openai_impl is not None
+
+    r = asyncio.run(client.generate(LLMGenerateRequest(
+        instructions="s", prompt="p", task_id="t-1",
+    )))
+    assert r.final_text == "routed ok"
+    assert r.runtime == "openai_sdk"

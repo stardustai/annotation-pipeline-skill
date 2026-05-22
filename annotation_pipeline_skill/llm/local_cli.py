@@ -131,12 +131,16 @@ def build_claude_command(
     strict_mcp_config: bool = False,
     disallowed_tools: list[str] | None = None,
     persist_session: bool = True,
+    no_bare: bool = False,
 ) -> list[str]:
     # --bare: never read OAuth / keychain / ~/.claude credentials. Auth is
     # strictly ANTHROPIC_API_KEY (no token writeback can clobber real creds).
     # Also skips hooks, auto-memory, CLAUDE.md auto-discovery, background
     # prefetches — exactly the surface we don't want in a worker.
-    command = [binary, "--bare", "-p"]
+    # no_bare=True is used for OAuth profiles: the credentials file has been
+    # written to the isolated home, and the claude binary must read it natively
+    # to send the token as Authorization: Bearer (x-api-key rejects OAuth tokens).
+    command = [binary, "-p"] if no_bare else [binary, "--bare", "-p"]
     if session_id:
         command.extend(["--resume", session_id])
     elif not persist_session:
@@ -273,34 +277,26 @@ def isolated_claude_home(
     provider_api_key: str | None = None,
     provider_base_url: str | None = None,
     user_id_override: str | None = None,
-) -> Iterator[tuple[dict[str, str], Path, str]]:
-    """Per-task isolated HOME for `claude --bare`. Never copies real ~/.claude;
-    auth comes from ANTHROPIC_API_KEY in the env. Defense-in-depth on top of
-    --bare so any path that bypasses --bare (skill plugin dirs, settings
-    lookup, history files) still cannot reach the user's real .claude tree.
+) -> Iterator[tuple[dict[str, str], Path, str, bool]]:
+    """Per-task isolated HOME for claude workers.
 
-    OAuth fallback: when no ``provider_api_key`` is supplied AND the user has
-    a Claude Code Pro / Max subscription (``~/.claude/.credentials.json``
-    contains a ``claudeAiOauth.accessToken``), reuse that OAuth access token
-    as ``ANTHROPIC_API_KEY``. This mirrors what bare-shell ``claude`` does
-    when launched directly: the binary looks up the OAuth credentials and
-    sends them as the bearer token. With ``--bare`` the binary itself won't
-    read the credentials file (verified via strace — it opens it but still
-    reports ``Not logged in``), so we inject the token into env explicitly.
-    Lets users run Anthropic claude_sonnet / claude_haiku targets without
-    needing a separate sk-ant-... API key.
+    When ``provider_api_key`` is a real API key (``sk-ant-api03-...``) it is
+    injected as ``ANTHROPIC_API_KEY`` and the worker runs with ``--bare``
+    (the fourth yielded value, ``oauth_mode``, is False).
+
+    OAuth fallback: when no ``provider_api_key`` is supplied AND
+    ``~/.claude/.credentials.json`` contains a ``claudeAiOauth.accessToken``
+    (Claude Code Pro / Max subscription), the credentials file is copied into
+    the isolated home and ``oauth_mode=True`` is yielded.  The caller then
+    builds the claude command *without* ``--bare`` so that the claude binary
+    reads the credentials natively and sends the OAuth token as
+    ``Authorization: Bearer`` (not ``x-api-key``, which Anthropic rejects for
+    OAuth tokens).
 
     ``user_id_override`` (typically the pipeline ``task_id``) is written into
     ``<HOME>/.claude.json``'s ``userID`` field BEFORE the claude subprocess
-    starts. The claude binary reads that field and packs it into
-    ``body.metadata.user_id`` as the ``device_id`` component (verified by
-    capturing live POST /v1/messages traffic). That body.user/device_id is
-    what gateways like LiteLLM use for sticky routing — without the override
-    every isolated home's userID is a stable hash that doesn't change per
-    task, so cross-task requests hash to a small number of buckets and
-    prefix-cache locality collapses. Passing task_id here makes the
-    device_id per-task, so a sticky-on-body.user routing config naturally
-    pins all turns of one task to one upstream instance.
+    starts so that LiteLLM sticky-routing pins all turns of one task to one
+    upstream vLLM instance.
     """
     runtime_root = Path(env.get("ANNOTATION_CLAUDE_HOME_ROOT") or Path.cwd() / ".annotation-pipeline-claude-homes")
     runtime_root.mkdir(parents=True, exist_ok=True)
@@ -319,20 +315,21 @@ def isolated_claude_home(
     isolated_env = codex_shell_environment(env)
     isolated_env["HOME"] = str(isolated_home)
 
-    # OAuth fallback BEFORE applying explicit provider_api_key so a real
-    # provider key always wins.
-    resolved_api_key = provider_api_key
-    if not resolved_api_key:
-        oauth_token = _read_claude_oauth_token(env)
-        if oauth_token:
-            resolved_api_key = oauth_token
+    oauth_mode = False
+    if provider_api_key:
+        isolated_env["ANTHROPIC_API_KEY"] = provider_api_key
+    else:
+        # No explicit API key — try copying OAuth credentials from the real home
+        # so the claude binary can authenticate natively (Bearer, not x-api-key).
+        real_creds = _read_claude_credentials_raw(env)
+        if real_creds:
+            _write_claude_credentials(isolated_home, real_creds)
+            oauth_mode = True
 
-    if resolved_api_key:
-        isolated_env["ANTHROPIC_API_KEY"] = resolved_api_key
     if provider_base_url:
         isolated_env["ANTHROPIC_BASE_URL"] = provider_base_url
 
-    yield isolated_env, isolated_home, home_id
+    yield isolated_env, isolated_home, home_id, oauth_mode
 
 
 def _write_claude_user_id(home: Path, user_id: str) -> None:
@@ -368,16 +365,9 @@ def _write_claude_user_id(home: Path, user_id: str) -> None:
         pass
 
 
-def _read_claude_oauth_token(env: Mapping[str, str]) -> str | None:
-    """Return the Claude Code Pro / Max OAuth access token from the user's
-    ``~/.claude/.credentials.json`` if present, else None.
-
-    Resolves the user HOME from the input ``env`` mapping (not ``os.environ``)
-    so tests and callers passing a synthetic HOME hit a predictable path.
-    Returns None on any read/parse error — caller falls back to the no-key
-    code path and the subsequent claude call will surface its own auth
-    failure with the proper error.
-    """
+def _read_claude_credentials_raw(env: Mapping[str, str]) -> dict | None:
+    """Return the parsed contents of ``~/.claude/.credentials.json`` (from the
+    real user HOME in ``env``), or None on any read/parse error."""
     home_str = env.get("HOME")
     if not home_str:
         return None
@@ -390,11 +380,23 @@ def _read_claude_oauth_token(env: Mapping[str, str]) -> str | None:
         return None
     if not isinstance(data, dict):
         return None
+    # Only return if there's an actual OAuth access token present.
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict):
         return None
-    token = oauth.get("accessToken")
-    return token if isinstance(token, str) and token else None
+    if not (isinstance(oauth.get("accessToken"), str) and oauth["accessToken"]):
+        return None
+    return data
+
+
+def _write_claude_credentials(home: Path, credentials: dict) -> None:
+    """Write ``credentials`` to ``<home>/.claude/.credentials.json`` so that
+    a claude worker whose HOME is ``home`` can read its OAuth token natively."""
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / ".credentials.json").write_text(
+        json.dumps(credentials), encoding="utf-8"
+    )
 
 
 def parse_codex_json_events(
@@ -543,6 +545,7 @@ class LocalCLIClient:
         self._store = store
         self._project_id = project_id
         self._anthropic_impl: object | None = None
+        self._openai_impl: object | None = None
         if profile.runtime == "anthropic_sdk":
             # Lazy import keeps the anthropic package optional for
             # workers that only run claude_cli / codex_cli profiles.
@@ -552,11 +555,19 @@ class LocalCLIClient:
             self._anthropic_impl = AnthropicSDKClient(
                 profile, store=store, project_id=project_id,
             )
+        elif profile.runtime == "openai_sdk":
+            from annotation_pipeline_skill.llm.openai_sdk import OpenAISDKClient
+            self._openai_impl = OpenAISDKClient(
+                profile, store=store, project_id=project_id,
+            )
 
     async def generate(self, request: LLMGenerateRequest) -> LLMGenerateResult:
         if self.profile.runtime == "anthropic_sdk":
             assert self._anthropic_impl is not None  # set in __init__
             return await self._anthropic_impl.generate(request)
+        if self.profile.runtime == "openai_sdk":
+            assert self._openai_impl is not None  # set in __init__
+            return await self._openai_impl.generate(request)
         if self.profile.runtime == "codex_cli":
             return await self._generate_codex(request)
         if self.profile.runtime == "claude_cli":
@@ -643,16 +654,6 @@ class LocalCLIClient:
         # would otherwise miss and silently start a fresh session, breaking
         # the entire multi-turn continuity chain.
         persist_session = not self.profile.disable_continuity
-        command = build_claude_command(
-            binary="claude",
-            model=self.profile.model,
-            permission_mode=self.profile.permission_mode,
-            session_id=session_id,
-            mcp_config_path=None,  # set inside the isolated_claude_home block below
-            strict_mcp_config=bool(self.profile.strict_mcp_config),
-            disallowed_tools=self.profile.disallowed_tools,
-            persist_session=persist_session,
-        )
         prompt = request.prompt or _messages_to_prompt(request.input_items)
         if request.instructions:
             prompt = f"{request.instructions}\n\n{prompt}"
@@ -662,7 +663,7 @@ class LocalCLIClient:
             provider_api_key=api_key,
             provider_base_url=self.profile.base_url,
             user_id_override=request.task_id,
-        ) as (env, _home, resolved_home_id):
+        ) as (env, _home, resolved_home_id, oauth_mode):
             # Sticky-routing hint: forward task_id to the gateway so a
             # LiteLLM router can pin every turn/retry of one task to the
             # same vLLM instance and let prefix-cache hits accumulate.
@@ -674,13 +675,17 @@ class LocalCLIClient:
                 env["ANTHROPIC_CUSTOM_HEADERS"] = (
                     f"{existing}\n{header_line}" if existing else header_line
                 )
-            # Materialize the per-invocation mcp-config.json inside the
-            # isolated home. The home is persistent across invocations
-            # (needed for session resume); this file is simply overwritten
-            # each call. No try/finally needed — the file has no secrets
-            # and the overwrite is idempotent.
+            # Build the command here where oauth_mode is known. When
+            # oauth_mode=True the credentials file has been written to the
+            # isolated home; skip --bare so claude reads it natively and
+            # sends the token as Authorization: Bearer (not x-api-key).
             mcp_servers = self.profile.mcp_servers or []
+            mcp_config_path: Path | None = None
             if mcp_servers:
+                # Materialize the per-invocation mcp-config.json inside the
+                # isolated home. The home is persistent across invocations
+                # (needed for session resume); this file is simply overwritten
+                # each call.
                 mcp_payload = {
                     "mcpServers": {
                         s["name"]: {"command": s["command"], "args": s["args"]}
@@ -689,17 +694,17 @@ class LocalCLIClient:
                 }
                 mcp_config_path = _home / "mcp-config.json"
                 mcp_config_path.write_text(json.dumps(mcp_payload), encoding="utf-8")
-                # Rebuild the command now that we have a real path.
-                command = build_claude_command(
-                    binary="claude",
-                    model=self.profile.model,
-                    permission_mode=self.profile.permission_mode,
-                    session_id=session_id,
-                    mcp_config_path=mcp_config_path,
-                    strict_mcp_config=bool(self.profile.strict_mcp_config),
-                    persist_session=persist_session,
-                    disallowed_tools=self.profile.disallowed_tools,
-                )
+            command = build_claude_command(
+                binary="claude",
+                model=self.profile.model,
+                permission_mode=self.profile.permission_mode,
+                session_id=session_id,
+                mcp_config_path=mcp_config_path,
+                strict_mcp_config=bool(self.profile.strict_mcp_config),
+                persist_session=persist_session,
+                disallowed_tools=self.profile.disallowed_tools,
+                no_bare=oauth_mode,
+            )
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(request.cwd) if request.cwd else None,
