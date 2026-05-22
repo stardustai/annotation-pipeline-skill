@@ -1752,11 +1752,21 @@ def _build_runtime_scheduler(
     # swaps `self._registry` the next worker call picks up the new binding.
     # `client_factory` is still supplied as a no-op default so the legacy
     # call signature stays valid (it's never invoked in this mode).
+    #
+    # store / project_id are threaded into the builder so anthropic_sdk
+    # profiles can dispatch in-process MCP tools (validator + KB). The
+    # claude_cli / codex_cli paths ignore both kwargs — their MCP tools
+    # spawn stdio subprocesses with their own --project-root args.
+    project_id = context.project_root.name
+
+    def _build_client(profile):
+        return LocalCLIClient(profile, store=context.store, project_id=project_id)
+
     return LocalRuntimeScheduler(
         store=context.store,
-        client_factory=lambda target: LocalCLIClient(context.registry.resolve(target)),
+        client_factory=lambda target: _build_client(context.registry.resolve(target)),
         registry=context.registry,
-        client_builder=LocalCLIClient,
+        client_builder=_build_client,
         config=runtime_config,
         profiles_yaml_path=profiles_yaml_path,
     )
