@@ -52,6 +52,15 @@ class LocalRuntimeScheduler:
         "annotation", "qc", "arbiter", "arbiter_secondary", "fallback",
     )
 
+    # Cap on simultaneously-running ARBITRATING tasks as a fraction of
+    # max_concurrent_tasks. Today's incident: ~100 tasks queued in
+    # ARBITRATING after a bulk rewind, each arbiter call ran 200-800s on
+    # deepseek_flash, all 16 worker slots saturated on arbiter calls,
+    # annotator + qc completely starved. Capping arbiter slots to half
+    # the pool guarantees forward progress on fresh annotation work.
+    # 0.0 disables the cap entirely (any worker can pick up any role).
+    ARBITER_SLOT_FRACTION: float = 0.5
+
     def __init__(
         self,
         store: SqliteStore,
@@ -693,11 +702,34 @@ class LocalRuntimeScheduler:
         # already does for the same reason.
         leased = {l.task_id for l in self.store.list_runtime_leases()}
         active = {r.task_id for r in self.store.list_active_runs()}
+        # Role quota: count how many ARBITRATING tasks are currently
+        # leased so we can skip new arbitrating candidates once the cap
+        # is hit. Falls through to PENDING/QC candidates, keeping
+        # annotation work flowing even when the arbiter queue is deep.
+        arbiter_cap = (
+            int(self.config.max_concurrent_tasks * self.ARBITER_SLOT_FRACTION)
+            if self.ARBITER_SLOT_FRACTION > 0
+            else self.config.max_concurrent_tasks
+        )
+        in_flight_ids = leased | active
+        arbiter_in_flight = 0
+        if in_flight_ids and arbiter_cap < self.config.max_concurrent_tasks:
+            arbiter_in_flight = sum(
+                1 for t in candidates
+                if t.task_id in in_flight_ids and t.status is TaskStatus.ARBITRATING
+            )
         now_ts = self._now_fn()
         for candidate in candidates:
             if candidate.task_id in leased or candidate.task_id in active:
                 continue
             if candidate.status is TaskStatus.QC and candidate.metadata.get("runtime_next_stage") != "qc":
+                continue
+            # Enforce arbiter slot cap — skip ARBITRATING candidates when
+            # at quota; loop continues to PENDING/QC.
+            if (
+                candidate.status is TaskStatus.ARBITRATING
+                and arbiter_in_flight >= arbiter_cap
+            ):
                 continue
             # Respect bail-backoff: tasks the worker bailed on get a
             # next_retry_at stamped on them so they don't immediately get
