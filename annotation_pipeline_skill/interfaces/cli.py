@@ -404,6 +404,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--reload", action="store_true", help="Auto-restart on .py file changes")
     serve_parser.set_defaults(handler=handle_serve)
 
+    inspect_parser = subparsers.add_parser("inspect", help="Print task state, attempts, and feedback")
+    inspect_parser.add_argument("task_id")
+    inspect_parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    inspect_parser.set_defaults(handler=handle_inspect)
+
     _register_db_commands(subparsers)
 
     return parser
@@ -1403,6 +1408,55 @@ def handle_task_unblock(args: argparse.Namespace) -> int:
     store.save_task(task)
     store.append_event(event)
     print(json.dumps({"task": task.to_dict(), "event": event.to_dict()}, sort_keys=True, indent=2))
+    return 0
+
+
+def handle_inspect(args: argparse.Namespace) -> int:
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    try:
+        task = store.load_task(args.task_id)
+    except KeyError:
+        print(json.dumps({"error": "task_not_found", "task_id": args.task_id}))
+        store.close()
+        return 1
+
+    attempts = store.list_attempts(args.task_id)
+    feedbacks = store.list_feedback(args.task_id)
+    open_feedbacks = [f for f in feedbacks if f.metadata.get("status") != "closed"]
+
+    result = {
+        "task_id": task.task_id,
+        "pipeline_id": task.pipeline_id,
+        "status": task.status.value,
+        "current_attempt": task.current_attempt,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "next_retry_at": task.next_retry_at.isoformat() if task.next_retry_at else None,
+        "recent_attempts": [
+            {
+                "index": a.index,
+                "stage": a.stage,
+                "status": a.status.value,
+                "provider_id": a.provider_id,
+                "model": a.model,
+                "error": a.error,
+                "summary": (a.summary or "")[:200],
+            }
+            for a in attempts[-3:]
+        ],
+        "open_feedback": [
+            {
+                "feedback_id": f.feedback_id,
+                "severity": f.severity.value,
+                "category": f.category,
+                "message": f.message,
+                "source_stage": f.source_stage.value,
+            }
+            for f in open_feedbacks
+        ],
+    }
+    print(json.dumps(result, sort_keys=True, indent=2))
+    store.close()
     return 0
 
 
