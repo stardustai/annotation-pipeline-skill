@@ -26,6 +26,7 @@ const DistributionPanel = lazy(() =>
 import { PosteriorAuditPanel } from "./components/PosteriorAuditPanel";
 import { ProvidersPanel } from "./components/ProvidersPanel";
 import { AlertsPanel } from "./components/AlertsPanel";
+import { AlertsMarquee } from "./components/AlertsMarquee";
 import { RuntimePanel } from "./components/RuntimePanel";
 import { TaskDrawer } from "./components/TaskDrawer";
 import { countCards } from "./kanban";
@@ -281,6 +282,7 @@ export default function App() {
         </div>
       </header>
 
+      <AlertsMarquee storeKey={selectedStoreKey} onClick={() => setView("alerts")} />
       <DashboardStatsBar projectId={selectedProjectId} storeKey={selectedStoreKey} />
 
       <nav className="view-tabs" aria-label="Dashboard views" role="tablist">

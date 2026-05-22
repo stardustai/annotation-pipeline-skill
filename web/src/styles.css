@@ -3124,3 +3124,75 @@ button {
     width: 100vw !important;
   }
 }
+
+/* ============================
+   Alerts marquee (top bar)
+   ============================ */
+
+.alerts-marquee {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: linear-gradient(90deg, #fff7f7 0%, #fff0f0 100%);
+  border-top: 1px solid #f0c2c2;
+  border-bottom: 1px solid #f0c2c2;
+  padding: 6px 16px;
+  font-size: 13px;
+  color: #8b1f1f;
+  cursor: pointer;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.alerts-marquee:hover {
+  background: linear-gradient(90deg, #ffeded 0%, #ffe0e0 100%);
+}
+.alerts-marquee-badge {
+  flex: 0 0 auto;
+  background: #c62828;
+  color: white;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  letter-spacing: 0.2px;
+}
+.alerts-marquee-viewport {
+  flex: 1 1 auto;
+  overflow: hidden;
+  position: relative;
+}
+.alerts-marquee-track {
+  display: inline-flex;
+  animation: alerts-marquee-scroll 60s linear infinite;
+  will-change: transform;
+}
+.alerts-marquee:hover .alerts-marquee-track {
+  animation-play-state: paused;
+}
+.alerts-marquee-item {
+  flex: 0 0 auto;
+  padding: 0 6px;
+}
+.alerts-marquee-item strong {
+  color: #6b1414;
+  font-weight: 600;
+}
+.alerts-marquee-sep {
+  color: #c79b9b;
+  font-weight: 400;
+}
+@keyframes alerts-marquee-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+
+/* Reduced motion: don't scroll; just show the chips statically with horizontal scroll if needed. */
+@media (prefers-reduced-motion: reduce) {
+  .alerts-marquee-track {
+    animation: none;
+  }
+  .alerts-marquee-viewport {
+    overflow-x: auto;
+  }
+}
