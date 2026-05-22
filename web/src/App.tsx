@@ -25,6 +25,7 @@ const DistributionPanel = lazy(() =>
 );
 import { PosteriorAuditPanel } from "./components/PosteriorAuditPanel";
 import { ProvidersPanel } from "./components/ProvidersPanel";
+import { AlertsPanel } from "./components/AlertsPanel";
 import { RuntimePanel } from "./components/RuntimePanel";
 import { TaskDrawer } from "./components/TaskDrawer";
 import { countCards } from "./kanban";
@@ -40,6 +41,7 @@ type ViewMode =
   | "annotation-rules"
   | "runtime"
   | "providers"
+  | "alerts"
   | "config"
   | "events"
   | "entity-knowledge"
@@ -333,6 +335,16 @@ export default function App() {
           Providers
         </button>
         <button
+          className={viewMode === "alerts" ? "view-tab selected" : "view-tab"}
+          role="tab"
+          aria-selected={viewMode === "alerts"}
+          type="button"
+          onClick={() => setView("alerts")}
+          title="Provider health alerts (auth/balance/rate-limit, etc.)"
+        >
+          Alerts
+        </button>
+        <button
           className={viewMode === "config" ? "view-tab selected" : "view-tab"}
           role="tab"
           aria-selected={viewMode === "config"}
@@ -394,6 +406,7 @@ export default function App() {
       {viewMode === "runtime" ? <RuntimePanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "output" ? <OutputPanel projectId={selectedProjectId} storeKey={selectedStoreKey} storePath={stores.find((s) => s.key === selectedStoreKey)?.path ?? null} /> : null}
       {viewMode === "providers" ? <ProvidersPanel /> : null}
+      {viewMode === "alerts" ? <AlertsPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "config" ? <ConfigPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "events" ? <EventLogPanel projectId={selectedProjectId} storeKey={selectedStoreKey} /> : null}
       {viewMode === "annotation-rules" ? (

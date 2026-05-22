@@ -863,6 +863,40 @@ class DashboardApi:
                 "limit": limit,
                 "offset": offset,
             })
+        if route == "/api/alerts":
+            # Read tail of <store_root>/alerts.jsonl. Lines are JSON
+            # objects written by SubagentRuntime._emit_provider_alert,
+            # _emit_enum_coerce_alert, and LocalRuntimeScheduler.
+            # _write_health_alert. Cheap O(N) read since the file caps
+            # at a few hundred KB in practice (alerts are deduped /
+            # rare); if it grows unbounded a future patch can rotate.
+            try:
+                limit = max(1, min(500, int(query.get("limit", ["100"])[0])))
+            except ValueError:
+                limit = 100
+            alerts_path = store.root / "alerts.jsonl"
+            entries: list[dict] = []
+            if alerts_path.exists():
+                try:
+                    raw_lines = alerts_path.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    raw_lines = []
+                # Take the last `limit` lines, parse each.
+                for line in raw_lines[-limit:]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+            # Reverse-chronological for the UI.
+            entries.reverse()
+            return self._json_response(200, {
+                "alerts": entries,
+                "total_lines": len(entries),
+                "alerts_path": str(alerts_path.relative_to(store.root)),
+            })
         if route == "/api/readiness":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})

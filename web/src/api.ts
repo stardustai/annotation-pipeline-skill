@@ -292,6 +292,36 @@ export async function fetchEventLog(
   return response.json() as Promise<EventLog>;
 }
 
+export interface AlertEntry {
+  ts: string;
+  kind?: string;
+  target?: string;
+  api_error_status?: number | null;
+  exception_class?: string | null;
+  message?: string;
+  task_id?: string;
+  dropped?: Record<string, number>;
+  [key: string]: unknown;
+}
+
+export interface AlertsResponse {
+  alerts: AlertEntry[];
+  total_lines: number;
+  alerts_path: string;
+}
+
+export async function fetchAlerts(
+  storeKey: string | null = null,
+  options: { limit?: number } = {},
+): Promise<AlertsResponse> {
+  const limit = options.limit ?? 100;
+  const response = await fetch(withStore(`/api/alerts?limit=${limit}`, storeKey));
+  if (!response.ok) {
+    throw new Error(`Alerts API returned ${response.status}`);
+  }
+  return response.json() as Promise<AlertsResponse>;
+}
+
 export async function fetchRuntimeSnapshot(storeKey: string | null = null): Promise<RuntimeSnapshot> {
   const response = await fetch(withStore("/api/runtime", storeKey));
   if (!response.ok) {
