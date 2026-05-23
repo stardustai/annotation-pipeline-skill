@@ -38,7 +38,6 @@ import re as _re
 import sys
 from pathlib import Path
 from uuid import uuid4
-from datetime import datetime, timezone
 
 # ── project root on path ─────────────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
@@ -259,22 +258,36 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  {i + 1:,}/{len(affected_tasks):,} done…")
     print(f"  {len(affected_tasks):,} artifacts written.")
 
-    # ── 4. Purge entity_statistics for all target spans ────────────────────────
-    # These are all not_an_entity now — there is no entity type to count.
-    # Using affected_spans (those that actually had task hits) to avoid
-    # deleting rows for spans that never appeared in any task (they'd have
-    # no effect anyway, but let's be precise).
-    print(f"\n── Step 4: purging entity_statistics for {len(affected_spans):,} affected spans ──")
-    now_iso = datetime.now(timezone.utc).isoformat()
-    deleted = 0
-    with store._conn:
-        for span_lower in affected_spans:
-            cur = store._conn.execute(
-                "DELETE FROM entity_statistics WHERE project_id = ? AND span_lower = ?",
-                (project_id, span_lower),
-            )
-            deleted += cur.rowcount
-    print(f"  Deleted {deleted:,} entity_statistics rows.")
+    # ── 4. Purge entity_statistics for ALL target spans ───────────────────────
+    # Delete ALL target spans (not just those with task hits): entity_statistics
+    # can accumulate rows from tasks no longer ACCEPTED, historical runs, etc.
+    # Use iterative passes until nothing above the threshold remains, since
+    # wordfreq scoring is deterministic but the boundary can shift slightly as
+    # jieba tokenization depends on span content context.
+    print(f"\n── Step 4: purging entity_statistics for all target spans ──")
+    total_deleted = 0
+    iteration = 0
+    while True:
+        iteration += 1
+        stat_rows_now = store._conn.execute(
+            "SELECT DISTINCT span_lower FROM entity_statistics WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        stale = [r["span_lower"] for r in stat_rows_now if _wordfreq_score(r["span_lower"]) >= threshold]
+        if not stale:
+            print(f"  Iteration {iteration}: clean.")
+            break
+        deleted = 0
+        with store._conn:
+            for span_lower in stale:
+                cur = store._conn.execute(
+                    "DELETE FROM entity_statistics WHERE project_id = ? AND span_lower = ?",
+                    (project_id, span_lower),
+                )
+                deleted += cur.rowcount
+        total_deleted += deleted
+        print(f"  Iteration {iteration}: purged {len(stale):,} spans / {deleted:,} rows")
+    print(f"  Total deleted: {total_deleted:,} entity_statistics rows.")
 
     # ── 5. Clear posterior_audit_cache ────────────────────────────────────────
     print("\n── Step 5: clearing posterior_audit_cache ──")
