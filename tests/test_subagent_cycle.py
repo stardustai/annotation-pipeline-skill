@@ -362,11 +362,11 @@ def test_annotator_output_without_schema_is_passed_through(tmp_path):
     assert task_after.status is TaskStatus.ACCEPTED
 
 
-def test_qc_rejection_escalates_to_human_review_after_n_rounds(tmp_path):
+def test_qc_rejection_escalates_after_n_rounds_uncertain_sets_flag(tmp_path):
     """After max_qc_rounds, arbiter is invoked. When arbiter returns a
-    tentative/unsure verdict (genuine uncertainty), the task transitions to
-    HUMAN_REVIEW. Mechanical arbiter failures route back to PENDING; only
-    genuine uncertainty (unresolved>0) escalates."""
+    tentative/unsure verdict (genuine uncertainty), the task stays in ARBITRATING
+    with arbiter_uncertain_needs_second=True for the second arbiter to resolve.
+    Mechanical arbiter failures route back to PENDING."""
     from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
     from annotation_pipeline_skill.store.sqlite_store import SqliteStore
     from annotation_pipeline_skill.core.models import Task
@@ -425,7 +425,10 @@ def test_qc_rejection_escalates_to_human_review_after_n_rounds(tmp_path):
         runtime.run_once()
 
     task_after = store.load_task("t-loop")
-    assert task_after.status is TaskStatus.HUMAN_REVIEW, f"got {task_after.status}"
+    assert task_after.status is TaskStatus.ARBITRATING, (
+        f"expected ARBITRATING+flag after uncertain arbiter; got {task_after.status}"
+    )
+    assert task_after.metadata.get("arbiter_uncertain_needs_second") is True
 
     qc_feedbacks = [f for f in store.list_feedback("t-loop") if f.source_stage is FeedbackSource.QC]
     assert len(qc_feedbacks) == 3
@@ -479,7 +482,7 @@ def test_subagent_runtime_defaults_max_qc_rounds_to_3(tmp_path):
 def test_validation_failures_count_toward_escalation_threshold(tmp_path):
     """Validation failures (schema invalid) count toward max_qc_rounds. After
     that threshold, arbiter runs; if it returns a tentative verdict, the task
-    goes to HUMAN_REVIEW."""
+    gets the second-arbiter flag (ARBITRATING) rather than going straight to HR."""
     from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
     from annotation_pipeline_skill.store.sqlite_store import SqliteStore
     from annotation_pipeline_skill.core.models import Task
@@ -531,17 +534,20 @@ def test_validation_failures_count_toward_escalation_threshold(tmp_path):
             )
 
     runtime = SubagentRuntime(store=store, client_factory=lambda _t: _StubClient(), max_qc_rounds=3)
-    # 3 rounds, each ends in validation failure -> 3rd triggers arbiter -> HR
+    # 3 rounds, each ends in validation failure -> 3rd triggers arbiter -> flag
     for _ in range(3):
         runtime.run_once()
 
     task_after = store.load_task("t-stuck")
-    assert task_after.status is TaskStatus.HUMAN_REVIEW
+    assert task_after.status is TaskStatus.ARBITRATING, (
+        f"expected ARBITRATING+flag after uncertain arbiter; got {task_after.status}"
+    )
+    assert task_after.metadata.get("arbiter_uncertain_needs_second") is True
 
 
 def test_mixed_qc_and_validation_failures_escalate_together(tmp_path):
     """QC + validation failures both count toward max_qc_rounds. After the
-    threshold, arbiter is invoked; tentative verdicts escalate to HR."""
+    threshold, arbiter is invoked; tentative verdicts set the second-arbiter flag."""
     from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
     from annotation_pipeline_skill.store.sqlite_store import SqliteStore
     from annotation_pipeline_skill.core.models import Task
@@ -604,16 +610,15 @@ def test_mixed_qc_and_validation_failures_escalate_together(tmp_path):
     # Run enough cycles to exhaust the 3-round budget
     for _ in range(5):
         runtime.run_once()
-        if store.load_task("t-mixed").status is TaskStatus.HUMAN_REVIEW:
+        t = store.load_task("t-mixed")
+        if t.status is TaskStatus.ARBITRATING and t.metadata.get("arbiter_uncertain_needs_second"):
             break
 
     task_after = store.load_task("t-mixed")
-    assert task_after.status is TaskStatus.HUMAN_REVIEW
-    # The metadata on the final transition event should record round_count
-    events = store.list_events("t-mixed")
-    hr_events = [e for e in events if e.next_status is TaskStatus.HUMAN_REVIEW]
-    assert hr_events, "expected an HR transition event"
-    assert hr_events[-1].metadata.get("round_count", 0) >= 3
+    assert task_after.status is TaskStatus.ARBITRATING, (
+        f"expected ARBITRATING+flag after uncertain arbiter; got {task_after.status}"
+    )
+    assert task_after.metadata.get("arbiter_uncertain_needs_second") is True
 
 
 def _seed_prelabeled_task(store, *, task_id, annotation_text, output_schema=None):
@@ -1196,10 +1201,8 @@ def test_qc_unsure_label_closes_feedback_by_consensus(tmp_path):
 def test_arbiter_rules_in_annotator_favor_avoids_hr(tmp_path):
     """When the retry loop is about to escalate to HUMAN_REVIEW, the arbiter
     is consulted. If it rules in the annotator's favor with confidence >= 0.7,
-    the disputed feedback is closed by consensus and the task can recover
-    instead of going to human review."""
-    from annotation_pipeline_skill.core.models import FeedbackRecord
-    from annotation_pipeline_skill.core.states import FeedbackSeverity
+    the disputed feedback is closed and the task is accepted without HR."""
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
 
     store = SqliteStore.open(tmp_path)
     task = Task.new(
@@ -1210,71 +1213,46 @@ def test_arbiter_rules_in_annotator_favor_avoids_hr(tmp_path):
     task.status = TaskStatus.PENDING
     store.save_task(task)
 
-    # Three prior QC complaints with annotator rebuttals; max_qc_rounds=3 → HR
-    # is about to fire when the next QC pass finishes.
-    feedback_ids = []
-    for index in range(3):
-        fb = FeedbackRecord.new(
-            task_id="t-arb",
-            attempt_id=f"t-arb-attempt-{index}",
-            source_stage=FeedbackSource.QC,
-            severity=FeedbackSeverity.WARNING,
-            category="missing_phrase",
-            message=f"Stretched complaint #{index}",
-            target={},
-            suggested_action="annotator_rerun",
-            created_by="qc-agent",
-            metadata={"confidence": 0.9},
-        )
-        store.append_feedback(fb)
-        feedback_ids.append(fb.feedback_id)
+    def _build_arbiter_response():
+        # P2: arbiter only sees the latest round's feedback; reference it dynamically.
+        feedbacks = store.list_feedback("t-arb")
+        if not feedbacks:
+            return '{"verdicts": [], "corrected_annotation": null}'
+        return json.dumps({
+            "verdicts": [
+                {"feedback_id": feedbacks[-1].feedback_id, "verdict": "annotator",
+                 "confidence": 0.85, "reasoning": "stretched, not verbatim"}
+            ]
+        })
 
-    arbiter_response = json.dumps({
-        "verdicts": [
-            {"feedback_id": fid, "verdict": "annotator", "confidence": 0.85, "reasoning": "stretched, not verbatim"}
-            for fid in feedback_ids
-        ]
-    })
+    class _StubClient:
+        async def generate(self, request):
+            if "senior arbiter" in request.instructions.lower():
+                final = _build_arbiter_response()
+            elif "quality" in request.instructions.lower():
+                final = '{"passed": false, "failures": [{"category": "missing_phrase", "confidence": 0.92, "message": "still missing"}]}'
+            else:
+                final = '{"entities": []}'
+            return LLMGenerateResult(
+                final_text=final, raw_response={}, usage={}, diagnostics={},
+                runtime="stub", provider="stub", model="stub", continuity_handle=None,
+            )
 
-    # Annotator produces a result with a rebuttal for each of the three opens.
-    annotation_payload = {
-        "entities": [],
-        "discussion_replies": [
-            {"feedback_id": fid, "confidence": 0.7, "message": "QC is wrong; span not in text."}
-            for fid in feedback_ids
-        ],
-    }
-    # Have QC fail one more time so the round_count crosses the threshold
-    # and the arbiter path is reached.
-    qc_response = '{"passed": false, "failures": [{"category": "missing_phrase", "confidence": 0.92, "message": "still missing"}]}'
-
-    annotation_client = StubLLMClient(final_text=json.dumps(annotation_payload), provider="annotator")
-    qc_client = StubLLMClient(final_text=qc_response, provider="qc")
-    arbiter_client = StubLLMClient(final_text=arbiter_response, provider="arbiter")
-
-    def factory(target: str):
-        if target == "arbiter":
-            return arbiter_client
-        if target == "qc":
-            return qc_client
-        return annotation_client
-
-    runtime = SubagentRuntime(store=store, client_factory=factory, max_qc_rounds=3)
-    runtime.run_once(stage_target="annotation")
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _StubClient(), max_qc_rounds=3)
+    for _ in range(3):
+        runtime.run_once()
 
     discussions = store.list_feedback_discussions("t-arb")
     arbiter_closures = [d for d in discussions if d.metadata.get("resolution_source") == "arbiter"]
-    assert len(arbiter_closures) == 3, f"expected 3 arbiter-closed feedbacks, got {len(arbiter_closures)}"
-    # The task did NOT go to HR because the arbiter dropped retry_round_count
-    # back below the threshold.
+    assert len(arbiter_closures) == 1, f"expected 1 arbiter closure (latest round only); got {len(arbiter_closures)}"
     assert store.load_task("t-arb").status is not TaskStatus.HUMAN_REVIEW
 
 
-def test_arbiter_low_confidence_falls_through_to_hr(tmp_path):
-    """When the arbiter's confidence is below 0.7 (uncertain ruling), the
-    task still escalates to HUMAN_REVIEW."""
-    from annotation_pipeline_skill.core.models import FeedbackRecord
-    from annotation_pipeline_skill.core.states import FeedbackSeverity
+def test_arbiter_low_confidence_sets_second_arbiter_flag(tmp_path):
+    """When the arbiter's verdict is uncertain (tentative/unsure), the task must
+    stay in ARBITRATING with arbiter_uncertain_needs_second=True rather than
+    going straight to HUMAN_REVIEW. The second-arbiter resolver handles HR."""
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
 
     store = SqliteStore.open(tmp_path)
     task = Task.new(
@@ -1284,57 +1262,46 @@ def test_arbiter_low_confidence_falls_through_to_hr(tmp_path):
     )
     task.status = TaskStatus.PENDING
     store.save_task(task)
-    for index in range(3):
-        fb = FeedbackRecord.new(
-            task_id="t-arb-low",
-            attempt_id=f"t-arb-low-attempt-{index}",
-            source_stage=FeedbackSource.QC,
-            severity=FeedbackSeverity.WARNING,
-            category="missing_phrase",
-            message=f"Complaint #{index}",
-            target={},
-            suggested_action="annotator_rerun",
-            created_by="qc-agent",
-            metadata={"confidence": 0.9},
-        )
-        store.append_feedback(fb)
 
-    feedback_ids = [f.feedback_id for f in store.list_feedback("t-arb-low")]
-    # Arbiter is uncertain → 0.4 confidence on every verdict, below 0.7 cut.
-    arbiter_response = json.dumps({
-        "verdicts": [
-            {"feedback_id": fid, "verdict": "annotator", "confidence": 0.4, "reasoning": "unclear"}
-            for fid in feedback_ids
-        ]
-    })
-    annotation_payload = {
-        "entities": [],
-        "discussion_replies": [
-            {"feedback_id": fid, "confidence": 0.7, "message": "I disagree."}
-            for fid in feedback_ids
-        ],
-    }
-    qc_response = '{"passed": false, "failures": [{"category": "missing_phrase", "confidence": 0.92, "message": "still missing"}]}'
-    annotation_client = StubLLMClient(final_text=json.dumps(annotation_payload), provider="annotator")
-    qc_client = StubLLMClient(final_text=qc_response, provider="qc")
-    arbiter_client = StubLLMClient(final_text=arbiter_response, provider="arbiter")
+    def _build_arbiter_response():
+        feedbacks = store.list_feedback("t-arb-low")
+        if not feedbacks:
+            return '{"verdicts": [], "corrected_annotation": null}'
+        # 0.4 confidence → "tentative" label → unresolved
+        return json.dumps({
+            "verdicts": [
+                {"feedback_id": feedbacks[-1].feedback_id, "verdict": "annotator",
+                 "confidence": 0.4, "reasoning": "unclear"}
+            ]
+        })
 
-    def factory(target: str):
-        if target == "arbiter":
-            return arbiter_client
-        if target == "qc":
-            return qc_client
-        return annotation_client
+    class _StubClient:
+        async def generate(self, request):
+            if "senior arbiter" in request.instructions.lower():
+                final = _build_arbiter_response()
+            elif "quality" in request.instructions.lower():
+                final = '{"passed": false, "failures": [{"category": "missing_phrase", "confidence": 0.92, "message": "still missing"}]}'
+            else:
+                final = '{"entities": []}'
+            return LLMGenerateResult(
+                final_text=final, raw_response={}, usage={}, diagnostics={},
+                runtime="stub", provider="stub", model="stub", continuity_handle=None,
+            )
 
-    runtime = SubagentRuntime(store=store, client_factory=factory, max_qc_rounds=3)
-    runtime.run_once(stage_target="annotation")
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _StubClient(), max_qc_rounds=3)
+    for _ in range(3):
+        runtime.run_once()
 
-    assert store.load_task("t-arb-low").status is TaskStatus.HUMAN_REVIEW
+    after = store.load_task("t-arb-low")
+    assert after.status is TaskStatus.ARBITRATING, (
+        f"expected ARBITRATING (waiting for second arbiter), got {after.status}"
+    )
+    assert after.metadata.get("arbiter_uncertain_needs_second") is True, (
+        "arbiter_uncertain_needs_second flag must be set when first arbiter is uncertain"
+    )
     discussions = store.list_feedback_discussions("t-arb-low")
     arbiter_entries = [d for d in discussions if d.metadata.get("resolution_source") == "arbiter"]
-    # Arbiter recorded its uncertain verdict (for audit) but none are
-    # consensus=True — feedback stays open.
-    assert arbiter_entries, "expected arbiter to leave an audit trail even when uncertain"
+    assert arbiter_entries, "arbiter must leave an audit trail even when uncertain"
     assert not any(d.consensus for d in arbiter_entries), "uncertain arbiter must not write consensus"
 
 
@@ -1960,3 +1927,394 @@ def test_generate_async_reraises_original_429_when_fallback_not_configured(tmp_p
         asyncio.run(runtime._generate_async("annotation", req))
 
     assert exc_info.value is rate_limit_exc
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (P3): arbiter slim prompt must include ALL source rows
+# ---------------------------------------------------------------------------
+
+def test_arbiter_slim_prompt_includes_all_input_rows_regardless_of_target(tmp_path):
+    """Rows whose row_index is NOT referenced in any qc.target must still
+    appear in the arbiter prompt's input.rows so the arbiter has full context.
+    Previously, a feedback item with no target.row_index caused its row to be
+    silently omitted, making the arbiter mark verdicts tentative."""
+    import asyncio
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import (
+        Task, FeedbackRecord, ArtifactRef, FeedbackDiscussionEntry,
+    )
+    from annotation_pipeline_skill.core.states import (
+        FeedbackSeverity, FeedbackSource, TaskStatus,
+    )
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
+
+    store = SqliteStore.open(tmp_path)
+    source_payload = {
+        "rows": [
+            {"row_id": "r0", "row_index": 0, "input": {"text": "row zero text"}},
+            {"row_id": "r1", "row_index": 1, "input": {"text": "row one text"}},
+            {"row_id": "r2", "row_index": 2, "input": {"text": "row two text"}},
+        ]
+    }
+    task = Task.new(
+        task_id="t-slim",
+        pipeline_id="p",
+        source_ref={"kind": "jsonl", "payload": source_payload},
+    )
+    task.status = TaskStatus.ARBITRATING
+    store.save_task(task)
+
+    ann_payload = {"rows": [
+        {"row_id": "r0", "row_index": 0, "output": {"entities": {}}},
+        {"row_id": "r1", "row_index": 1, "output": {"entities": {}}},
+        {"row_id": "r2", "row_index": 2, "output": {"entities": {}}},
+    ]}
+    rel = "artifact_payloads/t-slim/ann.json"
+    (store.root / "artifact_payloads" / "t-slim").mkdir(parents=True, exist_ok=True)
+    (store.root / rel).write_text(json.dumps({"text": json.dumps(ann_payload)}), encoding="utf-8")
+    store.append_artifact(ArtifactRef.new(
+        task_id="t-slim", kind="annotation_result", path=rel, content_type="application/json",
+    ))
+
+    # Feedback with NO target.row_index → this row was previously omitted.
+    fb_no_row = FeedbackRecord.new(
+        task_id="t-slim", attempt_id="t-slim-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="schema_invalid", message="annotation is empty",
+        target={}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    # Feedback WITH target.row_index=1.
+    fb_with_row = FeedbackRecord.new(
+        task_id="t-slim", attempt_id="t-slim-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="span not labelled",
+        target={"row_index": 1}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    store.append_feedback(fb_no_row)
+    store.append_feedback(fb_with_row)
+
+    for fid in [fb_no_row.feedback_id, fb_with_row.feedback_id]:
+        store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+            task_id="t-slim", feedback_id=fid, role="annotator", stance="disagree",
+            message="I disagree.", consensus=False, created_by="annotator",
+        ))
+
+    captured_prompts: list[str] = []
+
+    class _CapturingClient:
+        async def generate(self, request):
+            captured_prompts.append(request.prompt)
+            return LLMGenerateResult(
+                final_text=json.dumps({
+                    "verdicts": [
+                        {"feedback_id": fb_no_row.feedback_id, "verdict": "annotator",
+                         "confidence": "confident", "reasoning": "ok"},
+                        {"feedback_id": fb_with_row.feedback_id, "verdict": "annotator",
+                         "confidence": "confident", "reasoning": "ok"},
+                    ]
+                }),
+                raw_response={}, usage={}, diagnostics={}, runtime="stub",
+                provider="arbiter", model="stub", continuity_handle=None,
+            )
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _CapturingClient())
+    asyncio.run(runtime._arbitrate_and_apply(task, "t-slim-attempt-0", stage="qc"))
+
+    assert captured_prompts, "arbiter must have been called"
+    prompt_data = json.loads(captured_prompts[0])
+    row_indices_in_prompt = {r["row_index"] for r in prompt_data["input"]["rows"]}
+    assert row_indices_in_prompt == {0, 1, 2}, (
+        f"all 3 rows must appear in input.rows; got {row_indices_in_prompt}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (P2): arbiter must only see the latest QC round's feedback
+# ---------------------------------------------------------------------------
+
+def test_arbiter_receives_only_latest_qc_round_feedback(tmp_path):
+    """Stale feedback from an earlier QC round must NOT be sent to the arbiter.
+    Only the most recent round's feedback (by attempt_id) should appear in the
+    disputed_items the arbiter sees."""
+    import asyncio
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import (
+        Task, FeedbackRecord, ArtifactRef, FeedbackDiscussionEntry,
+    )
+    from annotation_pipeline_skill.core.states import (
+        FeedbackSeverity, FeedbackSource, TaskStatus,
+    )
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
+
+    store = SqliteStore.open(tmp_path)
+    source_payload = {"rows": [{"row_id": "r0", "row_index": 0, "input": {"text": "hello"}}]}
+    task = Task.new(
+        task_id="t-stale", pipeline_id="p",
+        source_ref={"kind": "jsonl", "payload": source_payload},
+    )
+    task.status = TaskStatus.ARBITRATING
+    store.save_task(task)
+
+    rel = "artifact_payloads/t-stale/ann.json"
+    (store.root / "artifact_payloads" / "t-stale").mkdir(parents=True, exist_ok=True)
+    ann = {"rows": [{"row_id": "r0", "row_index": 0, "output": {"entities": {}}}]}
+    (store.root / rel).write_text(json.dumps({"text": json.dumps(ann)}), encoding="utf-8")
+    store.append_artifact(ArtifactRef.new(
+        task_id="t-stale", kind="annotation_result", path=rel, content_type="application/json",
+    ))
+
+    # Round 1: stale feedback (old attempt_id).
+    fb_stale = FeedbackRecord.new(
+        task_id="t-stale", attempt_id="t-stale-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="schema_invalid", message="annotation was empty (stale)",
+        target={}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    # Round 2: current feedback (newer attempt_id).
+    fb_current = FeedbackRecord.new(
+        task_id="t-stale", attempt_id="t-stale-attempt-1",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="Acme should be labelled org",
+        target={"row_index": 0}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    store.append_feedback(fb_stale)
+    store.append_feedback(fb_current)
+
+    for fid in [fb_stale.feedback_id, fb_current.feedback_id]:
+        store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+            task_id="t-stale", feedback_id=fid, role="annotator", stance="disagree",
+            message="addressed", consensus=False, created_by="annotator",
+        ))
+
+    seen_feedback_ids: list[list[str]] = []
+
+    class _CapturingClient:
+        async def generate(self, request):
+            data = json.loads(request.prompt)
+            seen_feedback_ids.append([it["feedback_id"] for it in data["disputed_items"]])
+            return LLMGenerateResult(
+                final_text=json.dumps({
+                    "verdicts": [{"feedback_id": fb_current.feedback_id,
+                                  "verdict": "annotator", "confidence": "confident",
+                                  "reasoning": "correct"}]
+                }),
+                raw_response={}, usage={}, diagnostics={}, runtime="stub",
+                provider="arbiter", model="stub", continuity_handle=None,
+            )
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _CapturingClient())
+    asyncio.run(runtime._arbitrate_and_apply(task, "t-stale-attempt-1", stage="qc"))
+
+    assert seen_feedback_ids, "arbiter must have been called"
+    ids_sent = seen_feedback_ids[0]
+    assert fb_stale.feedback_id not in ids_sent, (
+        "stale round-1 feedback must NOT be sent to arbiter"
+    )
+    assert fb_current.feedback_id in ids_sent, (
+        "current round-2 feedback must be sent to arbiter"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 4: second arbiter for uncertain — flag setting and resolver methods
+# ---------------------------------------------------------------------------
+
+def test_arbiter_uncertain_sets_flag_instead_of_immediate_hr(tmp_path):
+    """When the first arbiter is uncertain (tentative/unsure verdict), the task
+    must stay in ARBITRATING with arbiter_uncertain_needs_second=True, NOT go
+    straight to HUMAN_REVIEW. The second-arbiter resolver handles the HR decision."""
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
+
+    store = SqliteStore.open(tmp_path)
+    task = Task.new(
+        task_id="t-unc",
+        pipeline_id="p",
+        source_ref={"kind": "jsonl", "payload": {"text": "alpha beta"}},
+    )
+    task.status = TaskStatus.PENDING
+    store.save_task(task)
+
+    def _build_arbiter_response():
+        feedbacks = store.list_feedback("t-unc")
+        if not feedbacks:
+            return '{"verdicts": [], "corrected_annotation": null}'
+        return json.dumps({
+            "verdicts": [
+                {"feedback_id": feedbacks[-1].feedback_id,
+                 "verdict": "annotator", "confidence": "tentative",
+                 "reasoning": "not sure"}
+            ],
+            "corrected_annotation": None,
+        })
+
+    class _StubClient:
+        async def generate(self, request):
+            if "senior arbiter" in request.instructions.lower():
+                final = _build_arbiter_response()
+            elif "quality" in request.instructions.lower():
+                final = '{"passed": false, "failures": [{"category": "missing_phrase", "confidence": 0.92, "message": "still missing"}]}'
+            else:
+                final = '{"entities": []}'
+            return LLMGenerateResult(
+                final_text=final, raw_response={}, usage={}, diagnostics={},
+                runtime="stub", provider="stub", model="stub", continuity_handle=None,
+            )
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda _t: _StubClient(), max_qc_rounds=3)
+    for _ in range(3):
+        runtime.run_once()
+
+    after = store.load_task("t-unc")
+    assert after.status is TaskStatus.ARBITRATING, (
+        f"expected ARBITRATING (waiting for second arbiter), got {after.status}"
+    )
+    assert after.metadata.get("arbiter_uncertain_needs_second") is True, (
+        "arbiter_uncertain_needs_second flag must be set"
+    )
+
+
+def _make_uncertain_task(store, task_id: str):
+    """Helper: task in ARBITRATING with arbiter_uncertain_needs_second flag and
+    an annotation_result artifact."""
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    task = Task.new(
+        task_id=task_id, pipeline_id="p",
+        source_ref={"kind": "jsonl", "payload": {
+            "rows": [{"row_id": "r0", "row_index": 0, "input": {"text": "hello"}}]
+        }},
+    )
+    task.status = TaskStatus.ARBITRATING
+    task.metadata["arbiter_uncertain_needs_second"] = True
+    store.save_task(task)
+
+    rel = f"artifact_payloads/{task_id}/ann.json"
+    (store.root / "artifact_payloads" / task_id).mkdir(parents=True, exist_ok=True)
+    ann = {"rows": [{"row_id": "r0", "row_index": 0, "output": {"entities": {}}}]}
+    (store.root / rel).write_text(json.dumps({"text": json.dumps(ann)}), encoding="utf-8")
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel, content_type="application/json",
+    ))
+    return store.load_task(task_id)
+
+
+def test_resolve_uncertain_arbiter_second_confident_accepts(tmp_path):
+    """When the second arbiter responds with confident verdicts (annotator wins),
+    the task is ACCEPTED and the flag is cleared."""
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import FeedbackRecord, FeedbackDiscussionEntry
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource, TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
+
+    store = SqliteStore.open(tmp_path)
+    fb = FeedbackRecord.new(
+        task_id="t-unc2", attempt_id="t-unc2-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="missing span",
+        target={}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    store.append_feedback(fb)
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t-unc2", feedback_id=fb.feedback_id,
+        role="annotator", stance="disagree", message="ok", consensus=False, created_by="annotator",
+    ))
+    task = _make_uncertain_task(store, "t-unc2")
+
+    second_resp = json.dumps({
+        "verdicts": [{"feedback_id": fb.feedback_id, "verdict": "annotator",
+                      "confidence": "confident", "reasoning": "clear"}]
+    })
+
+    runtime = SubagentRuntime(
+        store=store,
+        client_factory=lambda _t: StubLLMClient(final_text=second_resp, provider="arbiter_secondary"),
+    )
+    runtime._resolve_uncertain_arbiter(task)
+
+    after = store.load_task("t-unc2")
+    assert after.status is TaskStatus.ACCEPTED, f"expected ACCEPTED, got {after.status}"
+    assert not after.metadata.get("arbiter_uncertain_needs_second"), "flag must be cleared"
+
+
+def test_resolve_uncertain_arbiter_second_also_uncertain_goes_to_hr(tmp_path):
+    """When the second arbiter is ALSO uncertain (tentative/unsure), the task
+    escalates to HUMAN_REVIEW with a clear reason."""
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import FeedbackRecord, FeedbackDiscussionEntry
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource, TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.llm.client import LLMGenerateResult
+
+    store = SqliteStore.open(tmp_path)
+    fb = FeedbackRecord.new(
+        task_id="t-unc3", attempt_id="t-unc3-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="missing span",
+        target={}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    store.append_feedback(fb)
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t-unc3", feedback_id=fb.feedback_id,
+        role="annotator", stance="disagree", message="ok", consensus=False, created_by="annotator",
+    ))
+    task = _make_uncertain_task(store, "t-unc3")
+
+    second_resp = json.dumps({
+        "verdicts": [{"feedback_id": fb.feedback_id, "verdict": "annotator",
+                      "confidence": "tentative", "reasoning": "still unsure"}]
+    })
+
+    runtime = SubagentRuntime(
+        store=store,
+        client_factory=lambda _t: StubLLMClient(final_text=second_resp, provider="arbiter_secondary"),
+    )
+    runtime._resolve_uncertain_arbiter(task)
+
+    after = store.load_task("t-unc3")
+    assert after.status is TaskStatus.HUMAN_REVIEW, f"expected HUMAN_REVIEW, got {after.status}"
+    assert not after.metadata.get("arbiter_uncertain_needs_second"), "flag must be cleared"
+    events = store.list_events("t-unc3")
+    hr_event = next((e for e in events if e.next_status.value == "human_review"), None)
+    assert hr_event is not None
+    assert "both arbiters" in hr_event.reason.lower() or "second arbiter" in hr_event.reason.lower()
+
+
+def test_resolve_uncertain_arbiter_unavailable_goes_to_hr(tmp_path):
+    """When the second arbiter client raises (unavailable), the task goes to
+    HUMAN_REVIEW rather than staying stuck in ARBITRATING."""
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import FeedbackRecord, FeedbackDiscussionEntry
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource, TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+
+    store = SqliteStore.open(tmp_path)
+    fb = FeedbackRecord.new(
+        task_id="t-unc4", attempt_id="t-unc4-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="missing",
+        target={}, suggested_action="annotator_rerun", created_by="qc",
+    )
+    store.append_feedback(fb)
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t-unc4", feedback_id=fb.feedback_id,
+        role="annotator", stance="disagree", message="ok", consensus=False, created_by="annotator",
+    ))
+    task = _make_uncertain_task(store, "t-unc4")
+
+    def bad_factory(target):
+        raise RuntimeError("provider not configured")
+
+    runtime = SubagentRuntime(store=store, client_factory=bad_factory)
+    runtime._resolve_uncertain_arbiter(task)
+
+    after = store.load_task("t-unc4")
+    assert after.status is TaskStatus.HUMAN_REVIEW, f"expected HUMAN_REVIEW, got {after.status}"
+    assert not after.metadata.get("arbiter_uncertain_needs_second")

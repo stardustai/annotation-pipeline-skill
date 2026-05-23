@@ -627,21 +627,11 @@ class SubagentRuntime:
                 # worker pickup re-runs the arbiter — no point sending back
                 # to the annotator, the annotation didn't change.
                 if arb["unresolved"] > 0:
-                    self._transition(
-                        task,
-                        TaskStatus.HUMAN_REVIEW,
-                        reason="Arbiter flagged its own answer as uncertain (tentative/unsure verdict); needs human review",
-                        stage="validation",
-                        attempt_id=annotation_attempt_id,
-                        metadata={
-                            "auto_escalated": True,
-                            "round_count": round_count,
-                            "max_qc_rounds": self.max_qc_rounds,
-                            "arbiter_ran": arb["ran"],
-                            "arbiter_unresolved": arb["unresolved"],
-                            "arbiter_mechanical_fail": arb["mechanical_fail"],
-                        },
-                    )
+                    # First arbiter uncertain — defer to a second arbiter rather
+                    # than escalating immediately. Scheduler detects the flag and
+                    # calls _resolve_uncertain_arbiter_async.
+                    task.metadata["arbiter_uncertain_needs_second"] = True
+                    self.store.save_task(task)
                 else:
                     self._handle_arbiter_mechanical_fail(
                         task, annotation_attempt_id, arb, stage="validation",
@@ -831,23 +821,9 @@ class SubagentRuntime:
                 # leave the task in ARBITRATING for re-pickup; the arbiter
                 # gets another shot on the same annotation.
                 if arb["unresolved"] > 0:
-                    self._transition(
-                        task,
-                        TaskStatus.HUMAN_REVIEW,
-                        reason="Arbiter flagged its own answer as uncertain (tentative/unsure verdict); needs human review",
-                        stage="qc",
-                        attempt_id=qc_attempt_id,
-                        metadata={
-                            "auto_escalated": True,
-                            "round_count": round_count,
-                            "max_qc_rounds": self.max_qc_rounds,
-                            "feedback_id": feedbacks[0].feedback_id,
-                            "qc_artifact_id": qc_artifact.artifact_id,
-                            "arbiter_ran": arb["ran"],
-                            "arbiter_unresolved": arb["unresolved"],
-                            "arbiter_mechanical_fail": arb["mechanical_fail"],
-                        },
-                    )
+                    # First arbiter uncertain — defer to second arbiter.
+                    task.metadata["arbiter_uncertain_needs_second"] = True
+                    self.store.save_task(task)
                 else:
                     self._handle_arbiter_mechanical_fail(
                         task, qc_attempt_id, arb, stage="qc",
@@ -2346,6 +2322,72 @@ class SubagentRuntime:
         task.metadata.pop("prior_verifier_first_arbiter_divergent", None)
         task.metadata.pop("prior_verifier_payload", None)
 
+    def _resolve_uncertain_arbiter(self, task: Task) -> None:
+        """Sync entry called by the scheduler when it sees a task with the
+        ``arbiter_uncertain_needs_second`` flag set. Runs the second arbiter
+        via arbiter_secondary and applies the resolution:
+
+        - second arbiter resolves (unresolved == 0) → ACCEPTED or arbiter fix
+        - second arbiter also uncertain (unresolved > 0) → HUMAN_REVIEW
+        - second arbiter unavailable (exception) → HUMAN_REVIEW
+        """
+        asyncio.run(self._resolve_uncertain_arbiter_async(task))
+
+    async def _resolve_uncertain_arbiter_async(self, task: Task) -> None:
+        """Async implementation of the second-arbiter-for-uncertain path."""
+        attempt_id = self._next_attempt_id(task)
+        task.metadata.pop("arbiter_uncertain_needs_second", None)
+
+        arb = await self._arbitrate_and_apply(
+            task,
+            attempt_id,
+            stage="arbitration",
+            require_rebuttal=False,
+            target_name="arbiter_secondary",
+        )
+
+        # _arbitrate_and_apply catches _ArbiterClientUnavailable/_ArbiterCallFailed
+        # internally and returns ran=False with exception_class set. Treat any
+        # client/call failure as "second arbiter unavailable" → HR.
+        if not arb.get("ran") and arb.get("exception_class"):
+            self._transition(
+                task,
+                TaskStatus.HUMAN_REVIEW,
+                reason="Arbiter flagged its own answer as uncertain; second arbiter unavailable — needs human review",
+                stage="arbitration",
+                attempt_id=attempt_id,
+            )
+            self.store.save_task(task)
+            return
+
+        terminal = self._terminal_from_arbiter(task, attempt_id, "arbitration", arb)
+        if terminal is not None:
+            self.store.save_task(task)
+            return
+
+        if arb["unresolved"] > 0:
+            self._transition(
+                task,
+                TaskStatus.HUMAN_REVIEW,
+                reason=(
+                    "Both arbiters flagged their answers as uncertain "
+                    "(tentative/unsure verdict); needs human review"
+                ),
+                stage="arbitration",
+                attempt_id=attempt_id,
+                metadata={
+                    "auto_escalated": True,
+                    "arbiter_ran": arb["ran"],
+                    "arbiter_unresolved": arb["unresolved"],
+                },
+            )
+        else:
+            self._handle_arbiter_mechanical_fail(
+                task, attempt_id, arb, stage="arbitration",
+                hr_extra_metadata={},
+            )
+        self.store.save_task(task)
+
     async def _run_rearbitration(self, task: Task) -> None:
         """Worker entry for human-dragged REJECTED/HR → Arbitration cards.
 
@@ -2421,6 +2463,7 @@ class SubagentRuntime:
         *,
         include_closed_feedbacks: bool = False,
         require_rebuttal: bool = True,
+        target_name: str = "arbiter",
     ) -> dict[str, Any]:
         """Run the external arbiter as judge + fixer over open disputes.
 
@@ -2459,6 +2502,15 @@ class SubagentRuntime:
             and (not require_rebuttal or f.feedback_id in replies_by_feedback)
             and (f.source_stage is FeedbackSource.QC or f.source_stage is FeedbackSource.VALIDATION)
         ]
+        # Send only the latest QC round's feedback. list_feedback returns records
+        # ordered by seq (insertion order); feedbacks from the same QC run share an
+        # attempt_id and are inserted together, so the last record's attempt_id is
+        # the most recent round. Stale feedback from prior rounds references
+        # annotation states that no longer exist, causing the arbiter to mark
+        # verdicts tentative when it sees the mismatch with current_annotation.
+        if open_feedbacks:
+            latest_attempt_id = open_feedbacks[-1].attempt_id
+            open_feedbacks = [f for f in open_feedbacks if f.attempt_id == latest_attempt_id]
         if not open_feedbacks:
             return empty
         # Promote the task into ARBITRATING — visible in the kanban while the
@@ -2506,7 +2558,7 @@ class SubagentRuntime:
             payload = await self._run_arbiter_llm(
                 task=task,
                 items=items,
-                target_name="arbiter",
+                target_name=target_name,
             )
         except _ArbiterRateLimited as exc:
             empty["rate_limited"] = True
@@ -2782,11 +2834,13 @@ class SubagentRuntime:
                 ref_rows.add(ri)
         full_payload = masked_task.source_ref.get("payload", {}) or {}
         full_rows = full_payload.get("rows", []) if isinstance(full_payload, dict) else []
-        slim_input_rows = [r for r in full_rows
-                           if isinstance(r, dict) and r.get("row_index") in ref_rows]
+        # Include ALL source rows so the arbiter has full text context even for
+        # feedback items that lack a target.row_index (schema errors, empty-annotation
+        # complaints, etc.). Omitting those rows caused the arbiter to mark verdicts
+        # tentative due to missing context. current_annotation is still filtered to
+        # disputed rows only.
         slim_input = {**{k: v for k, v in full_payload.items() if k != "rows"},
-                      "rows": slim_input_rows,
-                      "_omitted_unchanged_rows": max(0, len(full_rows) - len(slim_input_rows))}
+                      "rows": full_rows}
         # Slim current_annotation analogously
         ann_rows = current_annotation.get("rows", []) if isinstance(current_annotation, dict) else []
         slim_ann_rows = [r for r in ann_rows
