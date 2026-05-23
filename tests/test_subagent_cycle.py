@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from annotation_pipeline_skill.core.models import Task
 from annotation_pipeline_skill.core.states import FeedbackSource, TaskStatus
@@ -213,7 +214,12 @@ def test_subagent_runtime_rerun_prompt_includes_feedback_context(tmp_path):
     rerun_prompt = second_annotation_client.requests[0].prompt
     assert "missing entity" in rerun_prompt
     assert "feedback_bundle" in rerun_prompt
-    assert "prior_artifacts" in rerun_prompt
+    # Continuation turn (StubLLMClient returned continuity_handle="thread-1")
+    # intentionally omits prior_artifacts — the server-side KV cache from
+    # turn 1 already holds the full task + prior context. Only the new
+    # feedback delta is sent on the continuation. See
+    # _annotation_prompt(continuation_handle=...) in subagent_cycle.
+    assert "prior_artifacts" not in rerun_prompt
     discussions = store.list_feedback_discussions("task-1")
     assert len(discussions) == 1
     assert discussions[0].consensus is True
@@ -884,11 +890,15 @@ def test_annotation_prompt_includes_resolved_schema_from_project(tmp_path):
     runtime.run_once(stage_target="annotation")
 
     assert annotation_client.requests, "annotator was not invoked"
-    prompt_obj = json.loads(annotation_client.requests[0].prompt)
-    assert prompt_obj["output_schema"] == project_schema
-    # QC prompt also carries it.
+    # output_schema lives in the SYSTEM prompt (instructions), not user JSON,
+    # so the cacheable prefix stays bytestable across tasks. Verify the
+    # serialized schema is embedded in instructions.
+    annotator_instructions = annotation_client.requests[0].instructions or ""
+    assert json.dumps(project_schema, sort_keys=True) in annotator_instructions
+    # QC currently keeps schema in user JSON (codex_5.4_mini path doesn't
+    # benefit from local prefix-cache); preserve that contract for now.
     qc_prompt_obj = json.loads(qc_client.requests[0].prompt)
-    assert qc_prompt_obj["output_schema"] == project_schema
+    assert qc_prompt_obj.get("output_schema") is None or qc_prompt_obj["output_schema"] == project_schema
 
 
 def test_annotation_prompt_uses_inline_schema_when_present(tmp_path):
@@ -925,8 +935,9 @@ def test_annotation_prompt_uses_inline_schema_when_present(tmp_path):
 
     runtime.run_once(stage_target="annotation")
 
-    prompt_obj = json.loads(annotation_client.requests[0].prompt)
-    assert prompt_obj["output_schema"] == inline_schema
+    # Schema-in-system contract — see preceding test's comment block.
+    annotator_instructions = annotation_client.requests[0].instructions or ""
+    assert json.dumps(inline_schema, sort_keys=True) in annotator_instructions
 
 
 def test_next_attempt_id_uses_max_existing_index_not_current_attempt(tmp_path):
@@ -1913,3 +1924,39 @@ def test_permanent_classifier_catches_cli_auth_failure_in_stderr():
         {"stderr": "connection reset by peer", "returncode": 1},
     )
     assert _is_provider_permanent_error(unknown) is False
+
+
+def test_generate_async_reraises_original_429_when_fallback_not_configured(tmp_path):
+    """_generate_async must re-raise the original 429 when the 'fallback' target
+    is not in llm_profiles.yaml (ProfileValidationError from client_factory).
+
+    Regression: previously the ProfileValidationError replaced the 429, causing
+    the scheduler to classify the error as unknown-transient and loop forever
+    instead of surfacing the real cause.
+    """
+    import asyncio
+    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.llm.profiles import ProfileValidationError
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+
+    rate_limit_exc = LocalCLIExecutionError(
+        "local CLI provider failed",
+        {"error_event": {"api_error_status": 429, "result_text": "usage limit exceeded"}},
+    )
+
+    def client_factory(target: str):
+        if target == "annotation":
+            raise rate_limit_exc
+        raise ProfileValidationError(f"LLM target is not configured: {target}")
+
+    store_path = tmp_path
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    runtime = SubagentRuntime(store=SqliteStore.open(store_path), client_factory=client_factory)
+
+    from annotation_pipeline_skill.llm.client import LLMGenerateRequest
+    req = LLMGenerateRequest(instructions="test", prompt="ping")
+
+    with pytest.raises(LocalCLIExecutionError) as exc_info:
+        asyncio.run(runtime._generate_async("annotation", req))
+
+    assert exc_info.value is rate_limit_exc

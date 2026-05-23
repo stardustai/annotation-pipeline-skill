@@ -42,10 +42,12 @@ def test_build_conventions_block_returns_none_when_no_conventions(tmp_path):
 
 
 def test_annotation_prompt_starts_with_stable_task_key(tmp_path):
-    """Prefix-cache locality: the prompt JSON must begin with the stable
-    `task` key (source rows, schema) so cross-turn calls of the same task
-    share a byte-identical head. sort_keys=True (old behaviour) made
-    `feedback_bundle` the first key, busting cache from byte one."""
+    """Prefix-cache locality: the user-prompt JSON must begin with the
+    stable `task` key (source rows) so cross-turn calls of the same task
+    share a byte-identical head. output_schema now lives in the system
+    prompt (see test_subagent_cycle.py::test_annotation_prompt_includes
+    _resolved_schema_from_project) — keeping it out of the user JSON
+    moves a 3-4 KB stable block into the cacheable system prefix."""
     from annotation_pipeline_skill.runtime.prompt_builder import AnnotationPromptBuilder
     from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
@@ -58,8 +60,9 @@ def test_annotation_prompt_starts_with_stable_task_key(tmp_path):
     # across turns of the same task.
     feedback_pos = prompt.index('"feedback_bundle"')
     task_pos = prompt.index('"task"')
-    schema_pos = prompt.index('"output_schema"')
-    assert task_pos < schema_pos < feedback_pos
+    assert task_pos < feedback_pos
+    # Schema is no longer in user JSON — it's been promoted to system.
+    assert '"output_schema"' not in prompt
     store.close()
 
 

@@ -53,31 +53,26 @@ class AnnotationPromptBuilder:
     def build_annotation_prompt(
         self, task: Task, *, continuation_handle: str | None = None
     ) -> str:
-        """Build the full annotation prompt JSON string.
+        """Build the per-task annotation prompt — the user-message body.
 
-        When ``continuation_handle`` is None this is a first-turn prompt
-        containing the full task payload plus feedback bundle and prior
-        artifacts. When a handle is supplied the model already has the
-        full context in its KV cache, so only the incremental feedback
-        delta is sent.
+        Returns JSON; the schema is INTENTIONALLY omitted (it's
+        task-agnostic and now lives in the system prompt so it's part of
+        the stable prefix vLLM can cache). The system prompt is byte-
+        stable across tasks of the same project; this user payload is
+        the variable per-task portion.
 
-        Key ordering matters for vLLM prefix-cache locality: same-task
-        multi-turn calls (annotator-rerun loop) must share a byte-stable
-        prefix or the cache never warms. We put STABLE content (task
-        source rows, output_schema) at the head of the JSON and the
-        per-turn mutating content (prior_artifacts, feedback_bundle) at
-        the tail, and we drop sort_keys so the insertion order is
-        preserved. With sort_keys=True the alphabetical first key was
-        `feedback_bundle` — the most volatile section — busting any
-        prefix-cache hit from the very first byte.
+        Key ordering still matters within this payload for same-task
+        multi-turn calls — stable head (task source rows) first,
+        per-turn mutating tail (prior_artifacts, feedback_bundle) last.
+        sort_keys would put `feedback_bundle` (most volatile) at byte 0;
+        relying on dict insertion order preserves the stable→volatile
+        layout.
         """
         if continuation_handle is None:
             return json.dumps(
                 {
                     # Stable per task (source rows, task_id, annotator id).
                     "task": self._task_payload(task),
-                    # Stable per project.
-                    "output_schema": resolve_output_schema(task, self._store),
                     # Mutating per turn — kept at the tail so the head stays
                     # bytes-identical across turns of the same task.
                     "prior_artifacts": self._artifact_context(task.task_id),
@@ -90,17 +85,14 @@ class AnnotationPromptBuilder:
         )
 
     def build_qc_prompt(self, task: Task, annotation_artifact: ArtifactRef) -> str:
-        """Build the QC prompt JSON string.
+        """Build the QC prompt JSON — user-message body.
 
-        Same prefix-cache ordering rule as ``build_annotation_prompt``:
-        stable fields first (task, output_schema), volatile last
-        (annotation_artifact — which is what's being QC'd, different
-        every turn; feedback_bundle — grows monotonically).
+        output_schema is no longer in the JSON (moved to system prompt
+        for prefix-cache locality, same reason as build_annotation_prompt).
         """
         return json.dumps(
             {
                 "task": self._task_payload(task),
-                "output_schema": resolve_output_schema(task, self._store),
                 "annotation_artifact": {
                     **annotation_artifact.to_dict(),
                     "payload": self.slim_annotation_payload(annotation_artifact),

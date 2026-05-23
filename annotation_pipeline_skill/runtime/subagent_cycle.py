@@ -40,6 +40,13 @@ class _ArbiterCallFailed(Exception):
     parsing failed (network error, malformed JSON, no verdicts list)."""
 
 
+class _ArbiterRateLimited(Exception):
+    """Raised by `_run_arbiter_llm` when the call failed due to provider
+    rate-limiting (429 / too-many-requests). Distinct from _ArbiterCallFailed
+    so callers can retry with backoff instead of counting toward the
+    mechanical-failure cap that routes tasks to human review."""
+
+
 class QCParseError(ValueError):
     def __init__(self, message: str, *, raw_text: str):
         super().__init__(message)
@@ -62,6 +69,8 @@ def _is_rate_limited(exc: BaseException) -> bool:
     Covers openai.RateLimitError (status 429), generic APIStatusError with
     .status_code==429, and CLI-style errors that just carry a message — we
     inspect both the type name and the string representation.
+    Also covers LocalCLIExecutionError from AnthropicSDKClient which buries
+    the HTTP status in diagnostics["error_event"]["api_error_status"].
     """
     name = type(exc).__name__
     if "RateLimit" in name:
@@ -69,6 +78,13 @@ def _is_rate_limited(exc: BaseException) -> bool:
     status = getattr(exc, "status_code", None)
     if status == 429:
         return True
+    # AnthropicSDKClient wraps anthropic.APIError as LocalCLIExecutionError
+    # with the HTTP status in diagnostics["error_event"]["api_error_status"].
+    diagnostics = getattr(exc, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        err_ev = diagnostics.get("error_event")
+        if isinstance(err_ev, dict) and err_ev.get("api_error_status") == 429:
+            return True
     text = str(exc).lower()
     return "rate limit" in text or "429" in text or "too many requests" in text
 
@@ -318,15 +334,30 @@ class SubagentRuntime:
         annotation_started_at = utc_now()
         conventions_block = self._build_conventions_block(task)
         continuation_handle = self._read_pinned_handle(task, "continuity_handle", stage_target)
+        # Prefix-cache layout — keep the system prompt bytestable across
+        # tasks of the same project. Per-task content (conventions block,
+        # task source rows, feedback) goes in the user message; project-
+        # wide content (schema, validator workflow, span rules) stays in
+        # system.
+        from annotation_pipeline_skill.core.schema_validation import resolve_output_schema
+        annotation_user_prompt = self._annotation_prompt(
+            task, continuation_handle=continuation_handle,
+        )
+        if conventions_block:
+            # Conventions are per-task — prepend as a header to the user
+            # message rather than appending to the system prompt.
+            annotation_user_prompt = (
+                conventions_block + "\n\n" + annotation_user_prompt
+            )
         annotation_result = await self._generate_async(
             stage_target,
             LLMGenerateRequest(
                 instructions=_annotation_instructions(
                     task,
                     guideline=guideline,
-                    conventions_block=conventions_block,
+                    output_schema=resolve_output_schema(task, self.store),
                 ),
-                prompt=self._annotation_prompt(task, continuation_handle=continuation_handle),
+                prompt=annotation_user_prompt,
                 continuity_handle=continuation_handle,
                 response_format={"type": "json_object"},
                 task_id=task.task_id,
@@ -445,6 +476,12 @@ class SubagentRuntime:
         cap is reached, transition to HR. Otherwise leave the task in
         ARBITRATING for re-pickup — the next worker takes a fresh shot.
         """
+        if arb.get("rate_limited"):
+            # Arbiter call was rate-limited (429). Don't count this toward any
+            # failure cap — the task stays in ARBITRATING so the next worker
+            # picks it up after provider backoff resolves.
+            return
+
         verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
         if verbatim_exhausted:
             count = int(task.metadata.get("arbiter_verbatim_bail_count", 0)) + 1
@@ -507,19 +544,20 @@ class SubagentRuntime:
     def _retry_round_count(self, task_id: str) -> int:
         """Count how many *open* retry rounds have happened for this task.
 
-        A round is any QC/VALIDATION feedback that bounced the task back to
-        PENDING. Feedbacks that have already been resolved by consensus
-        (QC accepted an annotator rebuttal) are excluded — otherwise a
-        single subjective complaint that both sides agreed to drop would
-        still march the task toward HUMAN_REVIEW.
+        A round is a QC/VALIDATION rejection attempt. Multiple feedback records
+        sharing the same attempt_id belong to the same round. A round is closed
+        only when ALL its feedback records have reached consensus; otherwise it
+        still counts toward the escalation threshold.
         """
         discussions = self.store.list_feedback_discussions(task_id)
         consensus_ids = {d.feedback_id for d in discussions if d.consensus}
-        return sum(
-            1 for f in self.store.list_feedback(task_id)
+        open_attempt_ids: set[str] = {
+            f.attempt_id
+            for f in self.store.list_feedback(task_id)
             if (f.source_stage is FeedbackSource.QC or f.source_stage is FeedbackSource.VALIDATION)
             and f.feedback_id not in consensus_ids
-        )
+        }
+        return len(open_attempt_ids)
 
     async def _run_validation_and_qc(
         self,
@@ -651,8 +689,6 @@ class SubagentRuntime:
         if not dups:
             return
         sample = dups[0]
-        # One feedback per attempt; aggregate count + first example in the message
-        # so annotator sees the pattern without N feedbacks per task.
         self.store.append_feedback(
             FeedbackRecord.new(
                 task_id=task.task_id,
@@ -666,7 +702,7 @@ class SubagentRuntime:
                     f"Each (type, span) pair should appear at most once per row. "
                     f"Auto-deduped at write time; eliminate the duplicate in the next emission."
                 ),
-                target={"duplicates": dups[:5]},
+                target={"duplicates": dups},
                 suggested_action="annotator_dedupe",
                 created_by="validation",
             )
@@ -745,7 +781,7 @@ class SubagentRuntime:
             if verifier_failure is not None:
                 # Divergent — route to ARBITRATING for first-arbiter resolution.
                 # No convention update (the verifier just flagged the decision).
-                self.store.append_feedback(verifier_failure["feedback"])
+                self.store.append_feedback_many([vf["feedback"] for vf in verifier_failure])
                 self._transition(
                     task,
                     TaskStatus.ARBITRATING,
@@ -755,7 +791,7 @@ class SubagentRuntime:
                     metadata={
                         "qc_artifact_id": qc_artifact.artifact_id,
                         "prior_verifier_action": "qc_pass_divergent",
-                        "verifier_payload": verifier_failure["payload"],
+                        "verifier_payload": verifier_failure[0]["payload"],
                     },
                 )
                 self.store.save_task(task)
@@ -775,9 +811,9 @@ class SubagentRuntime:
                 metadata={"qc_artifact_id": qc_artifact.artifact_id},
             )
         else:
-            feedback = _feedback_from_qc_decision(task, qc_attempt_id, qc_decision)
-            self.store.append_feedback(feedback)
-            qc_conf = _clamp_confidence(feedback.metadata.get("confidence"))
+            feedbacks = _feedback_from_qc_decision(task, qc_attempt_id, qc_decision)
+            self.store.append_feedback_many(feedbacks)
+            qc_conf = _clamp_confidence(feedbacks[0].metadata.get("confidence"))
             if qc_conf is not None:
                 self._record_confidence_sample("qc", qc_conf)
             round_count = self._retry_round_count(task.task_id)
@@ -805,7 +841,7 @@ class SubagentRuntime:
                             "auto_escalated": True,
                             "round_count": round_count,
                             "max_qc_rounds": self.max_qc_rounds,
-                            "feedback_id": feedback.feedback_id,
+                            "feedback_id": feedbacks[0].feedback_id,
                             "qc_artifact_id": qc_artifact.artifact_id,
                             "arbiter_ran": arb["ran"],
                             "arbiter_unresolved": arb["unresolved"],
@@ -818,7 +854,7 @@ class SubagentRuntime:
                         hr_extra_metadata={
                             "round_count": round_count,
                             "max_qc_rounds": self.max_qc_rounds,
-                            "feedback_id": feedback.feedback_id,
+                            "feedback_id": feedbacks[0].feedback_id,
                             "qc_artifact_id": qc_artifact.artifact_id,
                         },
                     )
@@ -829,7 +865,7 @@ class SubagentRuntime:
                     reason="subagent qc requested annotator rerun",
                     stage="qc",
                     attempt_id=qc_attempt_id,
-                    metadata={"feedback_id": feedback.feedback_id, "qc_artifact_id": qc_artifact.artifact_id},
+                    metadata={"feedback_id": feedbacks[0].feedback_id, "qc_artifact_id": qc_artifact.artifact_id},
                 )
         self.store.save_task(task)
 
@@ -936,9 +972,9 @@ class SubagentRuntime:
         self,
         task: Task,
         annotation_artifact: ArtifactRef,
-    ) -> dict | None:
-        """Return {feedback, payload} on the FIRST divergent (span, type), or
-        None when every span is agree/cold_start.
+    ) -> list[dict] | None:
+        """Return list of {feedback, payload} for ALL divergent (span, type) pairs,
+        or None when every span is agree/cold_start.
         """
         from annotation_pipeline_skill.services.entity_statistics_service import (
             EntityStatisticsService,
@@ -948,6 +984,9 @@ class SubagentRuntime:
         if payload is None:
             return None
         svc = EntityStatisticsService(self.store)
+        attempts = self.store.list_attempts(task.task_id)
+        attempt_id = attempts[-1].attempt_id if attempts else f"{task.task_id}-attempt-0"
+        divergents: list[dict] = []
         for span, entity_type in iter_span_decisions(payload):
             result = svc.check(
                 project_id=task.pipeline_id,
@@ -956,8 +995,6 @@ class SubagentRuntime:
             )
             if result.status != "divergent":
                 continue
-            attempts = self.store.list_attempts(task.task_id)
-            attempt_id = attempts[-1].attempt_id if attempts else f"{task.task_id}-attempt-0"
             verifier_payload = {
                 "span": result.span,
                 "proposed_type": result.proposed_type,
@@ -966,7 +1003,7 @@ class SubagentRuntime:
                 "total": result.total,
                 "distribution": result.distribution,
             }
-            return {
+            divergents.append({
                 "payload": verifier_payload,
                 "feedback": FeedbackRecord.new(
                     task_id=task.task_id,
@@ -985,8 +1022,8 @@ class SubagentRuntime:
                     suggested_action="arbiter_rerun",
                     created_by="prior_verifier",
                 ),
-            }
-        return None
+            })
+        return divergents if divergents else None
 
     def _mark_first_arbiter_divergence_if_any(
         self,
@@ -1006,7 +1043,7 @@ class SubagentRuntime:
         if divergence is None:
             return
         task.metadata["prior_verifier_first_arbiter_divergent"] = True
-        task.metadata["prior_verifier_payload"] = divergence["payload"]
+        task.metadata["prior_verifier_payload"] = divergence[0]["payload"]
 
     def _verifier_confirmed_all_spans(
         self,
@@ -2471,6 +2508,13 @@ class SubagentRuntime:
                 items=items,
                 target_name="arbiter",
             )
+        except _ArbiterRateLimited as exc:
+            empty["rate_limited"] = True
+            empty["exception_class"] = type(exc).__name__
+            empty["exception_message"] = str(exc)[:500]
+            task.metadata["arbiter_last_exception_class"] = empty["exception_class"]
+            task.metadata["arbiter_last_exception_message"] = empty["exception_message"]
+            return empty
         except (_ArbiterClientUnavailable, _ArbiterCallFailed) as exc:
             # Preserve the actual failure cause so HR metadata + task.metadata
             # show whether it was client-unavailable, LLM exception, JSON
@@ -2701,10 +2745,12 @@ class SubagentRuntime:
         # span rules — verbatim, no character substitution, no trailing punct,
         # no duplicates, one type per span. Single source of truth in code.
         instructions = instructions + "\n\n" + _SHARED_SPAN_RULES
-        # Inject per-project entity conventions if any match the input text.
+        # NOTE: conventions_block is per-task and was previously appended to
+        # `instructions` (= system prompt). That made the system prompt
+        # task-specific and broke vLLM prefix-cache locality for the
+        # arbiter_secondary (qwen) path. The block is now prepended to the
+        # user prompt below; system stays bytestable.
         conventions_block = self._build_conventions_block(task)
-        if conventions_block:
-            instructions = instructions + "\n\n" + conventions_block
         # Include the resolved output_schema so the arbiter doesn't invent
         # entity types, phrase types, or field shapes when constructing
         # corrected_annotation. Without this constraint, gpt-5.5 was emitting
@@ -2833,6 +2879,10 @@ class SubagentRuntime:
             },
             indent=2,
         )
+        # Prepend per-task entity conventions to the user prompt (was
+        # previously appended to system, which broke prefix-cache).
+        if conventions_block:
+            prompt = conventions_block + "\n\n" + prompt
         # Up to ``arbiter_verbatim_retries`` retry rounds if the arbiter's
         # corrected_annotation contains a non-verbatim span. After retries
         # exhausted, we PRESERVE the (still non-verbatim) correction and
@@ -2918,6 +2968,10 @@ class SubagentRuntime:
                         except Exception:  # noqa: BLE001
                             pass
                         # `result` now holds fallback output — skip the raise.
+                elif _is_rate_limited(exc):
+                    raise _ArbiterRateLimited(
+                        f"rate_limit/{type(exc).__name__}: {exc!s}{tail}"
+                    ) from exc
                 else:
                     raise _ArbiterCallFailed(
                         f"llm_call/{type(exc).__name__}: {exc!s}{tail}"
@@ -3183,6 +3237,31 @@ class SubagentRuntime:
         )
 
 
+_ANNOTATION_VALIDATOR_SUFFIX = (
+    "SELF-CHECK TOOL (MANDATORY BEFORE SUBMIT): when "
+    "`mcp__annotation-validator__check_annotation_draft` is in your tools list, you MUST call it on "
+    "your draft BEFORE you emit your final JSON answer. The pipeline runs the same mechanical checks "
+    "after you submit and will REJECT non-clean drafts, costing a full re-annotation. Self-check "
+    "lets you fix issues in this session.\n"
+    "  Workflow:\n"
+    "    1. Build your full draft `{rows: [...]}` payload (all source rows, not a subset).\n"
+    "    2. Call `mcp__annotation-validator__check_annotation_draft` with "
+    "       `{task_id: <task_id from prompt input>, payload: <your draft>}`.\n"
+    "    3. If `ok=true` and `violations={}`, emit your final JSON. Done.\n"
+    "    4. If violations are non-empty, fix each one in your draft. For verbatim_violations: "
+    "       the offending span is not a byte-for-byte substring of the row's input.text. Use "
+    "       `mcp__annotation-validator__lookup_row_text` with `{task_id, row_index}` to read the "
+    "       original text and re-extract the correct verbatim substring (no character substitution, "
+    "       no normalization). For row_coverage_missing: add the missing rows with at least empty "
+    "       `{entities: {}, json_structures: {}}` outputs. For cross_type_collisions: pick ONE type "
+    "       per span per row. For trailing_punctuation: drop the trailing punctuation from the span. "
+    "       For schema_errors: align entity/structure type names with the schema enum.\n"
+    "    5. Re-call check_annotation_draft. Loop until ok=true. Hard cap: 5 self-check iterations; "
+    "       if still not clean, submit your best draft and the pipeline will route to human review.\n"
+    "  Don't skip this even if you're confident — the dominant failure mode is verbatim violations "
+    "  on spans you remembered slightly wrong (paraphrased / normalized / dropped article)."
+)
+
 _SHARED_SPAN_RULES = """\
 CROSS-CUTTING SPAN RULES (every agent — annotator, QC, arbiter — enforces the same set):
 
@@ -3214,8 +3293,31 @@ def _annotation_instructions(
     task: Task,
     *,
     guideline: str | None = None,
-    conventions_block: str | None = None,
+    conventions_block: str | None = None,  # DEPRECATED — kept for callers that still pass it; no-op
+    output_schema: dict | None = None,
 ) -> str:
+    """Build the system prompt for annotator subagents.
+
+    Prefix-cache contract (see commit history around the vLLM 0% hit-rate
+    fix): this string must be BYTE-STABLE across tasks of the same project
+    so vLLM's prefix cache can hit on the system block. Anything per-task
+    MUST be excluded:
+      - conventions_block (per-task entity examples) is NOT appended here;
+        the caller prepends it to the user message instead.
+      - The "Modality: ... Requirements: ..." f-string at the end of base
+        is constant for the v3 deployment (all tasks are text + entity
+        extraction); if a future project varies these the caller should
+        also move them out of system.
+
+    output_schema, when supplied, is embedded as a stable JSON block.
+    Schemas are per-project (not per-task), so embedding them here keeps
+    system bytestable while making the schema part of the cacheable
+    prefix instead of leaking into the variable user payload.
+
+    The SELF-CHECK TOOL workflow text was historically appended to the
+    user message (one source of per-call variability — its bytes shifted
+    relative to the per-task content above it). Now baked into base.
+    """
     base = (
         "You are an annotation subagent. Return raw JSON only, with no markdown fences or commentary. "
         "Follow the output_schema in this prompt: it is the JSON Schema your response must conform to, and its "
@@ -3267,35 +3369,21 @@ def _annotation_instructions(
         "verbs) or for spans whose schema mapping is already obvious — over-calling wastes tokens and "
         "the tool has no useful information for spans you can already handle."
         "\n\n"
-        "SELF-CHECK TOOL (MANDATORY BEFORE SUBMIT): when "
-        "`mcp__annotation-validator__check_annotation_draft` is in your tools list, you MUST call it on "
-        "your draft BEFORE you emit your final JSON answer. The pipeline runs the same mechanical checks "
-        "after you submit and will REJECT non-clean drafts, costing a full re-annotation. Self-check "
-        "lets you fix issues in this session.\n"
-        "  Workflow:\n"
-        "    1. Build your full draft `{rows: [...]}` payload (all source rows, not a subset).\n"
-        "    2. Call `mcp__annotation-validator__check_annotation_draft` with "
-        "       `{task_id: <task_id from prompt input>, payload: <your draft>}`.\n"
-        "    3. If `ok=true` and `violations={}`, emit your final JSON. Done.\n"
-        "    4. If violations are non-empty, fix each one in your draft. For verbatim_violations: "
-        "       the offending span is not a byte-for-byte substring of the row's input.text. Use "
-        "       `mcp__annotation-validator__lookup_row_text` with `{task_id, row_index}` to read the "
-        "       original text and re-extract the correct verbatim substring (no character substitution, "
-        "       no normalization). For row_coverage_missing: add the missing rows with at least empty "
-        "       `{entities: {}, json_structures: {}}` outputs. For cross_type_collisions: pick ONE type "
-        "       per span per row. For trailing_punctuation: drop the trailing punctuation from the span. "
-        "       For schema_errors: align entity/structure type names with the schema enum.\n"
-        "    5. Re-call check_annotation_draft. Loop until ok=true. Hard cap: 5 self-check iterations; "
-        "       if still not clean, submit your best draft and the pipeline will route to human review.\n"
-        "  Don't skip this even if you're confident — the dominant failure mode is verbatim violations "
-        "  on spans you remembered slightly wrong (paraphrased / normalized / dropped article)."
-        f"\n\nModality: {task.modality}. Requirements: {json.dumps(task.annotation_requirements, sort_keys=True)}."
+        + _ANNOTATION_VALIDATOR_SUFFIX
+        + f"\n\nModality: {task.modality}. Requirements: {json.dumps(task.annotation_requirements, sort_keys=True)}."
     )
     parts = [base, _SHARED_SPAN_RULES]
-    if conventions_block:
-        parts.append(conventions_block)
+    if output_schema is not None:
+        # Schema bytes are stable per-project. Embedding into the system
+        # prompt with sort_keys=True for deterministic byte layout.
+        parts.append(
+            "OUTPUT SCHEMA (your response MUST conform to this JSON Schema):\n"
+            + json.dumps(output_schema, sort_keys=True)
+        )
     if guideline:
         parts.append(guideline)
+    # NOTE: conventions_block intentionally NOT appended here — caller
+    # prepends it to the user message so the system stays bytestable.
     return "\n\n".join(parts)
 
 
@@ -3508,6 +3596,61 @@ def _parse_llm_json(text: str) -> Any:
         raise primary_err
 
 
+def _auto_fill_missing_rows(task: Task, parsed: Any) -> int:
+    """Insert empty `{entities: {}, json_structures: {}}` stubs for any
+    source row the annotator dropped from its output. Returns the count
+    of stubs added.
+
+    Background: qwen3.6-35b-a3b on this annotation prompt produces 40%
+    "missing rows" failures (8 of 32 attempts in a sampled 30 min
+    window). The model knows what to do for the rows it emits — it's
+    just sloppy about row coverage. Each dropped row triggers a full
+    re-annotation (~220s) for one missing row, which is wasted work.
+
+    Auto-fill is SAFE because:
+      - The empty stub is structurally identical to what the prompt
+        already documents ("MANDATORY ROW COVERAGE: ... If a row has
+        no entities and no phrases, still include it with empty dicts").
+      - QC still sees the row and can flag it for missing content if
+        the row genuinely has annotatable spans the model overlooked.
+      - We don't fabricate spans — only add scaffolding.
+    """
+    if not isinstance(parsed, dict):
+        return 0
+    rows = parsed.get("rows")
+    if not isinstance(rows, list):
+        return 0
+    try:
+        src_rows = task.source_ref.get("payload", {}).get("rows", [])
+    except (AttributeError, TypeError):
+        return 0
+    if not isinstance(src_rows, list) or not src_rows:
+        return 0
+    present_ids = {
+        r.get("row_id") for r in rows
+        if isinstance(r, dict) and isinstance(r.get("row_id"), str)
+    }
+    added = 0
+    for src in src_rows:
+        if not isinstance(src, dict):
+            continue
+        rid = src.get("row_id")
+        if not isinstance(rid, str) or rid in present_ids:
+            continue
+        ridx = src.get("row_index")
+        rows.append({
+            "row_id": rid,
+            "row_index": ridx,
+            "output": {"entities": {}, "json_structures": {}},
+        })
+        present_ids.add(rid)
+        added += 1
+    if added:
+        # Keep stable order by row_index so the artifact reads naturally.
+        rows.sort(key=lambda r: r.get("row_index", 0) if isinstance(r, dict) and isinstance(r.get("row_index"), int) else 0)
+    return added
+
+
 def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
     """Parse LLM output, run safe auto-fix, and re-serialize as canonical
     JSON. Returns the original text if no JSON can be recovered (caller
@@ -3519,13 +3662,15 @@ def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
       - For already-verbatim spans where the punct-trimmed form is ALSO
         verbatim, prefer the trimmed form — matches ``find_trailing_punctuation_spans``
         ("entity is the name, not the sentence boundary").
+      - Auto-fill missing rows with empty `{entities:{}, json_structures:{}}`
+        stubs (qwen 40% drop rate, see ``_auto_fill_missing_rows``).
       - Dedupe within-type duplicates.
 
     Cross-type collisions, hallucinated (genuinely-non-verbatim) spans,
     schema breakage, and empty annotations are NOT silently rewritten —
     they fail the verification gate and surface as feedback. Auto-fix only
     handles cases where the annotator's intent is clear but the boundary
-    was off by trim-safe characters.
+    was off by trim-safe characters or rows were silently dropped.
     """
     try:
         parsed = _parse_llm_json(text)
@@ -3537,6 +3682,10 @@ def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
                 auto_fix_safe_spans_in_place,
             )
             auto_fix_safe_spans_in_place(task, parsed)
+        except Exception:  # noqa: BLE001 — never block artifact write on auto-fix
+            pass
+        try:
+            _auto_fill_missing_rows(task, parsed)
         except Exception:  # noqa: BLE001 — never block artifact write on auto-fix
             pass
     _dedupe_within_type_spans(parsed)
@@ -3725,27 +3874,32 @@ def _resolve_confidence_label(value: Any) -> str | None:
     return "unsure"
 
 
-def _feedback_from_qc_decision(task: Task, attempt_id: str, decision: dict[str, Any]) -> FeedbackRecord:
+def _feedback_from_qc_decision(task: Task, attempt_id: str, decision: dict[str, Any]) -> list[FeedbackRecord]:
     failures = decision.get("failures") if isinstance(decision.get("failures"), list) else []
-    first_failure = failures[0] if failures and isinstance(failures[0], dict) else {}
-    confidence_label = _resolve_confidence_label(
-        first_failure.get("confidence") if isinstance(first_failure, dict) else None
-    )
-    metadata: dict[str, Any] = {"qc_decision": decision}
-    if confidence_label is not None:
-        metadata["confidence"] = confidence_label
-    return FeedbackRecord.new(
-        task_id=task.task_id,
-        attempt_id=attempt_id,
-        source_stage=FeedbackSource.QC,
-        severity=FeedbackSeverity(decision["severity"]),
-        category=str(first_failure.get("category") or decision.get("category") or "qc"),
-        message=str(first_failure.get("message") or decision.get("message") or "QC rejected the annotation result."),
-        target=first_failure.get("target") if isinstance(first_failure.get("target"), dict) else decision.get("target") if isinstance(decision.get("target"), dict) else {},
-        suggested_action=str(first_failure.get("suggested_action") or decision.get("suggested_action") or "annotator_rerun"),
-        created_by="qc",
-        metadata=metadata,
-    )
+    valid_failures: list[dict[str, Any]] = [f for f in failures if isinstance(f, dict)]
+    if not valid_failures:
+        valid_failures = [{}]
+
+    records: list[FeedbackRecord] = []
+    for i, failure in enumerate(valid_failures):
+        metadata: dict[str, Any] = {"qc_decision": decision}
+        if i == 0:
+            confidence_label = _resolve_confidence_label(failure.get("confidence"))
+            if confidence_label is not None:
+                metadata["confidence"] = confidence_label
+        records.append(FeedbackRecord.new(
+            task_id=task.task_id,
+            attempt_id=attempt_id,
+            source_stage=FeedbackSource.QC,
+            severity=FeedbackSeverity(failure.get("severity") or decision["severity"]),
+            category=str(failure.get("category") or decision.get("category") or "qc"),
+            message=str(failure.get("message") or decision.get("message") or "QC rejected the annotation result."),
+            target=failure.get("target") if isinstance(failure.get("target"), dict) else decision.get("target") if isinstance(decision.get("target"), dict) else {},
+            suggested_action=str(failure.get("suggested_action") or decision.get("suggested_action") or "annotator_rerun"),
+            created_by="qc",
+            metadata=metadata,
+        ))
+    return records
 
 
 def _severity_value(value: object) -> str:
