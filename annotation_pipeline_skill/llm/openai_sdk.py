@@ -49,6 +49,7 @@ class OpenAISDKClient(BaseSdkClient):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         task_id: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> _ApiCallResult:
         openai_tools = [_to_openai_tool(t) for t in tools] if tools else None
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
@@ -61,12 +62,13 @@ class OpenAISDKClient(BaseSdkClient):
             kwargs: dict[str, Any] = dict(
                 model=self.profile.model,
                 messages=full_messages,
-                max_tokens=32000,
             )
             if openai_tools:
                 kwargs["tools"] = openai_tools
             if self.profile.reasoning_effort:
                 kwargs["reasoning_effort"] = self.profile.reasoning_effort
+            if response_format:
+                kwargs["response_format"] = response_format
             if extra_headers:
                 kwargs["extra_headers"] = extra_headers
 
