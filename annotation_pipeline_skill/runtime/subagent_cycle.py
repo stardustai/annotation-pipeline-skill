@@ -19,6 +19,12 @@ from annotation_pipeline_skill.core.schema_validation import (
 from annotation_pipeline_skill.core.states import AttemptStatus, FeedbackSeverity, FeedbackSource, TaskStatus
 from annotation_pipeline_skill.core.transitions import transition_task
 from annotation_pipeline_skill.llm.client import LLMClient, LLMGenerateRequest, LLMGenerateResult
+from annotation_pipeline_skill.llm.structured_output import (
+    build_annotation_strict_schema,
+    build_arbiter_strict_schema,
+    build_qc_strict_schema,
+    make_json_schema_response_format,
+)
 from annotation_pipeline_skill.services.feedback_service import build_feedback_bundle, build_feedback_consensus_summary
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
@@ -174,6 +180,7 @@ class SubagentRuntime:
         *,
         max_qc_rounds: int | None = None,
         config: RuntimeConfig | None = None,
+        structured_output_targets: frozenset[str] = frozenset(),
     ):
         self.store = store
         self.client_factory = client_factory
@@ -183,6 +190,7 @@ class SubagentRuntime:
         # call the factory an extra time — cheap in production but in finite-
         # list test stubs it consumes a client and breaks retry flows.
         self._profile_name_cache: dict[str, str | None] = {}
+        self._structured_output_targets = structured_output_targets
         # ``config`` carries the project-level QC sampling policy and the
         # max-rounds setting. When omitted (callers that predate the lift, or
         # tests that only care about the per-task flow), fall back to defaults.
@@ -349,17 +357,20 @@ class SubagentRuntime:
             annotation_user_prompt = (
                 conventions_block + "\n\n" + annotation_user_prompt
             )
+        _ann_output_schema = resolve_output_schema(task, self.store)
         annotation_result = await self._generate_async(
             stage_target,
             LLMGenerateRequest(
                 instructions=_annotation_instructions(
                     task,
                     guideline=guideline,
-                    output_schema=resolve_output_schema(task, self.store),
+                    output_schema=_ann_output_schema,
                 ),
                 prompt=annotation_user_prompt,
                 continuity_handle=continuation_handle,
-                response_format={"type": "json_object"},
+                response_format=self._build_response_format(
+                    stage_target, stage="annotation", output_schema=_ann_output_schema
+                ),
                 task_id=task.task_id,
             ),
         )
@@ -707,13 +718,17 @@ class SubagentRuntime:
         guideline = self._load_guideline(task)
         qc_attempt_id = self._next_attempt_id(task)
         qc_started_at = utc_now()
+        qc_user_prompt = self._qc_prompt(task, annotation_artifact)
+        conventions_block = self._build_conventions_block(task)
+        if conventions_block:
+            qc_user_prompt = conventions_block + "\n\n" + qc_user_prompt
         qc_result = await self._generate_async(
             "qc",
             LLMGenerateRequest(
                 instructions=self._qc_instructions(task, guideline=guideline),
-                prompt=self._qc_prompt(task, annotation_artifact),
+                prompt=qc_user_prompt,
                 continuity_handle=self._read_pinned_handle(task, "qc_continuity_handle", "qc"),
-                response_format={"type": "json_object"},
+                response_format=self._build_response_format("qc", stage="qc"),
                 task_id=task.task_id,
             ),
         )
@@ -1303,24 +1318,29 @@ class SubagentRuntime:
             rows.sort(key=lambda r: r.get("row_index", 0) if isinstance(r, dict) else 0)
 
     def _emit_enum_coerce_alert(
-        self, task: Task, dropped: dict[str, int]
+        self,
+        task: Task,
+        dropped: dict[str, int],
+        rescued: dict[str, int] | None = None,
     ) -> None:
-        """Append a structured row to alerts.jsonl when the arbiter
-        invented entity / structure types that had to be dropped before
-        schema validation. Helps build a corpus of frequently-hallucinated
-        types so we can either teach the model not to invent them or
-        promote a heavily-used invention to the real enum.
+        """Append a structured row to alerts.jsonl when the arbiter put
+        valid types in the wrong field (rescued) or invented non-schema
+        types (dropped). Helps track cross-field confusion and hallucination
+        rates so we can tune prompts or promote heavily-used types.
 
         Not deduped by cooldown — these are per-task data points that
         matter for the rolling-up dashboard, not floods.
         """
         from annotation_pipeline_skill.runtime.alerts import append_alert
-        append_alert(self.store.root, {
+        entry: dict = {
             "ts": utc_now().isoformat(),
             "kind": "arbiter_enum_coerce",
             "task_id": task.task_id,
             "dropped": dropped,
-        })
+        }
+        if rescued:
+            entry["rescued"] = rescued
+        append_alert(self.store.root, entry)
 
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         try:
@@ -1364,6 +1384,35 @@ class SubagentRuntime:
         will retry without it.
         """
         return self._profile_name_cache.get(target)
+
+    def _build_response_format(
+        self,
+        target: str,
+        *,
+        stage: str,
+        output_schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return the appropriate response_format for a generate call.
+
+        When the target profile has structured_output enabled, builds a
+        strict json_schema payload for the given stage. Falls back to
+        json_object (forces valid JSON, no structural enforcement) otherwise.
+        """
+        if target not in self._structured_output_targets:
+            return {"type": "json_object"}
+        if stage == "annotation" and output_schema:
+            return make_json_schema_response_format(
+                build_annotation_strict_schema(output_schema), name="annotation"
+            )
+        if stage == "qc":
+            return make_json_schema_response_format(
+                build_qc_strict_schema(), name="qc_decision"
+            )
+        if stage == "arbiter" and output_schema:
+            return make_json_schema_response_format(
+                build_arbiter_strict_schema(output_schema), name="arbiter_decision"
+            )
+        return {"type": "json_object"}
 
     def _read_pinned_handle(self, task: Task, key: str, target: str) -> str | None:
         """Return ``task.metadata[key]`` only if it was minted by the SAME
@@ -1821,10 +1870,13 @@ class SubagentRuntime:
             schema_resolved = resolve_output_schema(task, self.store)
         except Exception:  # noqa: BLE001
             schema_resolved = None
-        dropped = _coerce_to_enum_in_place(corrected, schema_resolved)
-        if dropped:
-            arb.setdefault("enum_coerce_dropped", {}).update(dropped)
-            self._emit_enum_coerce_alert(task, dropped)
+        dropped, rescued = _coerce_to_enum_in_place(corrected, schema_resolved)
+        if dropped or rescued:
+            if dropped:
+                arb.setdefault("enum_coerce_dropped", {}).update(dropped)
+            if rescued:
+                arb.setdefault("enum_coerce_rescued", {}).update(rescued)
+            self._emit_enum_coerce_alert(task, dropped, rescued)
         # Schema check the corrected annotation up front. If it fails we punt
         # back to HR rather than save a bad artifact.
         try:
@@ -2732,9 +2784,15 @@ class SubagentRuntime:
             '  "verdicts": [{"feedback_id", "verdict", "confidence", "reasoning"}, ...],\n'
             '  "corrected_annotation": <full corrected annotation object> | null\n'
             "}\n"
-            "`corrected_annotation` is a TOP-LEVEL REQUIRED key. Always present. Either an object "
-            "matching current_annotation's shape, or literally null. Do not omit the field.\n\n"
-            "For EACH disputed feedback choose exactly one verdict:\n"
+            "`corrected_annotation` is a TOP-LEVEL key. "
+            + (
+                "OMIT IT ENTIRELY (do not output null) when ALL verdicts are 'annotator'. "
+                "Include it as an object when ANY verdict is 'qc' or 'neither'.\n\n"
+                if target_name in self._structured_output_targets else
+                "Always present. Either an object matching current_annotation's shape, or literally null. "
+                "Do not omit the field.\n\n"
+            )
+            + "For EACH disputed feedback choose exactly one verdict:\n"
             "  - 'annotator': the annotator's current annotation IS correct on this item; QC is wrong.\n"
             "  - 'qc':        QC's complaint IS correct; the annotation has the defect QC describes — "
             "YOU MUST APPLY QC's REQUESTED FIX in corrected_annotation. (Add the missing entity, "
@@ -2771,18 +2829,18 @@ class SubagentRuntime:
             "Preserve fields the annotator already had right WITHIN the rows you do change; "
             "only modify what your verdicts say needs changing.\n\n"
             "SELF-CHECK TOOL (MANDATORY when producing a corrected_annotation): when "
-            "`mcp__annotation-validator__check_annotation_draft` is in your tools list, you MUST "
+            "`check_annotation_draft` is in your tools list, you MUST "
             "validate your correction BEFORE submitting. The pipeline runs the same mechanical "
             "checks post-submit and rejects non-clean corrections, burning a full arbiter call. "
             "Self-check fixes the issue in this session.\n"
             "  Workflow:\n"
             "    1. Build the FULL merged annotation: start from current_annotation (which includes "
             "       unchanged rows via the SLIM-PROMPT contract — fetch them with "
-            "       `mcp__annotation-validator__lookup_row_text` if you need to verify a row's text). "
+            "       `lookup_row_text` if you need to verify a row's text). "
             "       Apply your changes on top to get a full {rows: [...]} payload covering every "
             "       source row. (Note: your final corrected_annotation in the answer still follows the "
             "       slim contract — only changed rows. But run the validator on the merged full draft.)\n"
-            "    2. Call `mcp__annotation-validator__check_annotation_draft` with "
+            "    2. Call `check_annotation_draft` with "
             "       `{task_id: <task_id>, payload: <merged full draft>}`.\n"
             "    3. If ok=true → submit your final JSON (slim corrected_annotation in the actual answer).\n"
             "    4. If violations are non-empty, identify which ones are in YOUR changed rows vs "
@@ -2966,7 +3024,9 @@ class SubagentRuntime:
                     instructions=attempt_instructions,
                     prompt=prompt,
                     continuity_handle=None,
-                    response_format={"type": "json_object"},
+                    response_format=self._build_response_format(
+                        target_name, stage="arbiter", output_schema=output_schema
+                    ),
                     task_id=task.task_id,
                 ))
             except Exception as exc:  # noqa: BLE001
@@ -3005,7 +3065,9 @@ class SubagentRuntime:
                             instructions=attempt_instructions,
                             prompt=prompt,
                             continuity_handle=None,
-                            response_format={"type": "json_object"},
+                            response_format=self._build_response_format(
+                                "fallback", stage="arbiter", output_schema=output_schema
+                            ),
                             task_id=task.task_id,
                         ))
                         # fallback succeeded — continue to JSON parse step
@@ -3192,7 +3254,6 @@ class SubagentRuntime:
             task,
             resolved_policy=self._resolved_qc_policy(task),
             guideline=guideline,
-            conventions_block=self._build_conventions_block(task),
         )
 
     def _build_conventions_block(self, task: Task) -> str | None:
@@ -3293,18 +3354,18 @@ class SubagentRuntime:
 
 _ANNOTATION_VALIDATOR_SUFFIX = (
     "SELF-CHECK TOOL (MANDATORY BEFORE SUBMIT): when "
-    "`mcp__annotation-validator__check_annotation_draft` is in your tools list, you MUST call it on "
+    "`check_annotation_draft` is in your tools list, you MUST call it on "
     "your draft BEFORE you emit your final JSON answer. The pipeline runs the same mechanical checks "
     "after you submit and will REJECT non-clean drafts, costing a full re-annotation. Self-check "
     "lets you fix issues in this session.\n"
     "  Workflow:\n"
     "    1. Build your full draft `{rows: [...]}` payload (all source rows, not a subset).\n"
-    "    2. Call `mcp__annotation-validator__check_annotation_draft` with "
+    "    2. Call `check_annotation_draft` with "
     "       `{task_id: <task_id from prompt input>, payload: <your draft>}`.\n"
     "    3. If `ok=true` and `violations={}`, emit your final JSON. Done.\n"
     "    4. If violations are non-empty, fix each one in your draft. For verbatim_violations: "
     "       the offending span is not a byte-for-byte substring of the row's input.text. Use "
-    "       `mcp__annotation-validator__lookup_row_text` with `{task_id, row_index}` to read the "
+    "       `lookup_row_text` with `{task_id, row_index}` to read the "
     "       original text and re-extract the correct verbatim substring (no character substitution, "
     "       no normalization). For row_coverage_missing: add the missing rows with at least empty "
     "       `{entities: {}, json_structures: {}}` outputs. For cross_type_collisions: pick ONE type "
@@ -3408,7 +3469,7 @@ def _annotation_instructions(
         "  stance:      str, optional — for human readability only. The label drives the decision.\n"
         "Omit discussion_replies on a first attempt with no prior feedback. Never set consensus yourself."
         "\n\n"
-        "KNOWLEDGE BASE TOOL: when the `mcp__annotation-kb__check_past_experience` tool appears in your "
+        "KNOWLEDGE BASE TOOL: when the `check_past_experience` tool appears in your "
         "tools list, the project has an accumulated annotation history you can consult before guessing. "
         "Call it for any candidate entity/phrase whose type is genuinely ambiguous in this row — typically: "
         "named-entity spans (proper nouns, products, organizations, technologies), tokens that could "
@@ -3472,7 +3533,7 @@ def _build_qc_instructions(
     *,
     resolved_policy: dict[str, Any],
     guideline: str | None = None,
-    conventions_block: str | None = None,
+    conventions_block: str | None = None,  # DEPRECATED — kept for callers that still pass it; no-op
 ) -> str:
     base = (
         "You are a QC subagent. Inspect EVERY row of the task and the latest annotation artifact end-to-end. "
@@ -3484,6 +3545,20 @@ def _build_qc_instructions(
         "DETERMINISM: scan every row exactly once. Do not sample, do not pick random rows. "
         "If you fail this task, the NEXT QC pass on the same input MUST produce the same failure list — "
         "do not surface different missing types on different passes; that creates infinite retry loops. "
+        "\n\n"
+        "ROUND DISCIPLINE: The feedback_bundle in this prompt contains all prior feedback items for this task. "
+        "If feedback_bundle.items is EMPTY, this is round 1 — scan every row exhaustively and report EVERY "
+        "defect you detect. This is your only opportunity to flag issues anywhere in the annotation. "
+        "If feedback_bundle.items is NON-EMPTY, this is a retry round. In retry rounds your failures list "
+        "is STRICTLY RESTRICTED to: "
+        "(1) rows or spans explicitly referenced by a prior feedback item where the annotator's fix is still "
+        "incorrect or introduced a new defect; and "
+        "(2) rows or spans that the annotator has visibly changed since the last round but that now contain "
+        "a new defect not present before. "
+        "Do NOT raise new failures on rows or spans that prior feedback did not cover — those regions were "
+        "scanned in round 1 and implicitly approved. If you see issues there, accept them; the round-1 "
+        "window has passed. Violating this rule causes the annotator to chase an ever-expanding target "
+        "and creates infinite retry loops. "
         "\n\n"
         "json_structures recall: for each row, scan the input text for every phrase type declared in this "
         "prompt's output_schema (jsonStructureType enum or equivalent $defs). Each phrase is a verbatim string "
@@ -3511,7 +3586,7 @@ def _build_qc_instructions(
         "changed your mind, ack it.\n"
         "(3) annotator label is LOWER than yours → keep the failure.\n"
         "\n\n"
-        "KNOWLEDGE BASE TOOL: when `mcp__annotation-kb__check_past_experience` is in your tools list, "
+        "KNOWLEDGE BASE TOOL: when `check_past_experience` is in your tools list, "
         "call it for any span where you're uncertain whether the annotator's type choice matches "
         "project convention — pass the span text as `entry`. The tool returns the established "
         "convention (if any) and example sentences from past tasks. Use the convention as the "
@@ -3524,8 +3599,6 @@ def _build_qc_instructions(
         f"Modality: {task.modality}. Requirements: {json.dumps(task.annotation_requirements, sort_keys=True)}."
     )
     parts = [base, _SHARED_SPAN_RULES]
-    if conventions_block:
-        parts.append(conventions_block)
     if guideline:
         parts.append(guideline)
     return "\n\n".join(parts)
@@ -3749,34 +3822,46 @@ def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
         return text
 
 
-def _coerce_to_enum_in_place(payload: Any, schema: Any) -> dict[str, int]:
-    """Drop entity / json_structure entries whose TYPE KEY is not in the
-    resolved output_schema enum. Returns a summary of what was dropped:
-    ``{"entities/<bad_type>": N, "json_structures/<bad_type>": M, ...}``.
+def _coerce_to_enum_in_place(
+    payload: Any, schema: Any
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Remove entity / json_structure entries whose TYPE KEY is not in the
+    resolved output_schema enum.
 
-    Arbiters (esp. gpt-5.5 + DeepSeek) occasionally invent types like
-    "attribute" or "system" that pass the model's own coherence check
-    but fail strict schema validation downstream — that fail routes the
-    whole correction to HR, including the parts the arbiter got right.
-    Coercing keeps the valid types and discards only the invented ones,
-    salvaging corrections that would otherwise be wholly rejected.
+    Returns ``(dropped, rescued)`` where:
+    - ``dropped``: types invalid in both fields, truly invented — spans lost.
+      ``{"entities/<bad_type>": N, ...}``
+    - ``rescued``: types valid in the OTHER field, misrouted — spans moved.
+      ``{"entities/<bad_type>→json_structures": N, ...}``
 
-    Safe no-op when payload doesn't conform, or when the schema can't
-    be resolved into enum sets (we leave the data alone and let the
-    strict validator make the call instead of silently passing through).
+    Arbiters occasionally put valid json_structures types (risk, goal, task…)
+    under entities and vice versa. Rather than discarding those spans, we move
+    them to the correct field so the correction is not degraded. Duplicates
+    created by the move are cleaned up by _dedupe_within_type_spans downstream.
+
+    Truly invented types (valid in neither field) are still dropped.
+
+    Safe no-op when payload doesn't conform, or when the schema can't be
+    resolved into enum sets (we leave the data alone and let the strict
+    validator make the call instead of silently passing through).
     """
     from annotation_pipeline_skill.core.schema_validation import _schema_type_enums
     if not isinstance(payload, dict):
-        return {}
+        return {}, {}
     rows = payload.get("rows")
     if not isinstance(rows, list):
-        return {}
+        return {}, {}
     entity_enum, phrase_enum = _schema_type_enums(schema)
     if not entity_enum and not phrase_enum:
         # Schema couldn't be resolved — don't coerce, let downstream
         # validation handle whatever is there.
-        return {}
+        return {}, {}
     dropped: dict[str, int] = {}
+    rescued: dict[str, int] = {}
+    other_field: dict[str, tuple[str, set[str]]] = {
+        "entities": ("json_structures", phrase_enum),
+        "json_structures": ("entities", entity_enum),
+    }
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -3790,13 +3875,25 @@ def _coerce_to_enum_in_place(payload: Any, schema: Any) -> dict[str, int]:
             field = output.get(field_key)
             if not isinstance(field, dict) or not allowed:
                 continue
+            other_key, other_allowed = other_field[field_key]
             for bad_type in [t for t in field.keys() if t not in allowed]:
                 spans = field.pop(bad_type)
-                count = len(spans) if isinstance(spans, list) else 1
-                dropped[f"{field_key}/{bad_type}"] = dropped.get(
-                    f"{field_key}/{bad_type}", 0
-                ) + count
-    return dropped
+                count = len(spans) if isinstance(spans, list) else 0
+                if other_allowed and bad_type in other_allowed and isinstance(spans, list):
+                    # Misrouted: move to the correct field.
+                    target = output.setdefault(other_key, {})
+                    if bad_type in target and isinstance(target[bad_type], list):
+                        target[bad_type].extend(spans)
+                    else:
+                        target[bad_type] = spans
+                    if count:
+                        rkey = f"{field_key}/{bad_type}→{other_key}"
+                        rescued[rkey] = rescued.get(rkey, 0) + count
+                else:
+                    if count:
+                        dkey = f"{field_key}/{bad_type}"
+                        dropped[dkey] = dropped.get(dkey, 0) + count
+    return dropped, rescued
 
 
 def _dedupe_within_type_spans(payload: Any) -> None:

@@ -1,28 +1,24 @@
-"""In-process tool registry shared by the Anthropic SDK client and the
-stdio MCP servers.
+"""Tool schemas + dispatch wiring for the Anthropic SDK client.
 
-The stdio MCP servers (validator_server, kb_server) were the original
-home for these tool schemas. The Anthropic SDK client (anthropic_sdk.py)
-calls the API directly, so it cannot rely on those subprocesses — it
-needs the schemas inline in the ``tools=`` argument and a pure-Python
-dispatcher to invoke when ``stop_reason == "tool_use"``. To prevent
-schema drift between the two transports, both consume from the
-constants and ``build_tool_registry`` defined here.
+Source of truth for every tool the annotator / QC / arbiter subagents can
+call. Schemas use the Anthropic-API shape ``{name, description, input_schema}``.
+Tool names are bare identifiers (``check_annotation_draft``) — historically
+they carried an ``mcp__<server>__<tool>`` prefix because claude CLI rewrote
+MCP tool names that way before exposing them to the model. The SDK runtime
+calls the tools directly so the prefix served no purpose; dropped.
 
-Tool name convention: when claude CLI exposes an MCP tool to its
-underlying model, it rewrites the bare tool name (``check_annotation_draft``)
-to ``mcp__<server-name>__<tool-name>`` (e.g.
-``mcp__annotation-validator__check_annotation_draft``). The annotator,
-QC, and arbiter prompts in ``runtime/subagent_cycle.py`` were written
-referencing the prefixed names. The SDK client therefore also exposes
-prefixed names — same string the prompts already tell the model to call.
+A profile's ``tools`` field is a list of group names (``"annotation-validator"``,
+``"annotation-kb"``). ``build_tool_registry`` looks up which schemas + dispatch
+callables to register for that group.
 """
 from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, NamedTuple
 
-from annotation_pipeline_skill.mcp.check_past_experience import check_past_experience
-from annotation_pipeline_skill.mcp.validator_server import (
+from annotation_pipeline_skill.llm.tools.check_past_experience import (
+    check_past_experience,
+)
+from annotation_pipeline_skill.llm.tools.validator import (
     check_annotation_draft,
     lookup_row_text,
 )
@@ -32,7 +28,7 @@ from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 # ---- Tool schemas (Anthropic-API shape: {name, description, input_schema}) ----
 
 CHECK_ANNOTATION_DRAFT_SCHEMA: dict[str, Any] = {
-    "name": "mcp__annotation-validator__check_annotation_draft",
+    "name": "check_annotation_draft",
     "description": (
         "Validate a draft annotation against the project's deterministic "
         "checks BEFORE you submit your final JSON. Returns the list of "
@@ -74,7 +70,7 @@ CHECK_ANNOTATION_DRAFT_SCHEMA: dict[str, Any] = {
 
 
 LOOKUP_ROW_TEXT_SCHEMA: dict[str, Any] = {
-    "name": "mcp__annotation-validator__lookup_row_text",
+    "name": "lookup_row_text",
     "description": (
         "Fetch the exact input.text and metadata for one row of a task. "
         "Use this when check_annotation_draft reports a verbatim "
@@ -99,7 +95,7 @@ LOOKUP_ROW_TEXT_SCHEMA: dict[str, Any] = {
 
 
 CHECK_PAST_EXPERIENCE_SCHEMA: dict[str, Any] = {
-    "name": "mcp__annotation-kb__check_past_experience",
+    "name": "check_past_experience",
     "description": (
         "Query the project's annotation history for a candidate "
         "entity/span. Returns the current convention (if any), the "
@@ -138,19 +134,15 @@ def build_tool_registry(
     *,
     store: SqliteStore | None,
     project_id: str | None,
-    mcp_server_names: set[str],
+    tool_group_names: set[str],
 ) -> dict[str, ToolEntry]:
-    """Build {prefixed_tool_name: ToolEntry} based on which MCP servers
-    the profile declared. Same shape as the stdio MCP transport so the
-    prompt text in ``subagent_cycle.py`` (which spells the tool names
-    with the ``mcp__<server>__<tool>`` prefix) keeps working unchanged.
-
-    A profile that declares no MCP servers gets an empty registry; the
+    """Build ``{tool_name: ToolEntry}`` based on the tool groups a profile
+    enabled. A profile that declares no groups gets an empty registry; the
     SDK client sends ``tools=[]`` and the model can't call any tool.
     """
     registry: dict[str, ToolEntry] = {}
 
-    if "annotation-validator" in mcp_server_names:
+    if "annotation-validator" in tool_group_names:
         if store is None:
             raise ValueError(
                 "annotation-validator tools require a store; "
@@ -172,7 +164,7 @@ def build_tool_registry(
             dispatch=_lookup_row,
         )
 
-    if "annotation-kb" in mcp_server_names:
+    if "annotation-kb" in tool_group_names:
         if store is None or not project_id:
             raise ValueError(
                 "annotation-kb tools require a store and project_id; "

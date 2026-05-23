@@ -679,9 +679,16 @@ class LocalCLIClient:
             # oauth_mode=True the credentials file has been written to the
             # isolated home; skip --bare so claude reads it natively and
             # sends the token as Authorization: Bearer (not x-api-key).
-            mcp_servers = self.profile.mcp_servers or []
+            tool_groups = self.profile.tools or []
             mcp_config_path: Path | None = None
-            if mcp_servers:
+            # Only group entries that carry a stdio `command` are relevant
+            # to claude_cli; SDK-only groups (the common case post-Tier-2)
+            # have name-only and would error here without a guard.
+            stdio_groups = [
+                s for s in tool_groups
+                if isinstance(s, dict) and s.get("command")
+            ]
+            if stdio_groups:
                 # Materialize the per-invocation mcp-config.json inside the
                 # isolated home. The home is persistent across invocations
                 # (needed for session resume); this file is simply overwritten
@@ -689,7 +696,7 @@ class LocalCLIClient:
                 mcp_payload = {
                     "mcpServers": {
                         s["name"]: {"command": s["command"], "args": s["args"]}
-                        for s in mcp_servers
+                        for s in stdio_groups
                     }
                 }
                 mcp_config_path = _home / "mcp-config.json"

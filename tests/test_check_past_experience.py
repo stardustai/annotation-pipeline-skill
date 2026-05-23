@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from annotation_pipeline_skill.mcp.check_past_experience import check_past_experience
+from annotation_pipeline_skill.llm.tools.check_past_experience import check_past_experience
 from annotation_pipeline_skill.services.entity_convention_service import (
     EntityConventionService,
 )

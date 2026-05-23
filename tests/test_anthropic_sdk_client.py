@@ -38,7 +38,7 @@ def _profile(
     name: str = "qwen-probe",
     timeout_seconds: int | None = 30,
     disable_continuity: bool | None = None,
-    mcp_servers: list[dict] | None = None,
+    tools: list[dict] | None = None,
 ) -> LLMProfile:
     return LLMProfile(
         name=name,
@@ -48,7 +48,7 @@ def _profile(
         api_key="sk-fake",
         timeout_seconds=timeout_seconds,
         disable_continuity=disable_continuity,
-        mcp_servers=mcp_servers,
+        tools=tools,
     )
 
 

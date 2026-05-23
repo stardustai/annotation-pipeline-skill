@@ -13,7 +13,7 @@ import pytest
 
 from annotation_pipeline_skill.core.models import Task
 from annotation_pipeline_skill.core.states import TaskStatus
-from annotation_pipeline_skill.mcp.validator_server import (
+from annotation_pipeline_skill.llm.tools.validator import (
     check_annotation_draft,
     lookup_row_text,
 )

@@ -60,6 +60,7 @@ class AnthropicSDKClient(BaseSdkClient):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         task_id: str | None = None,
+        response_format: dict[str, Any] | None = None,  # not used; Anthropic uses tool_use
     ) -> _ApiCallResult:
         _, anthropic_messages = _openai_to_anthropic_messages(messages)
 

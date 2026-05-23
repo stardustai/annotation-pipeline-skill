@@ -49,7 +49,8 @@ class LLMProfile:
     concurrency_limit: int | None = None
     no_progress_timeout_seconds: int | None = None
     disable_continuity: bool | None = None
-    mcp_servers: list[dict] | None = None
+    structured_output: bool | None = None
+    tools: list[dict] | None = None
     strict_mcp_config: bool | None = None
     disallowed_tools: list[str] | None = None
 
@@ -101,18 +102,18 @@ def load_llm_registry(path: Path | str) -> LLMRegistry:
     if not isinstance(limits, dict):
         raise ProfileValidationError("LLM profile limits must be a mapping")
     max_concurrent_tasks = _optional_positive_int(limits.get("max_concurrent_tasks"), "limits.max_concurrent_tasks")
-    system_mcp_servers = _optional_mcp_servers(payload.get("mcp_servers"), "mcp_servers") or []
-    if system_mcp_servers:
-        # Both claude_cli and anthropic_sdk runtimes consume MCP-style
-        # tool declarations (claude_cli via --mcp-config subprocess,
-        # anthropic_sdk via the in-process tool_registry). Both must
-        # inherit the workspace-level mcp_servers list or SDK profiles
-        # would silently lose access to the KB / validator tools that
-        # the prompts already reference.
+    system_tools = _optional_tool_groups(payload.get("tools"), "tools") or []
+    if system_tools:
+        # SDK runtimes consume tool declarations via the in-process
+        # tool_registry; claude_cli used to consume them via --mcp-config
+        # stdio subprocesses (now dead code but still in dispatch).
+        # Workspace-level `tools:` is unioned into every per-profile
+        # `tools` list so SDK profiles inherit access to the KB +
+        # validator groups without YAML duplication.
         profiles = {
             name: dataclasses.replace(
                 profile,
-                mcp_servers=system_mcp_servers + (profile.mcp_servers or []),
+                tools=system_tools + (profile.tools or []),
             ) if profile.runtime in {"claude_cli", "anthropic_sdk", "openai_sdk"} else profile
             for name, profile in profiles.items()
         }
@@ -152,7 +153,8 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
         concurrency_limit=_optional_positive_int(raw.get("concurrency_limit"), f"profile {name} concurrency_limit"),
         no_progress_timeout_seconds=_optional_positive_int(raw.get("no_progress_timeout_seconds"), f"profile {name} no_progress_timeout_seconds"),
         disable_continuity=_optional_bool(raw.get("disable_continuity"), f"profile {name} disable_continuity"),
-        mcp_servers=_optional_mcp_servers(raw.get("mcp_servers"), f"profile {name} mcp_servers"),
+        structured_output=_optional_bool(raw.get("structured_output"), f"profile {name} structured_output"),
+        tools=_optional_tool_groups(raw.get("tools"), f"profile {name} tools"),
         strict_mcp_config=_optional_bool(raw.get("strict_mcp_config"), f"profile {name} strict_mcp_config"),
         disallowed_tools=_optional_string_list(raw.get("disallowed_tools"), f"profile {name} disallowed_tools"),
     )
@@ -221,7 +223,16 @@ def _optional_non_negative_int(value: object, label: str) -> int | None:
     return parsed
 
 
-def _optional_mcp_servers(value: object, label: str) -> list[dict] | None:
+def _optional_tool_groups(value: object, label: str) -> list[dict] | None:
+    """Parse the YAML `tools:` field — a list of tool-group declarations.
+
+    A group declaration is shaped like ``{name, command, args}`` for
+    backward compat with the legacy claude_cli MCP-stdio plumbing
+    (``command`` / ``args`` told the CLI how to spawn the stdio server).
+    The Anthropic SDK runtime ignores ``command`` / ``args`` and only
+    cares about ``name`` — that's the group key the in-process
+    tool_registry uses to decide which dispatchers to wire up.
+    """
     if value is None:
         return None
     if not isinstance(value, list):
@@ -231,12 +242,14 @@ def _optional_mcp_servers(value: object, label: str) -> list[dict] | None:
         if not isinstance(entry, dict):
             raise ProfileValidationError(f"{label}[{i}] must be a mapping")
         name = entry.get("name")
-        command = entry.get("command")
-        args = entry.get("args", [])
         if not isinstance(name, str) or not name.strip():
             raise ProfileValidationError(f"{label}[{i}].name must be a non-empty string")
-        if not isinstance(command, str) or not command.strip():
-            raise ProfileValidationError(f"{label}[{i}].command must be a non-empty string")
+        # command/args remain optional — only the claude_cli stdio path
+        # ever used them; SDK runtimes ignore.
+        command = entry.get("command")
+        args = entry.get("args", [])
+        if command is not None and (not isinstance(command, str) or not command.strip()):
+            raise ProfileValidationError(f"{label}[{i}].command must be a non-empty string or omitted")
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise ProfileValidationError(f"{label}[{i}].args must be a list of strings")
         out.append({"name": name, "command": command, "args": list(args)})

@@ -66,15 +66,15 @@ class BaseSdkClient(ABC):
         self.profile = profile
         self._store = store
         self._project_id = project_id
-        mcp_names = {
+        tool_group_names = {
             s.get("name", "")
-            for s in (profile.mcp_servers or [])
+            for s in (profile.tools or [])
             if isinstance(s, dict)
         }
         self._tools = build_tool_registry(
             store=store,
             project_id=project_id,
-            mcp_server_names=mcp_names,
+            tool_group_names=tool_group_names,
         )
         self._tool_schemas = [entry.schema for entry in self._tools.values()]
 
@@ -116,6 +116,7 @@ class BaseSdkClient(ABC):
                 messages=messages,
                 tools=self._tool_schemas,
                 task_id=request.task_id,
+                response_format=request.response_format,
             )
             _add_usage(usage_acc, result.usage)
             messages.append(result.assistant_message)
@@ -278,6 +279,7 @@ class BaseSdkClient(ABC):
         messages: list[dict[str, Any]],  # OpenAI Chat Completions format
         tools: list[dict[str, Any]],     # Anthropic registry format (input_schema)
         task_id: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> _ApiCallResult: ...
 
 
