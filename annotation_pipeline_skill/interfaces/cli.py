@@ -117,7 +117,7 @@ runtime:
 """,
     "llm_profiles.yaml": """profiles:
   local_claude:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: claude-sonnet-4-6
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
@@ -1753,10 +1753,9 @@ def _build_runtime_scheduler(
     # `client_factory` is still supplied as a no-op default so the legacy
     # call signature stays valid (it's never invoked in this mode).
     #
-    # store / project_id are threaded into the builder so anthropic_sdk
-    # profiles can dispatch in-process MCP tools (validator + KB). The
-    # claude_cli / codex_cli paths ignore both kwargs — their MCP tools
-    # spawn stdio subprocesses with their own --project-root args.
+    # store / project_id are threaded into the builder so SDK profiles
+    # (anthropic_sdk, openai_sdk) can dispatch in-process tools
+    # (validator + KB). codex_cli ignores both kwargs.
     project_id = context.project_root.name
 
     def _build_client(profile):

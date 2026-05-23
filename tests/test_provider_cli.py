@@ -58,11 +58,11 @@ def test_provider_targets_exposes_ui_relevant_profile_fields(tmp_path, capsys):
         "base_url": "https://api.anthropic.com",
         "model": "claude-sonnet-4-6",
         "profile": "local_claude",
-        "runtime": "claude_cli",
+        "runtime": "anthropic_sdk",
     }
     assert payload["qc"] == {
         "base_url": "https://api.anthropic.com",
         "model": "claude-sonnet-4-6",
         "profile": "local_claude",
-        "runtime": "claude_cli",
+        "runtime": "anthropic_sdk",
     }

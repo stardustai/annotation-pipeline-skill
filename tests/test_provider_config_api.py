@@ -17,7 +17,7 @@ profiles:
     base_url: https://api.example.com/codex
     api_key_env: CODEX_API_KEY
   missing_api:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: deepseek-chat
     api_key_env: DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com
@@ -44,11 +44,15 @@ limits:
     assert payload["targets"] == {"annotation": "local_python", "qc": "missing_api"}
     assert payload["limits"] == {"max_concurrent_tasks": 2}
     assert payload["profiles"][0]["name"] == "local_python"
-    assert payload["profiles"][1]["runtime"] == "claude_cli"
+    assert payload["profiles"][1]["runtime"] == "anthropic_sdk"
     assert payload["diagnostics"]["local_python"]["status"] in ("ok", "error")
     assert payload["diagnostics"]["missing_api"]["status"] in ("ok", "error")
-    assert payload["diagnostics"]["missing_api"]["checks"][2]["id"] == "api_key_env_present"
-    assert payload["diagnostics"]["missing_api"]["checks"][2]["status"] == "ok"
+    # SDK runtimes no longer shell out to a binary, so cli_binary_found is
+    # skipped. Checks list is: [base_url_configured, api_key_env_present].
+    check_ids = [c["id"] for c in payload["diagnostics"]["missing_api"]["checks"]]
+    assert "api_key_env_present" in check_ids
+    api_key_check = next(c for c in payload["diagnostics"]["missing_api"]["checks"] if c["id"] == "api_key_env_present")
+    assert api_key_check["status"] == "ok"
 
 
 def test_provider_config_api_saves_structured_provider_configuration(tmp_path):
@@ -76,7 +80,7 @@ def test_provider_config_api_saves_structured_provider_configuration(tmp_path):
                     },
                     {
                         "name": "deepseek_default",
-                        "runtime": "claude_cli",
+                        "runtime": "anthropic_sdk",
                         "model": "deepseek-chat",
                         "api_key_env": "DEEPSEEK_API_KEY",
                         "base_url": "https://api.deepseek.com",
@@ -182,7 +186,7 @@ def test_provider_config_api_persists_inline_api_key_to_yaml(tmp_path):
                 "profiles": [
                     {
                         "name": "deepseek_inline",
-                        "runtime": "claude_cli",
+                        "runtime": "anthropic_sdk",
                         "model": "deepseek-chat",
                         "api_key": "sk-secret-abc123",
                         "api_key_env": "DEEPSEEK_API_KEY",
@@ -208,7 +212,7 @@ def test_provider_config_api_get_masks_api_key_as_set_flag(tmp_path):
         """
 profiles:
   deepseek_inline:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: deepseek-chat
     api_key: sk-secret-abc123
     api_key_env: DEEPSEEK_API_KEY
@@ -242,7 +246,7 @@ def test_provider_config_api_save_preserves_existing_api_key_when_blank(tmp_path
         """
 profiles:
   deepseek_inline:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: deepseek-chat
     api_key: sk-existing-xyz
     api_key_env: DEEPSEEK_API_KEY
@@ -262,7 +266,7 @@ targets:
     for api_key_value in (None, ""):
         profile_payload = {
             "name": "deepseek_inline",
-            "runtime": "claude_cli",
+            "runtime": "anthropic_sdk",
             "model": "deepseek-chat",
             "api_key_env": "DEEPSEEK_API_KEY",
             "base_url": "https://api.deepseek.com",
@@ -292,7 +296,7 @@ def test_provider_config_api_save_overwrites_api_key_when_provided(tmp_path):
         """
 profiles:
   deepseek_inline:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: deepseek-chat
     api_key: sk-old-key
     api_key_env: DEEPSEEK_API_KEY
@@ -314,7 +318,7 @@ targets:
                 "profiles": [
                     {
                         "name": "deepseek_inline",
-                        "runtime": "claude_cli",
+                        "runtime": "anthropic_sdk",
                         "model": "deepseek-chat",
                         "api_key": "sk-new-key",
                         "api_key_env": "DEEPSEEK_API_KEY",

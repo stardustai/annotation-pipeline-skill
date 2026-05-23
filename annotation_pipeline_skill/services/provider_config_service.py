@@ -24,7 +24,6 @@ PROFILE_FIELDS = (
     "api_key",
     "base_url",
     "reasoning_effort",
-    "permission_mode",
     "timeout_seconds",
     "max_retries",
     "concurrency_limit",
@@ -171,7 +170,6 @@ def _profile_to_dict(profile: LLMProfile) -> dict[str, Any]:
         "api_key_env": profile.api_key_env,
         "api_key_set": bool(profile.api_key),
         "reasoning_effort": profile.reasoning_effort,
-        "permission_mode": profile.permission_mode,
         "timeout_seconds": profile.timeout_seconds,
         "max_retries": profile.max_retries,
         "concurrency_limit": profile.concurrency_limit,
@@ -181,20 +179,24 @@ def _profile_to_dict(profile: LLMProfile) -> dict[str, Any]:
 
 
 def _profile_diagnostics(profile: LLMProfile, *, env: Mapping[str, str]) -> dict[str, Any]:
-    binary = "claude" if profile.runtime == "claude_cli" else "codex"
-    found = _cli_binary_found(binary)
-    checks = [
-        {
+    # codex_cli is the only remaining runtime that shells out to a binary.
+    # SDK runtimes (anthropic_sdk, openai_sdk) talk HTTP from Python; the
+    # legacy cli_binary_found check just returns ok for them since there's
+    # nothing to look up on PATH.
+    binary = "codex" if profile.runtime == "codex_cli" else None
+    checks: list[dict[str, Any]] = []
+    if binary is not None:
+        found = _cli_binary_found(binary)
+        checks.append({
             "id": "cli_binary_found",
             "status": "ok" if found else "error",
             "message": f"{binary} is available" if found else f"{binary} was not found on PATH",
-        },
-        {
-            "id": "base_url_configured",
-            "status": "ok",
-            "message": f"{profile.base_url} configured",
-        },
-    ]
+        })
+    checks.append({
+        "id": "base_url_configured",
+        "status": "ok",
+        "message": f"{profile.base_url} configured",
+    })
     key_present = bool(profile.api_key) or bool(profile.resolve_api_key(env))
     if profile.api_key_env is None:
         env_label = None

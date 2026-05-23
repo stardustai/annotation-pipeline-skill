@@ -9,7 +9,7 @@ from typing import Literal, Mapping
 import yaml
 
 
-Runtime = Literal["claude_cli", "codex_cli", "anthropic_sdk", "openai_sdk"]
+Runtime = Literal["codex_cli", "anthropic_sdk", "openai_sdk"]
 
 LLM_PROFILES_FILENAME = "llm_profiles.yaml"
 
@@ -43,7 +43,6 @@ class LLMProfile:
     api_key_env: str | list[str] | None = None
     api_key: str | None = None
     reasoning_effort: str | None = None
-    permission_mode: str | None = None
     timeout_seconds: int | None = None
     max_retries: int | None = None
     concurrency_limit: int | None = None
@@ -51,8 +50,6 @@ class LLMProfile:
     disable_continuity: bool | None = None
     structured_output: bool | None = None
     tools: list[dict] | None = None
-    strict_mcp_config: bool | None = None
-    disallowed_tools: list[str] | None = None
 
     def resolve_api_key(self, env: Mapping[str, str] = os.environ) -> str:
         if self.api_key:
@@ -105,16 +102,16 @@ def load_llm_registry(path: Path | str) -> LLMRegistry:
     system_tools = _optional_tool_groups(payload.get("tools"), "tools") or []
     if system_tools:
         # SDK runtimes consume tool declarations via the in-process
-        # tool_registry; claude_cli used to consume them via --mcp-config
-        # stdio subprocesses (now dead code but still in dispatch).
-        # Workspace-level `tools:` is unioned into every per-profile
-        # `tools` list so SDK profiles inherit access to the KB +
-        # validator groups without YAML duplication.
+        # tool_registry. Workspace-level `tools:` is unioned into every
+        # per-profile `tools` list so SDK profiles inherit access to the
+        # KB + validator groups without YAML duplication. codex_cli does
+        # not have in-process tool dispatch yet, so this propagation
+        # skips it.
         profiles = {
             name: dataclasses.replace(
                 profile,
                 tools=system_tools + (profile.tools or []),
-            ) if profile.runtime in {"claude_cli", "anthropic_sdk", "openai_sdk"} else profile
+            ) if profile.runtime in {"anthropic_sdk", "openai_sdk"} else profile
             for name, profile in profiles.items()
         }
     registry = LLMRegistry(
@@ -131,9 +128,9 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
     if not isinstance(raw, dict):
         raise ProfileValidationError(f"LLM profile must be a mapping: {name}")
     runtime = raw.get("runtime")
-    if runtime not in {"claude_cli", "codex_cli", "anthropic_sdk", "openai_sdk"}:
+    if runtime not in {"codex_cli", "anthropic_sdk", "openai_sdk"}:
         raise ProfileValidationError(
-            f"profile {name} runtime must be 'claude_cli', 'codex_cli', 'anthropic_sdk', "
+            f"profile {name} runtime must be 'codex_cli', 'anthropic_sdk', "
             f"or 'openai_sdk', got: {runtime!r}"
         )
     model = _required_string(raw.get("model"), f"profile {name} model")
@@ -147,7 +144,6 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
         api_key_env=api_key_env,
         api_key=_optional_string(raw.get("api_key"), f"profile {name} api_key"),
         reasoning_effort=_optional_string(raw.get("reasoning_effort"), f"profile {name} reasoning_effort"),
-        permission_mode=_optional_string(raw.get("permission_mode"), f"profile {name} permission_mode"),
         timeout_seconds=_optional_positive_int(raw.get("timeout_seconds"), f"profile {name} timeout_seconds"),
         max_retries=_optional_non_negative_int(raw.get("max_retries"), f"profile {name} max_retries"),
         concurrency_limit=_optional_positive_int(raw.get("concurrency_limit"), f"profile {name} concurrency_limit"),
@@ -155,8 +151,6 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
         disable_continuity=_optional_bool(raw.get("disable_continuity"), f"profile {name} disable_continuity"),
         structured_output=_optional_bool(raw.get("structured_output"), f"profile {name} structured_output"),
         tools=_optional_tool_groups(raw.get("tools"), f"profile {name} tools"),
-        strict_mcp_config=_optional_bool(raw.get("strict_mcp_config"), f"profile {name} strict_mcp_config"),
-        disallowed_tools=_optional_string_list(raw.get("disallowed_tools"), f"profile {name} disallowed_tools"),
     )
 
 
@@ -224,14 +218,11 @@ def _optional_non_negative_int(value: object, label: str) -> int | None:
 
 
 def _optional_tool_groups(value: object, label: str) -> list[dict] | None:
-    """Parse the YAML `tools:` field — a list of tool-group declarations.
+    """Parse the YAML `tools:` field — a list of tool-group names.
 
-    A group declaration is shaped like ``{name, command, args}`` for
-    backward compat with the legacy claude_cli MCP-stdio plumbing
-    (``command`` / ``args`` told the CLI how to spawn the stdio server).
-    The Anthropic SDK runtime ignores ``command`` / ``args`` and only
-    cares about ``name`` — that's the group key the in-process
-    tool_registry uses to decide which dispatchers to wire up.
+    A group declaration is shaped ``{name: str}``. SDK runtimes look the
+    name up in ``annotation_pipeline_skill.llm.tool_registry`` to find
+    the schema + dispatch wiring.
     """
     if value is None:
         return None
@@ -244,21 +235,5 @@ def _optional_tool_groups(value: object, label: str) -> list[dict] | None:
         name = entry.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ProfileValidationError(f"{label}[{i}].name must be a non-empty string")
-        # command/args remain optional — only the claude_cli stdio path
-        # ever used them; SDK runtimes ignore.
-        command = entry.get("command")
-        args = entry.get("args", [])
-        if command is not None and (not isinstance(command, str) or not command.strip()):
-            raise ProfileValidationError(f"{label}[{i}].command must be a non-empty string or omitted")
-        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-            raise ProfileValidationError(f"{label}[{i}].args must be a list of strings")
-        out.append({"name": name, "command": command, "args": list(args)})
+        out.append({"name": name})
     return out
-
-
-def _optional_string_list(value: object, label: str) -> list[str] | None:
-    if value is None:
-        return None
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise ProfileValidationError(f"{label} must be a list of strings")
-    return list(value)

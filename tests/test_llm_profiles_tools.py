@@ -17,35 +17,30 @@ def _write_yaml(tmp: Path, body: str) -> Path:
 def test_profile_parses_tools(tmp_path):
     path = _write_yaml(tmp_path, """
 profiles:
-  annotator_claude_kb:
-    runtime: claude_cli
+  annotator_kb:
+    runtime: anthropic_sdk
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
     tools:
       - name: annotation-kb
-        command: python
-        args: ["-m", "annotation_pipeline_skill.llm.tools.check_past_experience"]
-    strict_mcp_config: true
-    disallowed_tools: ["Bash", "Edit", "Write"]
+      - name: annotation-validator
 targets:
-  annotator: annotator_claude_kb
+  annotator: annotator_kb
 """)
     reg = load_llm_registry(path)
-    profile = reg.profiles["annotator_claude_kb"]
+    profile = reg.profiles["annotator_kb"]
     assert profile.tools == [
-        {"name": "annotation-kb", "command": "python",
-         "args": ["-m", "annotation_pipeline_skill.llm.tools.check_past_experience"]}
+        {"name": "annotation-kb"},
+        {"name": "annotation-validator"},
     ]
-    assert profile.strict_mcp_config is True
-    assert profile.disallowed_tools == ["Bash", "Edit", "Write"]
 
 
 def test_profile_tool_fields_optional(tmp_path):
     path = _write_yaml(tmp_path, """
 profiles:
   classic:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
@@ -55,15 +50,13 @@ targets:
     reg = load_llm_registry(path)
     p = reg.profiles["classic"]
     assert p.tools is None
-    assert p.strict_mcp_config is None
-    assert p.disallowed_tools is None
 
 
 def test_profile_rejects_malformed_tools(tmp_path):
     path = _write_yaml(tmp_path, """
 profiles:
   bad:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
@@ -76,32 +69,16 @@ targets:
 
 
 def test_profile_rejects_tool_group_missing_required_keys(tmp_path):
+    """Each tool group entry must carry a `name` key."""
     path = _write_yaml(tmp_path, """
 profiles:
   bad:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: sonnet
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
     tools:
-      - command: python
-        args: ["-m", "annotation_pipeline_skill.llm.tools.check_past_experience"]
-targets:
-  annotator: bad
-""")
-    with pytest.raises(ProfileValidationError):
-        load_llm_registry(path)
-
-
-def test_profile_rejects_disallowed_tools_non_list(tmp_path):
-    path = _write_yaml(tmp_path, """
-profiles:
-  bad:
-    runtime: claude_cli
-    model: sonnet
-    base_url: https://api.anthropic.com
-    api_key_env: ANTHROPIC_API_KEY
-    disallowed_tools: "Bash,Edit"
+      - description: "name missing"
 targets:
   annotator: bad
 """)

@@ -732,15 +732,14 @@ def test_cli_human_review_correct_returns_nonzero_on_schema_fail(tmp_path):
 
 
 def test_default_llm_profiles_template_covers_memory_ner_models():
-    """The init template should include a claude_cli profile."""
+    """The init template should include an anthropic_sdk profile."""
     import yaml
     from annotation_pipeline_skill.interfaces.cli import CONFIG_FILES
 
     template = yaml.safe_load(CONFIG_FILES["llm_profiles.yaml"])
     profile_models = {p["model"] for p in template["profiles"].values()}
     profile_runtimes = {p.get("runtime") for p in template["profiles"].values()}
-    # flat schema: claude_cli runtime
-    assert "claude_cli" in profile_runtimes
+    assert "anthropic_sdk" in profile_runtimes
     # claude-sonnet-4-6 is the default model
     assert "claude-sonnet-4-6" in profile_models
 

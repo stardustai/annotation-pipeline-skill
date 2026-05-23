@@ -20,13 +20,13 @@ class LLMGenerateRequest:
     # OpenAI-compatible chat-completions ``response_format`` payload — e.g.
     # ``{"type": "json_object"}`` for forced-JSON or
     # ``{"type": "json_schema", "json_schema": {...}}`` for strict schema
-    # enforcement. Currently ignored by both codex_cli and claude_cli runtimes,
-    # but preserved on the request for callers that already populate it and
+    # enforcement. Currently ignored by codex_cli; honoured by openai_sdk and
+    # (via prefill) anthropic_sdk. Preserved on the request for callers that
     # for future runtimes that may honor it.
     response_format: dict[str, Any] | None = None
     # Stable identifier (e.g. pipeline task_id) that runtimes may forward to
-    # the gateway as a sticky-routing hint. claude_cli surfaces it as the
-    # ``x-task-id`` HTTP header via ``ANTHROPIC_CUSTOM_HEADERS`` so a
+    # the gateway as a sticky-routing hint. SDK runtimes surface it as the
+    # ``x-task-id`` HTTP header and as ``metadata.user_id`` in the body so a
     # LiteLLM router can pin every retry/turn for one task to the same
     # vLLM instance, letting that instance's prefix-cache fill up across
     # the multi-turn annotation conversation.

@@ -23,7 +23,6 @@ _SAFE_ENV_KEYS = {
     "LC_ALL",
     "CODEX_HOME",
     "ANNOTATION_CODEX_HOME_ROOT",
-    "ANNOTATION_CLAUDE_HOME_ROOT",
 }
 
 
@@ -65,16 +64,6 @@ def _parse_codex_handle(handle: str | None) -> tuple[str | None, str | None]:
         home_id, thread_id = handle.split("::", 1)
         return home_id, thread_id
     return None, handle  # legacy bare thread_id
-
-
-def _parse_claude_handle(handle: str | None) -> tuple[str | None, str | None]:
-    """Split 'home_id::session_id' into components. Legacy bare session_id is
-    treated as no handle: the session file lived in the user's real ~/.claude,
-    which the isolated runtime no longer touches, so resume would orphan-fail."""
-    if not handle or "::" not in handle:
-        return None, None
-    home_id, session_id = handle.split("::", 1)
-    return home_id, session_id
 
 
 def build_codex_command(
@@ -119,80 +108,6 @@ def build_codex_command(
         command.append(thread_id)
     command.append(prompt_file.read_text(encoding="utf-8"))
     return command, prompt_file
-
-
-def build_claude_command(
-    *,
-    binary: str,
-    model: str,
-    permission_mode: str | None,
-    session_id: str | None = None,
-    mcp_config_path: Path | None = None,
-    strict_mcp_config: bool = False,
-    disallowed_tools: list[str] | None = None,
-    persist_session: bool = True,
-    no_bare: bool = False,
-) -> list[str]:
-    # --bare: never read OAuth / keychain / ~/.claude credentials. Auth is
-    # strictly ANTHROPIC_API_KEY (no token writeback can clobber real creds).
-    # Also skips hooks, auto-memory, CLAUDE.md auto-discovery, background
-    # prefetches — exactly the surface we don't want in a worker.
-    # no_bare=True is used for OAuth profiles: the credentials file has been
-    # written to the isolated home, and the claude binary must read it natively
-    # to send the token as Authorization: Bearer (x-api-key rejects OAuth tokens).
-    command = [binary, "-p"] if no_bare else [binary, "--bare", "-p"]
-    if session_id:
-        command.extend(["--resume", session_id])
-    elif not persist_session:
-        # Only suppress session persistence when the profile has explicitly
-        # disabled continuity. Previously we ALWAYS added this flag whenever
-        # session_id was None — which meant turn 1 of a continuity-enabled
-        # task generated a session_id but never wrote the session file, so
-        # turn 2's `--resume <id>` silently started a fresh session instead
-        # of replaying history. Net effect: claimed continuity was broken
-        # end-to-end and vLLM prefix-cache hit rate stayed at 0%.
-        # Documented behaviour (claude --help): "Disable session persistence
-        # - sessions will not be saved to disk and cannot be resumed."
-        command.append("--no-session-persistence")
-    command.extend([
-        "--verbose",
-        "--output-format",
-        "stream-json",
-        "--model",
-        model,
-        # Pin per-machine bits (cwd, env, git status, memory paths) out of
-        # the system prompt and into the first user message. claude's
-        # default system prompt embeds those sections inline, which means
-        # every call from the same worker has a slightly different system
-        # prompt and vLLM's prefix cache misses on byte 1. claude
-        # documents this flag specifically for "cross-user prompt-cache
-        # reuse" (per --help). For our workload it also gives "cross-call
-        # prompt-cache reuse" on the same worker.
-        "--exclude-dynamic-system-prompt-sections",
-    ])
-    # Default to bypassPermissions when the profile doesn't specify a mode:
-    # --bare -p auto-approves built-in tools (Bash/Read/etc.) but MCP tools
-    # still go through the default "prompt for each call" gate, which blocks
-    # every tool_use the agent makes with "Claude requested permissions ...
-    # but you haven't granted it yet." Workers can't answer prompts. The
-    # historical workers all ran under bypassPermissions implicitly; setting
-    # it explicitly when None preserves that behaviour AND unblocks the new
-    # MCP-validator tool path. Profiles that want stricter scoping can set
-    # permission_mode explicitly.
-    command.extend(["--permission-mode", permission_mode or "bypassPermissions"])
-    if mcp_config_path is not None:
-        # `--mcp-config=PATH` (single token, equals syntax) — the space form
-        # `--mcp-config PATH` causes claude to greedily consume the trailing
-        # `-` (our stdin-prompt marker, appended below) as a second config
-        # path, producing "MCP config file not found: <cwd>/-". The equals
-        # form binds the path to the flag unambiguously.
-        command.append(f"--mcp-config={mcp_config_path}")
-        if strict_mcp_config:
-            command.append("--strict-mcp-config")
-    if disallowed_tools:
-        command.extend(["--disallowedTools", ",".join(disallowed_tools)])
-    command.append("-")
-    return command
 
 
 @contextmanager
@@ -269,135 +184,6 @@ def isolated_codex_home(
     yield isolated_env, isolated_home, home_id
 
 
-@contextmanager
-def isolated_claude_home(
-    env: Mapping[str, str],
-    *,
-    home_id: str | None,
-    provider_api_key: str | None = None,
-    provider_base_url: str | None = None,
-    user_id_override: str | None = None,
-) -> Iterator[tuple[dict[str, str], Path, str, bool]]:
-    """Per-task isolated HOME for claude workers.
-
-    When ``provider_api_key`` is a real API key (``sk-ant-api03-...``) it is
-    injected as ``ANTHROPIC_API_KEY`` and the worker runs with ``--bare``
-    (the fourth yielded value, ``oauth_mode``, is False).
-
-    OAuth fallback: when no ``provider_api_key`` is supplied AND
-    ``~/.claude/.credentials.json`` contains a ``claudeAiOauth.accessToken``
-    (Claude Code Pro / Max subscription), the credentials file is copied into
-    the isolated home and ``oauth_mode=True`` is yielded.  The caller then
-    builds the claude command *without* ``--bare`` so that the claude binary
-    reads the credentials natively and sends the OAuth token as
-    ``Authorization: Bearer`` (not ``x-api-key``, which Anthropic rejects for
-    OAuth tokens).
-
-    ``user_id_override`` (typically the pipeline ``task_id``) is written into
-    ``<HOME>/.claude.json``'s ``userID`` field BEFORE the claude subprocess
-    starts so that LiteLLM sticky-routing pins all turns of one task to one
-    upstream vLLM instance.
-    """
-    runtime_root = Path(env.get("ANNOTATION_CLAUDE_HOME_ROOT") or Path.cwd() / ".annotation-pipeline-claude-homes")
-    runtime_root.mkdir(parents=True, exist_ok=True)
-
-    if home_id:
-        isolated_home = runtime_root / home_id
-        isolated_home.mkdir(parents=True, exist_ok=True)
-    else:
-        home_id = str(uuid.uuid4())
-        isolated_home = runtime_root / home_id
-        isolated_home.mkdir(parents=True, exist_ok=True)
-
-    if user_id_override:
-        _write_claude_user_id(isolated_home, user_id_override)
-
-    isolated_env = codex_shell_environment(env)
-    isolated_env["HOME"] = str(isolated_home)
-
-    oauth_mode = False
-    if provider_api_key:
-        isolated_env["ANTHROPIC_API_KEY"] = provider_api_key
-    else:
-        # No explicit API key — try copying OAuth credentials from the real home
-        # so the claude binary can authenticate natively (Bearer, not x-api-key).
-        real_creds = _read_claude_credentials_raw(env)
-        if real_creds:
-            _write_claude_credentials(isolated_home, real_creds)
-            oauth_mode = True
-
-    if provider_base_url:
-        isolated_env["ANTHROPIC_BASE_URL"] = provider_base_url
-
-    yield isolated_env, isolated_home, home_id, oauth_mode
-
-
-def _write_claude_user_id(home: Path, user_id: str) -> None:
-    """Overwrite ``<home>/.claude.json`` 's ``userID`` field with the given
-    value, preserving any other fields claude has cached there (growth-book
-    feature flags, migration markers, etc.). claude reads this field on
-    startup and uses it as the ``device_id`` component of the body.metadata
-    .user_id JSON object it sends with every /v1/messages request — so by
-    writing task_id here we get per-task sticky-routing for free, without
-    a proxy.
-
-    Best-effort: any read/write/parse failure leaves the file as-is and the
-    next claude call falls back to its default behaviour (a stable hashed
-    device_id derived once per home). We don't want this to crash a worker
-    over a non-essential routing optimisation.
-    """
-    path = home / ".claude.json"
-    data: dict
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            data = loaded if isinstance(loaded, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            data = {}
-    else:
-        data = {}
-    if data.get("userID") == user_id:
-        return
-    data["userID"] = user_id
-    try:
-        path.write_text(json.dumps(data), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def _read_claude_credentials_raw(env: Mapping[str, str]) -> dict | None:
-    """Return the parsed contents of ``~/.claude/.credentials.json`` (from the
-    real user HOME in ``env``), or None on any read/parse error."""
-    home_str = env.get("HOME")
-    if not home_str:
-        return None
-    creds_path = Path(home_str) / ".claude" / ".credentials.json"
-    if not creds_path.exists():
-        return None
-    try:
-        data = json.loads(creds_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    # Only return if there's an actual OAuth access token present.
-    oauth = data.get("claudeAiOauth")
-    if not isinstance(oauth, dict):
-        return None
-    if not (isinstance(oauth.get("accessToken"), str) and oauth["accessToken"]):
-        return None
-    return data
-
-
-def _write_claude_credentials(home: Path, credentials: dict) -> None:
-    """Write ``credentials`` to ``<home>/.claude/.credentials.json`` so that
-    a claude worker whose HOME is ``home`` can read its OAuth token natively."""
-    claude_dir = home / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / ".credentials.json").write_text(
-        json.dumps(credentials), encoding="utf-8"
-    )
-
 
 def parse_codex_json_events(
     lines: list[str],
@@ -465,70 +251,6 @@ def parse_codex_json_events(
         diagnostics=diagnostics,
     )
 
-
-def parse_claude_stream_events(
-    lines: list[str],
-    *,
-    provider: str,
-    model: str,
-) -> LLMGenerateResult:
-    session_id: str | None = None
-    final_text_parts: list[str] = []
-    raw_events: list[dict[str, Any]] = []
-    usage: dict[str, Any] | None = None
-    error_event: dict[str, Any] | None = None
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            event = json.loads(stripped)
-        except json.JSONDecodeError:
-            final_text_parts.append(stripped)
-            continue
-        if not isinstance(event, dict):
-            continue
-        raw_events.append(event)
-        if isinstance(event.get("session_id"), str):
-            session_id = event["session_id"]
-        event_type = event.get("type")
-        if event_type == "assistant":
-            text = _claude_event_text(event)
-            if text:
-                final_text_parts.append(text)
-        event_usage = event.get("usage")
-        if event_type == "result" and isinstance(event_usage, dict):
-            usage = event_usage
-        # Provider-side errors (402 Insufficient Balance, 401 auth, 429
-        # rate limit, 5xx, etc.) come back as a terminal `result` event
-        # with `is_error: true`. The HTTP status is in `api_error_status`
-        # and the human message in `result`. Without this branch the
-        # whole event is silently dropped and upstream only sees
-        # `final_text=""` + `returncode != 0`, losing the cause.
-        if event_type == "result" and event.get("is_error"):
-            error_event = {
-                "api_error_status": event.get("api_error_status"),
-                "result_text": event.get("result"),
-                "duration_ms": event.get("duration_ms"),
-                "stop_reason": event.get("stop_reason"),
-            }
-
-    diagnostics: dict[str, Any] = {"line_count": len(lines), "event_count": len(raw_events)}
-    if error_event is not None:
-        diagnostics["error_event"] = error_event
-    return LLMGenerateResult(
-        runtime="local_cli",
-        provider=provider,
-        model=model,
-        continuity_handle=session_id,
-        final_text="\n".join(final_text_parts),
-        usage=usage,
-        raw_response=raw_events,
-        diagnostics=diagnostics,
-    )
-
-
 class LocalCLIClient:
     def __init__(
         self,
@@ -538,17 +260,16 @@ class LocalCLIClient:
         project_id: str | None = None,
     ) -> None:
         self.profile = profile
-        # SDK runtime needs the store + project_id at construction (the
-        # in-process tool dispatcher binds to them). claude_cli /
-        # codex_cli paths ignore these — their MCP tools spawn stdio
-        # subprocesses with their own --project-root args.
+        # SDK runtimes need the store + project_id at construction (the
+        # in-process tool dispatcher binds to them). codex_cli ignores
+        # them — it has no in-process tool layer.
         self._store = store
         self._project_id = project_id
         self._anthropic_impl: object | None = None
         self._openai_impl: object | None = None
         if profile.runtime == "anthropic_sdk":
             # Lazy import keeps the anthropic package optional for
-            # workers that only run claude_cli / codex_cli profiles.
+            # workers that only run codex_cli profiles.
             from annotation_pipeline_skill.llm.anthropic_sdk import (
                 AnthropicSDKClient,
             )
@@ -570,8 +291,6 @@ class LocalCLIClient:
             return await self._openai_impl.generate(request)
         if self.profile.runtime == "codex_cli":
             return await self._generate_codex(request)
-        if self.profile.runtime == "claude_cli":
-            return await self._generate_claude(request)
         raise ValueError(f"unsupported runtime: {self.profile.runtime}")
 
     async def _generate_codex(self, request: LLMGenerateRequest) -> LLMGenerateResult:
@@ -645,114 +364,6 @@ class LocalCLIClient:
         finally:
             prompt_file.unlink(missing_ok=True)
 
-    async def _generate_claude(self, request: LLMGenerateRequest) -> LLMGenerateResult:
-        handle = None if self.profile.disable_continuity else request.continuity_handle
-        home_id, session_id = _parse_claude_handle(handle)
-        api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
-        # persist_session=True for continuity-enabled profiles so turn 1 of a
-        # task actually writes its session file to disk; turn 2's --resume
-        # would otherwise miss and silently start a fresh session, breaking
-        # the entire multi-turn continuity chain.
-        persist_session = not self.profile.disable_continuity
-        prompt = request.prompt or _messages_to_prompt(request.input_items)
-        if request.instructions:
-            prompt = f"{request.instructions}\n\n{prompt}"
-        with isolated_claude_home(
-            {**os.environ, **request.env},
-            home_id=home_id,
-            provider_api_key=api_key,
-            provider_base_url=self.profile.base_url,
-            user_id_override=request.task_id,
-        ) as (env, _home, resolved_home_id, oauth_mode):
-            # Sticky-routing hint: forward task_id to the gateway so a
-            # LiteLLM router can pin every turn/retry of one task to the
-            # same vLLM instance and let prefix-cache hits accumulate.
-            # Merge with any preexisting ANTHROPIC_CUSTOM_HEADERS so we
-            # don't clobber user-supplied headers.
-            if request.task_id:
-                header_line = f"x-task-id: {request.task_id}"
-                existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
-                env["ANTHROPIC_CUSTOM_HEADERS"] = (
-                    f"{existing}\n{header_line}" if existing else header_line
-                )
-            # Build the command here where oauth_mode is known. When
-            # oauth_mode=True the credentials file has been written to the
-            # isolated home; skip --bare so claude reads it natively and
-            # sends the token as Authorization: Bearer (not x-api-key).
-            tool_groups = self.profile.tools or []
-            mcp_config_path: Path | None = None
-            # Only group entries that carry a stdio `command` are relevant
-            # to claude_cli; SDK-only groups (the common case post-Tier-2)
-            # have name-only and would error here without a guard.
-            stdio_groups = [
-                s for s in tool_groups
-                if isinstance(s, dict) and s.get("command")
-            ]
-            if stdio_groups:
-                # Materialize the per-invocation mcp-config.json inside the
-                # isolated home. The home is persistent across invocations
-                # (needed for session resume); this file is simply overwritten
-                # each call.
-                mcp_payload = {
-                    "mcpServers": {
-                        s["name"]: {"command": s["command"], "args": s["args"]}
-                        for s in stdio_groups
-                    }
-                }
-                mcp_config_path = _home / "mcp-config.json"
-                mcp_config_path.write_text(json.dumps(mcp_payload), encoding="utf-8")
-            command = build_claude_command(
-                binary="claude",
-                model=self.profile.model,
-                permission_mode=self.profile.permission_mode,
-                session_id=session_id,
-                mcp_config_path=mcp_config_path,
-                strict_mcp_config=bool(self.profile.strict_mcp_config),
-                persist_session=persist_session,
-                disallowed_tools=self.profile.disallowed_tools,
-                no_bare=oauth_mode,
-            )
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=str(request.cwd) if request.cwd else None,
-                env=env,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                preexec_fn=_die_with_parent,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(prompt.encode("utf-8")),
-                    timeout=self.profile.timeout_seconds,
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                process.kill()
-                try:
-                    await process.wait()
-                except Exception:  # noqa: BLE001
-                    pass
-                raise
-        lines = stdout.decode("utf-8", errors="replace").splitlines()
-        result = parse_claude_stream_events(lines, provider=self.profile.name, model=self.profile.model)
-        diagnostics = dict(result.diagnostics or {})
-        diagnostics["returncode"] = process.returncode
-        if stderr:
-            diagnostics["stderr"] = stderr.decode("utf-8", errors="replace")[-4000:]
-        if process.returncode != 0:
-            raise LocalCLIExecutionError("local CLI provider failed", diagnostics)
-        new_session_id = result.continuity_handle
-        new_handle = f"{resolved_home_id}::{new_session_id}" if new_session_id else None
-        return LLMGenerateResult(
-            runtime=result.runtime,
-            provider=result.provider,
-            model=result.model,
-            continuity_handle=None if self.profile.disable_continuity else new_handle,
-            final_text=result.final_text,
-            usage=result.usage,
-            raw_response=result.raw_response,
-            diagnostics=diagnostics,
-        )
 
 
 def _write_isolated_codex_config(path: Path, *, model: str, reasoning_effort: str | None) -> None:
@@ -767,22 +378,3 @@ def _messages_to_prompt(input_items: list[dict[str, Any]]) -> str:
     return "\n".join(str(item.get("content", item)) for item in input_items)
 
 
-def _claude_event_text(event: dict[str, Any]) -> str:
-    message = event.get("message")
-    if isinstance(message, dict):
-        content = message.get("content")
-    else:
-        content = event.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    texts: list[str] = []
-    for part in content:
-        if isinstance(part, dict):
-            text = part.get("text") or part.get("content")
-        else:
-            text = getattr(part, "text", None) or getattr(part, "content", None)
-        if isinstance(text, str):
-            texts.append(text)
-    return "\n".join(texts)

@@ -18,13 +18,13 @@ def test_load_flat_registry_resolves_targets(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
   ds:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: deepseek-v4-flash
     base_url: https://api.deepseek.com/anthropic
     api_key_env: DEEPSEEK_API_KEY
     timeout_seconds: 120
   glm:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: glm-5
     base_url: https://open.bigmodel.cn/api/anthropic
     api_key_env: GLM_API_KEY
@@ -33,9 +33,9 @@ targets:
   coordinator: glm
 """)
     registry = load_llm_registry(p)
-    assert registry.resolve("qc").runtime == "claude_cli"
+    assert registry.resolve("qc").runtime == "anthropic_sdk"
     assert registry.resolve("qc").model == "deepseek-v4-flash"
-    assert registry.resolve("coordinator").runtime == "claude_cli"
+    assert registry.resolve("coordinator").runtime == "anthropic_sdk"
 
 
 def test_codex_runtime_parsed(tmp_path: Path):
@@ -71,7 +71,7 @@ def test_missing_base_url_raises(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
   bad:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: gpt-4
     api_key_env: OPENAI_API_KEY
 targets:
@@ -85,7 +85,7 @@ def test_missing_api_key_env_is_allowed(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
   minimal:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: claude-sonnet-4-5
     base_url: https://api.anthropic.com
 targets:
@@ -115,7 +115,7 @@ def test_optional_fields_default_to_none(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
   minimal:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: deepseek-v4-flash
     base_url: https://api.deepseek.com/anthropic
     api_key_env: DEEPSEEK_API_KEY
@@ -124,7 +124,6 @@ targets:
 """)
     profile = load_llm_registry(p).resolve("annotation")
     assert profile.reasoning_effort is None
-    assert profile.permission_mode is None
     assert profile.timeout_seconds is None
     assert profile.max_retries is None
     assert profile.concurrency_limit is None
@@ -136,7 +135,7 @@ def test_api_key_env_accepts_list(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
   glm:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: glm-5
     base_url: https://open.bigmodel.cn/api/anthropic
     api_key_env:
@@ -154,7 +153,7 @@ def test_resolve_api_key_returns_first_non_empty(tmp_path: Path):
     p = _write_yaml(tmp_path, """
 profiles:
   p:
-    runtime: claude_cli
+    runtime: anthropic_sdk
     model: m
     base_url: https://example.com
     api_key_env:

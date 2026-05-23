@@ -162,6 +162,17 @@ class LocalRuntimeScheduler:
             )
         return self._client_builder(self._registry.resolve(target))
 
+    def _structured_output_targets(self) -> frozenset[str]:
+        """Return the set of target names whose profile has structured_output=True."""
+        if self._registry is None:
+            return frozenset()
+        return frozenset(
+            target
+            for target, profile_name in self._registry.targets.items()
+            if self._registry.profiles.get(profile_name) and
+               self._registry.profiles[profile_name].structured_output
+        )
+
     def _clear_stale_records(self) -> None:
         """Drop leases / active_runs whose heartbeat is older than the stale window.
 
@@ -409,6 +420,7 @@ class LocalRuntimeScheduler:
             client_factory=self.client_factory,
             max_qc_rounds=self.config.max_qc_rounds,
             config=self.config,
+            structured_output_targets=self._structured_output_targets(),
         )
 
         completed = 0
@@ -494,8 +506,9 @@ class LocalRuntimeScheduler:
                             raise asyncio.TimeoutError
                         if stop_wait_task in done and work_task not in done:
                             # Shutdown signaled mid-task. Cancel work and drain
-                            # — _generate_claude / _generate_codex catch
-                            # CancelledError and SIGKILL the subprocess, so the
+                            # — _generate_codex catches CancelledError and
+                            # SIGKILLs the subprocess, SDK runtimes close
+                            # their httpx connections on cancel, so the
                             # provider call dies promptly.
                             stop_signaled_mid_task = True
                             work_task.cancel()
