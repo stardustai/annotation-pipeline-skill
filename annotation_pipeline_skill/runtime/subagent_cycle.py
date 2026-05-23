@@ -1269,54 +1269,6 @@ class SubagentRuntime:
             "message": message,
         })
 
-    def _merge_unchanged_rows_into_correction(
-        self, task: Task, corrected: dict[str, Any]
-    ) -> None:
-        """Fill `corrected.rows` with the unchanged rows from the latest
-        annotation_result so the row-coverage check downstream still
-        passes after the slim-prompt diet. In-place no-op when:
-          - the arbiter already emitted ALL rows (legacy / already-full
-            correction)
-          - there is no annotation artifact to merge from
-
-        Identity is by ``row_index``. Rows the arbiter included win; the
-        rest are copied verbatim from the latest annotation_result.
-        """
-        if not isinstance(corrected, dict):
-            return
-        rows = corrected.get("rows")
-        if not isinstance(rows, list):
-            return
-        try:
-            ann_artifact = self._latest_annotation_artifact(task.task_id)
-        except Exception:  # noqa: BLE001
-            return
-        try:
-            ann_payload = self._slim_annotation_payload(ann_artifact)
-        except Exception:  # noqa: BLE001
-            return
-        ann_rows = ann_payload.get("rows", []) if isinstance(ann_payload, dict) else []
-        if not isinstance(ann_rows, list) or not ann_rows:
-            return
-        present_indexes = {
-            r.get("row_index") for r in rows
-            if isinstance(r, dict) and isinstance(r.get("row_index"), int)
-        }
-        merged_in = 0
-        for r in ann_rows:
-            if not isinstance(r, dict):
-                continue
-            ri = r.get("row_index")
-            if isinstance(ri, int) and ri not in present_indexes:
-                # Copy as-is; arbiter chose not to touch this row, so we
-                # carry forward the annotator's existing values.
-                rows.append(r)
-                present_indexes.add(ri)
-                merged_in += 1
-        if merged_in:
-            # Sort by row_index for stable artifact output.
-            rows.sort(key=lambda r: r.get("row_index", 0) if isinstance(r, dict) else 0)
-
     def _emit_enum_coerce_alert(
         self,
         task: Task,
@@ -1853,13 +1805,6 @@ class SubagentRuntime:
             validate_payload_against_task_schema,
         )
 
-        # SLIM-PROMPT MERGE: the arbiter only sees disputed rows (see the
-        # SLIM-PROMPT CONTRACT in _call_arbiter_target) so corrected_annotation
-        # may include only the rows it changed. Merge in the unchanged rows
-        # from the latest annotation_result before validation, otherwise the
-        # row-coverage check below would reject every slim-prompt response.
-        self._merge_unchanged_rows_into_correction(task, corrected)
-
         # Enum coerce: arbiters occasionally invent entity/structure types
         # (e.g. "attribute", "system") alongside legitimate ones. Strict
         # schema validation then rejects the WHOLE correction, including
@@ -1883,15 +1828,12 @@ class SubagentRuntime:
             validate_payload_against_task_schema(task, corrected, store=self.store)
         except SchemaValidationError:
             return None
-        # Use the masked task for verbatim and row-coverage checks. The arbiter
-        # prompt was built from masked_task (masked rows excluded), so the
-        # corrected_annotation won't include those rows. Checking against the
-        # full unmasked task would fail both checks for tasks with masked rows:
-        #   verbatim: merged-in masked rows might have paraphrased spans
-        #   coverage: masked row IDs absent from corrected_annotation
-        # _merge_unchanged_rows_into_correction already filled in unchanged
-        # *non-masked* rows; masked rows are intentionally absent and must be
-        # excluded from the coverage requirement.
+        # Use the masked task for verbatim and row-coverage checks. The
+        # arbiter prompt was built from masked_task (masked rows excluded),
+        # so the corrected_annotation won't include those rows. Checking
+        # against the full unmasked task would fail both checks for tasks
+        # with masked rows: masked row IDs would always be missing from
+        # the coverage requirement.
         from annotation_pipeline_skill.services.row_mask_service import (
             apply_masks_to_task as _apply_masks_to_task,
         )
@@ -1922,9 +1864,9 @@ class SubagentRuntime:
         # Row coverage — all *non-masked* source rows must appear in the
         # corrected annotation. Masked rows are excluded from the LLM prompt
         # (both annotation and arbitration), so neither the annotator nor the
-        # arbiter includes them; _merge_unchanged_rows_into_correction cannot
-        # fill them in either. Use _masked_task.source_ref to build source_ids
-        # so masked row IDs are naturally absent from the requirement.
+        # arbiter includes them. Use _masked_task.source_ref to build
+        # source_ids so masked row IDs are naturally absent from the
+        # requirement.
         try:
             source_rows = _masked_task.source_ref["payload"]["rows"]
             if isinstance(source_rows, list) and source_rows:
@@ -2812,12 +2754,12 @@ class SubagentRuntime:
             "There is no 'rejected' outcome.\n\n"
             "Shape of corrected_annotation when non-null: a {\"rows\": [{\"row_index\": int, "
             "\"row_id\": str, \"output\": {entities, json_structures}}, ...]} object.\n"
-            "SLIM-PROMPT CONTRACT: the input + current_annotation in this prompt are "
-            "FILTERED down to only the rows referenced by disputed_items (see "
-            "`_omitted_unchanged_rows` markers). Your corrected_annotation should "
-            "ONLY include the rows you actually changed; the runtime auto-merges "
-            "the unchanged rows from the latest annotation_result before validation. "
-            "Do NOT echo back unchanged rows — that wastes tokens.\n"
+            "corrected_annotation MUST include EVERY source row, in order — not just the rows "
+            "your verdicts touch. Rows you didn't change: copy the annotator's existing output "
+            "(from current_annotation) verbatim. Rows you did change: apply your fix. The pipeline "
+            "post-validates the entire payload (schema / verbatim / cross-type / trailing-punct / "
+            "row-coverage); a partial corrected_annotation will fail the row-coverage check and "
+            "burn the arbiter call.\n"
             "Entity / structure type names: use ONLY the values listed in "
             "`output_schema.entity_types[*].name` and `output_schema.json_structure_types[*].name`. "
             "Inventing types like 'attribute' or 'system' causes silent drops "
@@ -2829,25 +2771,16 @@ class SubagentRuntime:
             "Preserve fields the annotator already had right WITHIN the rows you do change; "
             "only modify what your verdicts say needs changing.\n\n"
             "SELF-CHECK TOOL (MANDATORY when producing a corrected_annotation): when "
-            "`check_annotation_draft` is in your tools list, you MUST "
-            "validate your correction BEFORE submitting. The pipeline runs the same mechanical "
-            "checks post-submit and rejects non-clean corrections, burning a full arbiter call. "
-            "Self-check fixes the issue in this session.\n"
+            "`check_annotation_draft` is in your tools list, you MUST validate your full "
+            "corrected_annotation BEFORE submitting. The pipeline runs the same mechanical "
+            "checks post-submit and rejects non-clean corrections, burning a full arbiter call.\n"
             "  Workflow:\n"
-            "    1. Build the FULL merged annotation: start from current_annotation (which includes "
-            "       unchanged rows via the SLIM-PROMPT contract — fetch them with "
-            "       `lookup_row_text` if you need to verify a row's text). "
-            "       Apply your changes on top to get a full {rows: [...]} payload covering every "
-            "       source row. (Note: your final corrected_annotation in the answer still follows the "
-            "       slim contract — only changed rows. But run the validator on the merged full draft.)\n"
+            "    1. Build the full corrected_annotation: copy current_annotation, apply your "
+            "       fixes on the disputed rows.\n"
             "    2. Call `check_annotation_draft` with "
-            "       `{task_id: <task_id>, payload: <merged full draft>}`.\n"
-            "    3. If ok=true → submit your final JSON (slim corrected_annotation in the actual answer).\n"
-            "    4. If violations are non-empty, identify which ones are in YOUR changed rows vs "
-            "       inherited from the annotator. Fix the ones in YOUR rows. If a violation is in a "
-            "       row the annotator owns and you weren't disputing, that's actionable signal: include "
-            "       that row in your corrected_annotation with the fix (use lookup_row_text for "
-            "       verbatim spans). Re-call check_annotation_draft. Loop until ok=true. Cap: 5 "
+            "       `{task_id: <task_id>, payload: <your corrected_annotation>}`.\n"
+            "    3. If ok=true → submit. If violations are non-empty, fix them in the draft "
+            "       (use `lookup_row_text` for verbatim spans if needed) and re-call. Cap: 5 "
             "       iterations.\n"
             "Return raw JSON only, no markdown fences."
         )
@@ -2876,42 +2809,37 @@ class SubagentRuntime:
         # to correct annotations for) rows the operator has masked.
         masked_task = apply_masks_to_task(self.store, task)
 
-        # SLIM PROMPT: see SLIM-PROMPT CONTRACT in the instructions block.
-        # Measured on a typical 10-row 17-dispute task: full prompt was
-        # 37.9KB, slimmed is 22.4KB (-41%) — mostly from dropping the 7
-        # unchanged rows' input.text + current_annotation entries plus
-        # collapsing the full JSON Schema down to its two enum lists.
-        # The runtime merges unchanged rows back into corrected_annotation
-        # in _apply_arbiter_correction so the row-coverage check still
-        # passes.
-        ref_rows: set[int] = set()
-        for it in items:
-            target_dict = (it.get("qc") or {}).get("target") or {}
-            ri = target_dict.get("row_index")
-            if isinstance(ri, int):
-                ref_rows.add(ri)
+        # Arbiter input: full source rows + full current_annotation. The
+        # ROW-FILTERING that earlier code did (SLIM-PROMPT CONTRACT) saved
+        # ~5K on a ~30K prompt but caused 17% of all arbitration→HR
+        # transitions in production: arbiter emitted a partial
+        # corrected_annotation, the runtime merge-filled the unchanged
+        # rows from the latest annotation, post-validation tripped on a
+        # verbatim/cross-type violation in one of the merge-filled rows
+        # that the arbiter never saw — silent mech_fail → cap=3 → HR.
+        # Net cost of slimming was >$20/day in wasted LLM calls plus
+        # ~200 tasks/day routed to manual review unnecessarily.
+        #
+        # The compact `slim_schema` and `slim_items` shapes below are
+        # kept — those compress task-agnostic and duplicate content
+        # respectively, with no analogous bug pattern.
         full_payload = masked_task.source_ref.get("payload", {}) or {}
         full_rows = full_payload.get("rows", []) if isinstance(full_payload, dict) else []
-        # Include ALL source rows so the arbiter has full text context even for
-        # feedback items that lack a target.row_index (schema errors, empty-annotation
-        # complaints, etc.). Omitting those rows caused the arbiter to mark verdicts
-        # tentative due to missing context. current_annotation is still filtered to
-        # disputed rows only.
-        slim_input = {**{k: v for k, v in full_payload.items() if k != "rows"},
-                      "rows": full_rows}
-        # Slim current_annotation analogously
-        ann_rows = current_annotation.get("rows", []) if isinstance(current_annotation, dict) else []
-        slim_ann_rows = [r for r in ann_rows
-                         if isinstance(r, dict) and r.get("row_index") in ref_rows]
-        slim_ann = {"rows": slim_ann_rows,
-                    "_omitted_unchanged_rows": max(0, len(ann_rows) - len(slim_ann_rows))}
-        # Compact schema: just the {name, desc} list per enum. Strict
-        # validation still runs server-side after merge — this is just
-        # the model-facing contract.
+        arbiter_input = {
+            **{k: v for k, v in full_payload.items() if k != "rows"},
+            "rows": full_rows,
+        }
+        arbiter_current_annotation = (
+            current_annotation if isinstance(current_annotation, dict) else {"rows": []}
+        )
+        # Compact schema: just the {name, desc} list per enum. The full
+        # JSON Schema (with its $defs / oneOf / regex constraints) is
+        # re-applied server-side at validation time; the arbiter only
+        # needs the enum lists to avoid inventing types.
         slim_schema: dict[str, Any] = {
             "_note": "corrected_annotation entity keys must be drawn from entity_types[*].name; "
-                     "json_structures keys from json_structure_types[*].name. Runtime re-validates "
-                     "the full JSON Schema after merging unchanged rows.",
+                     "json_structures keys from json_structure_types[*].name. Runtime "
+                     "re-validates the full JSON Schema after submit.",
             "entity_types": [],
             "json_structure_types": [],
         }
@@ -2932,13 +2860,13 @@ class SubagentRuntime:
                         ]
                     elif isinstance(defn.get("enum"), list):
                         slim_schema[dst_key] = [{"name": v, "desc": ""} for v in defn["enum"]]
-        # Slim disputed_items: drop annotator's disputed_points/agreed_points
-        # (duplicate qc.message + annotator.message). Also cap
-        # qc.target.errors[].message — schema_invalid feedbacks serialize
-        # the ENTIRE annotation payload into the error message as a
-        # Python repr, which undoes the row filter above and reintroduces
-        # all rows by another path. Empirical: one schema_invalid item
-        # bloated a 1-row slim_input case back from ~22KB to ~40KB.
+        # Disputed-items shaping: drop annotator's disputed_points /
+        # agreed_points (duplicates qc.message + annotator.message). Also
+        # cap qc.target.errors[].message — schema_invalid feedbacks
+        # serialize the ENTIRE annotation payload into the error message
+        # as a Python repr, which would re-bloat the prompt. Empirical:
+        # one schema_invalid item used to take a 1-row prompt from
+        # ~22KB back up to ~40KB before the cap.
         ERR_MSG_CAP = 400
         def _slim_qc(qc_dict: Any) -> Any:
             if not isinstance(qc_dict, dict):
@@ -2984,9 +2912,9 @@ class SubagentRuntime:
         prompt = json.dumps(
             {
                 "task_id": task.task_id,
-                "input": slim_input,
+                "input": arbiter_input,
                 "output_schema": slim_schema,
-                "current_annotation": slim_ann,
+                "current_annotation": arbiter_current_annotation,
                 "disputed_items": slim_items,
             },
             indent=2,
