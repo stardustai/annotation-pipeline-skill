@@ -63,7 +63,6 @@ profiles:
 targets:
   annotation: minimax_claude
   qc: deepseek_claude
-  coordinator: glm_claude
 
 limits:
   # Optional ceiling on concurrent tasks the runtime scheduler pursues.
