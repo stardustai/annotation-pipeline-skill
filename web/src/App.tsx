@@ -25,9 +25,8 @@ const DistributionPanel = lazy(() =>
 );
 import { PosteriorAuditPanel } from "./components/PosteriorAuditPanel";
 import { ProvidersPanel } from "./components/ProvidersPanel";
-import { AlertsPanel } from "./components/AlertsPanel";
 import { AlertsMarquee } from "./components/AlertsMarquee";
-import { RuntimePanel } from "./components/RuntimePanel";
+import { RuntimePanel, type RuntimeSubtab } from "./components/RuntimePanel";
 import { TaskDrawer } from "./components/TaskDrawer";
 import { countCards } from "./kanban";
 import type { KanbanSnapshot, ProjectSummary, StoreInfo, TaskCard, TaskDetail } from "./types";
@@ -42,7 +41,6 @@ type ViewMode =
   | "annotation-rules"
   | "runtime"
   | "providers"
-  | "alerts"
   | "config"
   | "events"
   | "entity-knowledge"
@@ -50,10 +48,12 @@ type ViewMode =
   | "output";
 
 // Backward-compatible aliases for old URLs that still link to the
-// since-merged standalone tabs.
+// since-merged standalone tabs. `alerts` used to be a top-level tab; it
+// now lives as a sub-tab inside Runtime, so route the old URL there.
 function canonicalizeViewMode(raw: string): ViewMode {
   if (raw === "distribution") return "statistics";
   if (raw === "schema") return "annotation-rules";
+  if (raw === "alerts") return "runtime";
   return raw as ViewMode;
 }
 
@@ -86,6 +86,13 @@ export default function App() {
   // Aliased URL ?view=schema → land directly on the Schema sub-tab.
   useEffect(() => {
     if (urlState.view === "schema") setAnnotationRulesSubtab("schema");
+  }, [urlState.view]);
+
+  // Sub-tab state for Runtime (Overview vs Alerts). Aliased URL ?view=alerts
+  // lands on the Alerts sub-tab; the AlertsMarquee onClick also jumps here.
+  const [runtimeSubtab, setRuntimeSubtab] = useState<RuntimeSubtab>("overview");
+  useEffect(() => {
+    if (urlState.view === "alerts") setRuntimeSubtab("alerts");
   }, [urlState.view]);
 
   // ── Runtime issue badge ───────────────────────────────────────────────
@@ -282,7 +289,14 @@ export default function App() {
         </div>
       </header>
 
-      <AlertsMarquee storeKey={selectedStoreKey} onClick={() => setView("alerts")} />
+      <AlertsMarquee
+        storeKey={selectedStoreKey}
+        projectId={selectedProjectId}
+        onClick={() => {
+          setRuntimeSubtab("alerts");
+          setView("runtime");
+        }}
+      />
       <DashboardStatsBar projectId={selectedProjectId} storeKey={selectedStoreKey} />
 
       <nav className="view-tabs" aria-label="Dashboard views" role="tablist">
@@ -335,16 +349,6 @@ export default function App() {
           onClick={() => setView("providers")}
         >
           Providers
-        </button>
-        <button
-          className={viewMode === "alerts" ? "view-tab selected" : "view-tab"}
-          role="tab"
-          aria-selected={viewMode === "alerts"}
-          type="button"
-          onClick={() => setView("alerts")}
-          title="Provider health alerts (auth/balance/rate-limit, etc.)"
-        >
-          Alerts
         </button>
         <button
           className={viewMode === "config" ? "view-tab selected" : "view-tab"}
@@ -405,10 +409,15 @@ export default function App() {
           }}
         />
       ) : null}
-      {viewMode === "runtime" ? <RuntimePanel storeKey={selectedStoreKey} /> : null}
+      {viewMode === "runtime" ? (
+        <RuntimePanel
+          storeKey={selectedStoreKey}
+          subtab={runtimeSubtab}
+          onSubtabChange={setRuntimeSubtab}
+        />
+      ) : null}
       {viewMode === "output" ? <OutputPanel projectId={selectedProjectId} storeKey={selectedStoreKey} storePath={stores.find((s) => s.key === selectedStoreKey)?.path ?? null} /> : null}
       {viewMode === "providers" ? <ProvidersPanel /> : null}
-      {viewMode === "alerts" ? <AlertsPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "config" ? <ConfigPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "events" ? <EventLogPanel projectId={selectedProjectId} storeKey={selectedStoreKey} /> : null}
       {viewMode === "annotation-rules" ? (

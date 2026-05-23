@@ -2474,6 +2474,326 @@ button {
   text-align: left;
 }
 
+.runtime-table th.ar,
+.runtime-table td.ar {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* ── Runtime: status banner ─────────────────────────────────────────── */
+.runtime-status-banner {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #d7e0e5;
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 12px 14px;
+}
+
+.runtime-status-pills {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.runtime-pill {
+  align-items: center;
+  background: #f4f6f8;
+  border: 1px solid #d7e0e5;
+  border-radius: 999px;
+  color: #172026;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 5px;
+  line-height: 1.2;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+.runtime-pill strong { font-weight: 600; }
+.runtime-pill small { color: #52616b; font-size: 11px; }
+
+.runtime-pill.muted {
+  background: #f4f6f8;
+  color: #52616b;
+}
+
+.runtime-pill.ok {
+  background: #e8f5ec;
+  border-color: #b6d9be;
+  color: #1d6a3a;
+}
+
+.runtime-pill.bad {
+  background: #fbe8e6;
+  border-color: #e9a8a1;
+  color: #8a2820;
+}
+
+.runtime-pill.warn {
+  background: #fff4d6;
+  border-color: #e6c875;
+  color: #6f4e00;
+}
+
+.runtime-pill-dot {
+  background: currentColor;
+  border-radius: 50%;
+  display: inline-block;
+  height: 7px;
+  width: 7px;
+}
+
+.runtime-pill-button {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.runtime-pill-button:hover {
+  filter: brightness(0.96);
+}
+
+/* ── Runtime: queue distribution bar ────────────────────────────────── */
+.runtime-queue-bar {
+  background: #ffffff;
+  border: 1px solid #d7e0e5;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.runtime-queue-bar-stack {
+  background: #eef2f5;
+  border-radius: 4px;
+  display: flex;
+  height: 18px;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.runtime-queue-bar-seg {
+  height: 100%;
+  min-width: 2px;
+  transition: width 220ms ease;
+}
+
+.runtime-queue-bar-empty {
+  color: #52616b;
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+.runtime-queue-bar-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.runtime-queue-bar-legend-item {
+  align-items: center;
+  color: #172026;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 5px;
+}
+
+.runtime-queue-bar-legend-item.zero {
+  color: #9aa6ad;
+}
+
+.runtime-queue-bar-legend-item strong {
+  font-weight: 600;
+}
+
+.runtime-queue-bar-key {
+  color: #52616b;
+}
+
+.runtime-queue-bar-swatch {
+  border-radius: 2px;
+  display: inline-block;
+  height: 10px;
+  width: 10px;
+}
+
+/* ── Runtime: 3-column grid (Active runs · Stale & Retries · Monitor) ── */
+.runtime-grid-3 {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+@media (max-width: 1100px) {
+  .runtime-grid-3 {
+    grid-template-columns: 1fr;
+  }
+}
+
+.runtime-card-count {
+  background: #eef2f5;
+  border-radius: 999px;
+  color: #52616b;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
+  padding: 1px 8px;
+}
+
+.runtime-stale-group {
+  margin-top: 12px;
+}
+
+.runtime-stale-group h4 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+
+.runtime-id-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.runtime-id-list li {
+  background: #f4f6f8;
+  border: 1px solid #d7e0e5;
+  border-radius: 4px;
+  color: #172026;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+/* ── Runtime: monitor failures (formatted, not raw JSON) ────────────── */
+.runtime-monitor-failures {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.runtime-monitor-failure {
+  align-items: center;
+  background: #fbe8e6;
+  border: 1px solid #e9a8a1;
+  border-radius: 4px;
+  color: #8a2820;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 8px;
+  padding: 6px 10px;
+}
+
+.runtime-failure-tag { font-weight: 600; }
+.runtime-failure-count { color: #6a1f17; font-weight: 600; }
+.runtime-failure-ids {
+  color: #6a1f17;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+/* ── Runtime: inline recent alerts ──────────────────────────────────── */
+.runtime-recent-alerts {
+  margin-top: 12px;
+}
+
+.runtime-recent-alerts h4 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+
+.runtime-alert-list {
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.runtime-alert-row {
+  align-items: baseline;
+  background: #fff4d6;
+  border: 1px solid #e6c875;
+  border-radius: 4px;
+  color: #6f4e00;
+  display: grid;
+  font-size: 11px;
+  gap: 8px;
+  grid-template-columns: 38px 80px 90px 1fr;
+  padding: 4px 8px;
+}
+
+.runtime-alert-row .runtime-alert-age {
+  color: #6f4e00;
+  font-variant-numeric: tabular-nums;
+}
+
+.runtime-alert-row .runtime-alert-kind {
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.runtime-alert-row .runtime-alert-target {
+  color: #5a4500;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-alert-row .runtime-alert-msg {
+  color: #5a4500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-link {
+  background: none;
+  border: none;
+  color: #214f55;
+  cursor: pointer;
+  display: inline-block;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 10px;
+  padding: 0;
+}
+
+.runtime-link:hover { text-decoration: underline; }
+
+/* ── Sub-tab badges (Runtime: Overview/Alerts) ──────────────────────── */
+.sub-tab-badge {
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  margin-left: 6px;
+  padding: 2px 6px;
+}
+
+.sub-tab-badge--bad {
+  background: #d23a2a;
+  color: #ffffff;
+}
+
+.sub-tab-badge--warn {
+  background: #e6c875;
+  color: #4a3500;
+}
+
 .providers-panel {
   display: grid;
   gap: 14px;
@@ -3181,6 +3501,16 @@ button {
 .alerts-marquee-sep {
   color: #c79b9b;
   font-weight: 400;
+}
+.alerts-marquee-item--transition {
+  opacity: 0.85;
+}
+.alerts-marquee-item--transition strong {
+  color: #1a5c2e;
+}
+.alerts-marquee-transition-arrow {
+  color: #2e7d46;
+  font-size: 0.75em;
 }
 @keyframes alerts-marquee-scroll {
   from { transform: translateX(0); }
