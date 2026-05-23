@@ -5,7 +5,6 @@ def build_feedback_bundle(
     store: SqliteStore,
     task_id: str,
     *,
-    limit: int = 6,
     include_resolved: bool = False,
 ) -> dict:
     """Build feedback bundle for prompt context.
@@ -22,8 +21,6 @@ def build_feedback_bundle(
     records = sorted(store.list_feedback(task_id), key=lambda record: record.created_at)
     if not include_resolved:
         records = [r for r in records if r.feedback_id not in consensus_ids]
-    # Keep only the most-recent N records to bound prompt growth across retries.
-    records = records[-limit:]
     return {
         "task_id": task_id,
         "items": [

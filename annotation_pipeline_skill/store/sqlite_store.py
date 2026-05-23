@@ -667,6 +667,30 @@ class SqliteStore:
             for r in rows
         ]
 
+    def append_feedback_many(self, feedbacks) -> None:
+        self._conn.executemany(
+            """
+            INSERT INTO feedback_records (
+                feedback_id, task_id, attempt_id, source_stage, severity,
+                category, message, target_json, suggested_action,
+                created_at, created_by, metadata_json, seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                COALESCE((SELECT MAX(seq) + 1 FROM feedback_records WHERE task_id = ?), 1)
+            )
+            """,
+            [
+                (
+                    d["feedback_id"], d["task_id"], d["attempt_id"], d["source_stage"], d["severity"],
+                    d["category"], d["message"],
+                    json.dumps(d["target"], sort_keys=True),
+                    d["suggested_action"], d["created_at"], d["created_by"],
+                    json.dumps(d["metadata"], sort_keys=True),
+                    d["task_id"],
+                )
+                for d in (fb.to_dict() for fb in feedbacks)
+            ],
+        )
+
     def append_feedback_discussion(self, entry) -> None:
         d = entry.to_dict()
         self._conn.execute(
