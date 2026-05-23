@@ -102,6 +102,7 @@ class LocalRuntimeScheduler:
         profiles_yaml_path: Path | None = None,
         registry: Any | None = None,
         client_builder: Callable[[Any], LLMClient] | None = None,
+        runtime: Any | None = None,
     ):
         self.store = store
         # Two binding modes for client_factory:
@@ -120,6 +121,7 @@ class LocalRuntimeScheduler:
         else:
             self.client_factory = client_factory
         self.config = config
+        self._runtime_override = runtime
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         # Source-of-truth for hot-reloadable `max_concurrent_tasks`. Workers
         # check this on every claim loop; observer rewrites it when yaml
@@ -402,7 +404,7 @@ class LocalRuntimeScheduler:
             self._acquire_singleton()
 
         stop = stop_event or asyncio.Event()
-        runtime = SubagentRuntime(
+        runtime = self._runtime_override or SubagentRuntime(
             store=self.store,
             client_factory=self.client_factory,
             max_qc_rounds=self.config.max_qc_rounds,
@@ -442,6 +444,7 @@ class LocalRuntimeScheduler:
                 # Overwritten by the except branches when a worker exception
                 # actually fires.
                 last_exception_was_permanent = False
+                last_exception_was_transient = False
                 last_exception_summary = ""
                 # Set when stop fires mid-task. Tells `finally` to skip the
                 # bail-counter logic — shutdown isn't a failure, and counting
@@ -458,12 +461,16 @@ class LocalRuntimeScheduler:
                         task.status is TaskStatus.ARBITRATING
                         and task.metadata.get("prior_verifier_first_arbiter_divergent")
                     ):
-                        # Divergent-flag path: the first arbiter accepted an
-                        # annotation that still diverges from project prior.
-                        # Route to the dedicated resolver (which invokes a
-                        # second arbiter) instead of the manual re-arbitrate
-                        # flow that run_task_async would dispatch to.
+                        # Divergent-flag path: first arbiter accepted an annotation
+                        # that diverges from project prior; second arbiter adjudicates.
                         work_coro = runtime._resolve_first_arbiter_divergence_async(task)
+                    elif (
+                        task.status is TaskStatus.ARBITRATING
+                        and task.metadata.get("arbiter_uncertain_needs_second")
+                    ):
+                        # Uncertain-flag path: first arbiter was tentative/unsure;
+                        # second arbiter gets a fresh attempt before escalating to HR.
+                        work_coro = runtime._resolve_uncertain_arbiter_async(task)
                     else:
                         work_coro = runtime.run_task_async(task, stage_target=stage_target)
                     # Race the task against the stop event so SIGTERM is
@@ -521,8 +528,10 @@ class LocalRuntimeScheduler:
                     # 5-bail retry dance and go straight to HR.
                     from annotation_pipeline_skill.runtime.subagent_cycle import (
                         _is_provider_permanent_error,
+                        _is_provider_transient_error,
                     )
                     last_exception_was_permanent = _is_provider_permanent_error(worker_exc)
+                    last_exception_was_transient = _is_provider_transient_error(worker_exc)
                     # Mirror of the arbiter wrap site: LocalCLIExecutionError
                     # only stringifies to "local CLI provider failed"; the
                     # actual cause (auth, model name, OOM, API 5xx) is in
@@ -613,11 +622,18 @@ class LocalRuntimeScheduler:
                             #      (corrupted auth, subprocess hangs, exotic
                             #      provider error shapes). Without (2),
                             #      misclassified-transient bugs loop forever.
+                            # Transient errors (429 / 5xx) are explicitly
+                            # excluded from the total cap: they self-heal
+                            # and should back off indefinitely rather than
+                            # escalate to HR.
                             permanent_cap_hit = (
                                 last_exception_was_permanent
                                 and permanent_bails >= self.PERMANENT_BAIL_CAP
                             )
-                            total_cap_hit = bails >= self.TOTAL_BAIL_CAP
+                            total_cap_hit = (
+                                not last_exception_was_transient
+                                and bails >= self.TOTAL_BAIL_CAP
+                            )
                             if permanent_cap_hit or total_cap_hit:
                                 latest.next_retry_at = None
                                 escalation_kind = (
@@ -658,7 +674,7 @@ class LocalRuntimeScheduler:
                                 except InvalidTransition:
                                     pass
                             else:
-                                base = 60 if last_exception_was_permanent else 15
+                                base = 60 if last_exception_was_permanent else 30
                                 backoff_seconds = min(base * bails, 600)
                                 next_retry_at = self._now_fn() + timedelta(seconds=backoff_seconds)
                                 latest.next_retry_at = next_retry_at

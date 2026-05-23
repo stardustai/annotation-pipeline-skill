@@ -637,3 +637,96 @@ def test_stale_owner_sentinel_is_overwritten(tmp_path):
         )
 
     asyncio.run(drive())
+
+
+def test_transient_rate_limit_bails_never_escalate_to_human_review(tmp_path):
+    """Rate-limit (429) errors are transient — they must NOT trigger HUMAN_REVIEW
+    even after more bails than TOTAL_BAIL_CAP.  Tasks should stay in PENDING
+    with exponential backoff so the scheduler can retry once the provider
+    rate-limit window resets.
+
+    Regression: previously `total_cap_hit = bails >= TOTAL_BAIL_CAP` applied
+    regardless of error type, routing tasks to HR after 10 consecutive 429s.
+    """
+    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+
+    class RateLimitClient:
+        """Raises a 429 wrapped exactly as AnthropicSDKClient does."""
+        async def generate(self, request):
+            raise LocalCLIExecutionError(
+                "local CLI provider failed",
+                {
+                    "runtime": "anthropic_sdk",
+                    "error_event": {
+                        "api_error_status": 429,
+                        "result_text": "rate limit exceeded",
+                    },
+                },
+            )
+
+    task = Task.new(task_id="task-rl", pipeline_id="pipe", source_ref={"kind": "jsonl"})
+    task.status = TaskStatus.PENDING
+    # Seed well above TOTAL_BAIL_CAP; the next bail should still not hit HR.
+    task.metadata["worker_bail_count"] = LocalRuntimeScheduler.TOTAL_BAIL_CAP + 5
+    store = SqliteStore.open(tmp_path)
+    store.save_task(task)
+
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=lambda target: RateLimitClient(),
+        config=RuntimeConfig(max_concurrent_tasks=1),
+    )
+    scheduler.run_until_idle(stage_target="annotation", max_tasks=1)
+
+    loaded = store.load_task("task-rl")
+    assert loaded.status is TaskStatus.PENDING, (
+        f"rate-limit bails must not escalate to HR; got {loaded.status}"
+    )
+    assert loaded.next_retry_at is not None, "task should have a backoff next_retry_at"
+
+
+# ---------------------------------------------------------------------------
+# Task 5: scheduler must route arbiter_uncertain_needs_second to second arbiter
+# ---------------------------------------------------------------------------
+
+def test_scheduler_routes_uncertain_flag_to_second_arbiter(tmp_path):
+    """An ARBITRATING task with arbiter_uncertain_needs_second=True must be
+    routed to _resolve_uncertain_arbiter, not the normal run_task_async path."""
+    import asyncio
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+
+    store = SqliteStore.open(tmp_path)
+    task = Task.new(
+        task_id="t-sched-unc",
+        pipeline_id="p",
+        source_ref={"kind": "jsonl", "payload": {"text": "hello"}},
+    )
+    task.status = TaskStatus.ARBITRATING
+    task.metadata["arbiter_uncertain_needs_second"] = True
+    store.save_task(task)
+
+    resolver_called: list[str] = []
+
+    class _PatchedRuntime(SubagentRuntime):
+        async def _resolve_uncertain_arbiter_async(self, t):
+            resolver_called.append(t.task_id)
+            t.metadata.pop("arbiter_uncertain_needs_second", None)
+            t.status = TaskStatus.ACCEPTED
+            self.store.save_task(t)
+
+        async def _resolve_first_arbiter_divergence_async(self, t):
+            raise AssertionError("wrong resolver called")
+
+    runtime = _PatchedRuntime(store=store, client_factory=lambda _t: None)
+    scheduler = LocalRuntimeScheduler(
+        store=store,
+        client_factory=lambda _t: None,
+        config=RuntimeConfig(max_concurrent_tasks=1),
+        runtime=runtime,
+    )
+    scheduler.run_until_idle(max_tasks=1)
+
+    assert resolver_called == ["t-sched-unc"], (
+        f"_resolve_uncertain_arbiter must be called for the flagged task; got {resolver_called}"
+    )
+
