@@ -4,6 +4,29 @@
 
 ### Added
 
+- **Low-Info Filter & Naming Alignment** (`docs/superpowers/specs/2026-05-19-low-info-filter-design.md`, plan `2026-05-19-low-info-filter.md`).
+
+  - **`divergent_entries` rename.** `EntityStatisticsService.contested_spans()` renamed to `divergent_entries()` project-wide (service, API, scripts, TypeScript types). Old name removed.
+
+  - **`type_entropy` field on divergent entries.** Each entry in the `/posterior-audit` response's `divergent_entries` array now includes `type_entropy: float` — Shannon entropy H = −Σ(c/T)·log₂(c/T) over the span's prior distribution. Surfaces in the **Divergent Entries** tab as an **Entropy** column.
+
+  - **`low_info_entries` in posterior-audit response.** New top-level key containing all spans in `entity_statistics` whose average Zipf token frequency (`wordfreq_score`) ≥ `LOW_INFO_THRESHOLD` (4.0). Scans the full `entity_statistics` table — not limited to divergent spans. Each entry carries `span`, `prior_total`, `prior_distribution`, `wordfreq`.
+
+  - **Low Info Entries UI tab.** New third sub-tab in the Posterior Audit panel:
+    - Adjustable wordfreq threshold input (warns if set below backend floor 4.0).
+    - Per-row "Set not_an_entity" button and row checkbox.
+    - Always-visible **"Batch set 'Not an entity'"** button (disabled when nothing selected); shows selected count when active.
+    - 30-row pagination.
+
+  - **`scripts/bulk_set_lowinfo_not_an_entity.py`** — one-shot operator script to mark all spans with wordfreq ≥ threshold (default 5.0) as `not_an_entity` efficiently: scans each ACCEPTED task once, strips all target spans in a single annotation write, purges `entity_statistics` rows iteratively (handles historical/non-ACCEPTED sources), clears `posterior_audit_cache`. Applied to `v3_initial_deployment`: 3,555 tasks patched, 93,382 span occurrences removed, ~115K `entity_statistics` rows deleted.
+
+  - **`annotation_pipeline_skill.text.wordfreq_utils.wordfreq_score`** shared helper, replacing a duplicate inline function previously in `interfaces/api.py`.
+  - **`annotation_pipeline_skill.similarity.diverse.select_diverse_examples`** — MinHash-based farthest-first traversal sampler used to pick representative context snippets per (span, type) bucket.
+
+### Changed
+
+  - **`build_posterior_audit` response shape** updated: `contested_spans` → `divergent_entries` (with added `type_entropy`); new `low_info_entries` array. Cache surgery sites (`retroactive-fix`, `convention-set`) updated to use new keys. `low_info_entries` is not affected by convention changes (scans raw statistics, not convention-filtered view).
+
 - **Annotation knowledge base MCP tool (`check_past_experience`).** Annotator / QC / arbiter subagents launched via Claude CLI can now query the project's accumulated convention history on demand. The tool returns: current convention status + type, type distribution from past proposals, up to 3 diversity-selected sentence-level examples per type (via MinHash farthest-first sampling), and Zipf wordfreq metadata. Wired via `--mcp-config` and exposed by a stdio MCP server (`annotation_pipeline_skill.mcp.kb_server`).
 - **Annotator + QC system prompt updates.** The runtime-level `_annotation_instructions()` and `_build_qc_instructions()` now include a conditional `KNOWLEDGE BASE TOOL:` paragraph that fires when `mcp__annotation-kb__check_past_experience` is present in the agent's tools list — directs the agent to consult it for ambiguous named-entity spans, prefer the active convention, use per-type examples as analogies for `disputed` spans, and skip the tool for obvious tokens. Lives at the framework layer, not in per-project `annotation_rules.yaml`.
 - **`LLMProfile` schema additions:** `mcp_servers`, `strict_mcp_config`, `disallowed_tools` for declaring per-profile MCP server configurations and locking down built-in tools. Profiles attaching an MCP server should set `permission_mode: bypassPermissions` so the agent can actually invoke MCP tools in non-interactive (`--print`) mode (every other mode denies them; the MCP server itself is sandboxed to read-only SQL on the project DB). LLM provider switching continues to use the existing `base_url` field — `isolated_claude_home` injects it into each subagent subprocess in isolation, leaving the operator's shell untouched.
