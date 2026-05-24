@@ -1346,12 +1346,12 @@ class SubagentRuntime:
     ) -> dict[str, Any]:
         """Return the appropriate response_format for a generate call.
 
-        When the target profile has structured_output enabled, builds a
-        strict json_schema payload for the given stage. Falls back to
-        json_object (forces valid JSON, no structural enforcement) otherwise.
+        Structured output is project-driven: when output_schema is present
+        (the project has defined an annotation schema), strict json_schema
+        enforcement is used for all three stages. QC uses a fixed schema
+        independent of the project schema. Falls back to json_object only
+        when no schema is available.
         """
-        if target not in self._structured_output_targets:
-            return {"type": "json_object"}
         if stage == "annotation" and output_schema:
             return make_json_schema_response_format(
                 build_annotation_strict_schema(output_schema), name="annotation"
@@ -2727,14 +2727,9 @@ class SubagentRuntime:
             '  "corrected_annotation": <full corrected annotation object> | null\n'
             "}\n"
             "`corrected_annotation` is a TOP-LEVEL key. "
-            + (
-                "OMIT IT ENTIRELY (do not output null) when ALL verdicts are 'annotator'. "
-                "Include it as an object when ANY verdict is 'qc' or 'neither'.\n\n"
-                if target_name in self._structured_output_targets else
-                "Always present. Either an object matching current_annotation's shape, or literally null. "
-                "Do not omit the field.\n\n"
-            )
-            + "For EACH disputed feedback choose exactly one verdict:\n"
+            "OMIT IT ENTIRELY (do not output null) when ALL verdicts are 'annotator'. "
+            "Include it as an object when ANY verdict is 'qc' or 'neither'.\n\n"
+            "For EACH disputed feedback choose exactly one verdict:\n"
             "  - 'annotator': the annotator's current annotation IS correct on this item; QC is wrong.\n"
             "  - 'qc':        QC's complaint IS correct; the annotation has the defect QC describes — "
             "YOU MUST APPLY QC's REQUESTED FIX in corrected_annotation. (Add the missing entity, "
@@ -2752,8 +2747,19 @@ class SubagentRuntime:
             "reasoning while leaving corrected_annotation null wastes your verdicts.\n"
             "  - If ALL verdicts are 'annotator' (the annotation stands as-is), set corrected_annotation = null.\n"
             "There is no 'rejected' outcome.\n\n"
-            "Shape of corrected_annotation when non-null: a {\"rows\": [{\"row_index\": int, "
-            "\"row_id\": str, \"output\": {entities, json_structures}}, ...]} object.\n"
+            "Shape of corrected_annotation when non-null:\n"
+            "  {\"rows\": [{\"row_index\": int, \"row_id\": str, \"output\": "
+            "{\"entities\": {\"<type>\": [\"span\", ...]}, "
+            "\"json_structures\": {\"<type>\": [\"span\", ...]}}}, ...]}\n\n"
+            "CRITICAL — entities / json_structures format is DICT-BY-TYPE (keys = type names, "
+            "values = lists of verbatim strings). NEVER a list of objects.\n"
+            "  CORRECT:  {\"entities\": {\"location\": [\"Paris\"], \"person\": [\"Alice\"]}}\n"
+            "  WRONG:    {\"entities\": [{\"type\": \"location\", \"phrase\": \"Paris\"}, ...]}\n"
+            "  WRONG:    {\"entities\": [{\"text\": \"Paris\", \"type\": \"location\"}, ...]}\n"
+            "  WRONG:    {\"entities\": [{\"span\": \"Paris\", \"entity_type\": \"location\"}, ...]}\n"
+            "  WRONG:    {\"entities\": [{\"value\": \"Paris\", \"type\": \"location\"}, ...]}\n"
+            "If you output a list of objects instead of a dict, the pipeline rejects the entire "
+            "corrected_annotation and the arbiter call is wasted.\n\n"
             "corrected_annotation MUST include EVERY source row, in order — not just the rows "
             "your verdicts touch. Rows you didn't change: copy the annotator's existing output "
             "(from current_annotation) verbatim. Rows you did change: apply your fix. The pipeline "
@@ -3071,6 +3077,44 @@ class SubagentRuntime:
                     # so callers can preserve it in HR metadata; the flag
                     # tells them NOT to apply it as a real correction.
                     verbatim_exhausted_target = verbatim_failure.get("target", {})
+                else:
+                    # Cross-type collision: same span tagged under two entity
+                    # types. _apply_arbiter_correction blocks this silently;
+                    # catch it here to give the arbiter immediate feedback.
+                    from annotation_pipeline_skill.core.schema_validation import (
+                        find_cross_type_collisions,
+                        find_trailing_punctuation_spans,
+                    )
+                    cross_type = find_cross_type_collisions(corrected_check)
+                    if cross_type and attempt_idx < max_retries:
+                        collision_desc = "; ".join(
+                            f"span {c.get('span')!r} appears under both "
+                            + " and ".join(repr(t) for t in (c.get("types") or [])[:2])
+                            for c in cross_type[:3]
+                        )
+                        retry_note = (
+                            f"\n\nPREVIOUS ATTEMPT FAILED CROSS-TYPE CHECK: "
+                            f"{collision_desc}. "
+                            f"Each span must appear under exactly ONE entity type. "
+                            f"Remove the duplicate and re-emit corrected_annotation."
+                        )
+                        continue
+                    # Trailing-punctuation: span ends with a punctuation
+                    # character that is not part of the token (e.g. "Apple.")
+                    trailing = find_trailing_punctuation_spans(task, corrected_check)
+                    if trailing and attempt_idx < max_retries:
+                        tp_desc = "; ".join(
+                            f"span {t.get('span')!r} at {t.get('field')!r}"
+                            for t in trailing[:3]
+                        )
+                        retry_note = (
+                            f"\n\nPREVIOUS ATTEMPT FAILED TRAILING-PUNCTUATION CHECK: "
+                            f"{tp_desc}. "
+                            f"Spans must not end with punctuation that is not part of "
+                            f"the token itself. Strip the trailing punctuation and "
+                            f"re-emit corrected_annotation."
+                        )
+                        continue
             else:
                 needs_correction = any(
                     isinstance(v, dict)

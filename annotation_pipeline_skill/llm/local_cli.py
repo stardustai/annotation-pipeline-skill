@@ -297,10 +297,13 @@ class LocalCLIClient:
         handle = None if self.profile.disable_continuity else request.continuity_handle
         home_id, thread_id = _parse_codex_handle(handle)
         api_key = self.profile.resolve_api_key({**os.environ, **request.env}) or None
+        developer_instructions = _inject_schema_into_instructions(
+            request.instructions, request.response_format
+        )
         command, prompt_file = build_codex_command(
             binary="codex",
             prompt=request.prompt or _messages_to_prompt(request.input_items),
-            developer_instructions=request.instructions,
+            developer_instructions=developer_instructions,
             thread_id=thread_id,
             model=self.profile.model,
             reasoning_effort=self.profile.reasoning_effort,
@@ -376,5 +379,36 @@ def _write_isolated_codex_config(path: Path, *, model: str, reasoning_effort: st
 
 def _messages_to_prompt(input_items: list[dict[str, Any]]) -> str:
     return "\n".join(str(item.get("content", item)) for item in input_items)
+
+
+def _inject_schema_into_instructions(
+    instructions: str | None,
+    response_format: dict[str, Any] | None,
+) -> str | None:
+    """Append the strict JSON schema to developer_instructions for codex_cli.
+
+    openai_sdk enforces response_format at the API level; codex_cli ignores
+    the parameter entirely. This function extracts the schema from a
+    json_schema response_format and appends it as a plain-text block so the
+    model sees the exact required output shape.
+
+    Returns the original instructions unchanged when response_format is absent,
+    is not type=json_schema, or has no schema payload.
+    """
+    if not response_format:
+        return instructions
+    if response_format.get("type") != "json_schema":
+        return instructions
+    js = response_format.get("json_schema") or {}
+    schema = js.get("schema")
+    if not schema:
+        return instructions
+    name = js.get("name", "output")
+    schema_text = (
+        f"\n\nREQUIRED OUTPUT FORMAT — respond with a single JSON object matching "
+        f"this schema exactly (name: {name}):\n"
+        + json.dumps(schema, indent=2)
+    )
+    return (instructions or "") + schema_text
 
 
