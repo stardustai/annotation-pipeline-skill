@@ -338,54 +338,6 @@ export function PosteriorAuditPanel({
                 <span>Save as convention</span>
               </label>
             ) : null}
-            {subtab === "low_info" ? (
-              <>
-                <label
-                  htmlFor="low-info-threshold"
-                  style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "0.82rem", color: "var(--muted, #6b7280)", whiteSpace: "nowrap" }}
-                >
-                  <span>Wordfreq ≥</span>
-                  <input
-                    id="low-info-threshold"
-                    type="range"
-                    min={0}
-                    max={7}
-                    step={0.1}
-                    value={lowInfoThreshold}
-                    onChange={(e) => {
-                      const v = parseFloat(e.target.value);
-                      if (!isNaN(v)) setLowInfoThreshold(Math.max(0, Math.min(7, v)));
-                    }}
-                    style={{ width: "90px", cursor: "pointer", verticalAlign: "middle", accentColor: "var(--accent, #2563eb)" }}
-                  />
-                  <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2ch" }}>{lowInfoThreshold.toFixed(1)}</span>
-                  {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
-                    <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${LOW_INFO_BACKEND_FLOOR}. Re-check to see entries below it.`}>⚠</span>
-                  ) : null}
-                </label>
-                <button
-                  type="button"
-                  disabled={lowInfoSelected.size === 0 || lowInfoBulkRunning}
-                  onClick={() => lowInfoApplyBulkRef.current?.()}
-                  style={{
-                    fontSize: "0.82rem",
-                    background: lowInfoSelected.size > 0 ? "var(--danger, #b91c1c)" : undefined,
-                    color: lowInfoSelected.size > 0 ? "white" : undefined,
-                    padding: "3px 10px",
-                    borderRadius: "4px",
-                    cursor: lowInfoSelected.size === 0 || lowInfoBulkRunning ? "default" : "pointer",
-                    opacity: lowInfoSelected.size === 0 || lowInfoBulkRunning ? 0.5 : 1,
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {lowInfoBulkRunning
-                    ? "Applying…"
-                    : lowInfoSelected.size > 0
-                      ? `Batch set "Not an entity" (${lowInfoSelected.size})`
-                      : `Batch set "Not an entity"`}
-                </button>
-              </>
-            ) : null}
           </div>
 
           {subtab === "deviations" ? (
@@ -476,6 +428,10 @@ export function PosteriorAuditPanel({
                     bulkRunning={lowInfoBulkRunning}
                     setBulkRunning={setLowInfoBulkRunning}
                     applyBulkRef={lowInfoApplyBulkRef}
+                    threshold={lowInfoThreshold}
+                    setThreshold={setLowInfoThreshold}
+                    backendFloor={LOW_INFO_BACKEND_FLOOR}
+                    totalBeforeFilter={lowInfo.length}
                   />
                 ) : (
                   <p className="runtime-muted">
@@ -1628,6 +1584,10 @@ function LowInfoTable({
   bulkRunning,
   setBulkRunning,
   applyBulkRef,
+  threshold,
+  setThreshold,
+  backendFloor,
+  totalBeforeFilter,
 }: {
   items: LowInfoEntry[];
   projectId: string;
@@ -1639,6 +1599,10 @@ function LowInfoTable({
   bulkRunning: boolean;
   setBulkRunning: React.Dispatch<React.SetStateAction<boolean>>;
   applyBulkRef: React.MutableRefObject<(() => Promise<void>) | null>;
+  threshold: number;
+  setThreshold: (v: number) => void;
+  backendFloor: number;
+  totalBeforeFilter: number;
 }): React.ReactElement {
   const filter = externalFilter ?? "";
   const [page, setPage] = useState(0);
@@ -1780,12 +1744,60 @@ function LowInfoTable({
         {selected.size > 0 ? ` · ${selected.size} selected` : ""}
       </div>
       {error ? <div className="notice compact">{error}</div> : null}
-      <Pagination
-        total={filtered.length}
-        page={page}
-        pageSize={LOW_INFO_PAGE_SIZE}
-        onPageChange={setPage}
-      />
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+        <Pagination
+          total={filtered.length}
+          page={page}
+          pageSize={LOW_INFO_PAGE_SIZE}
+          onPageChange={setPage}
+        />
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          <label
+            htmlFor="low-info-threshold"
+            style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "0.82rem", color: "var(--muted, #6b7280)", whiteSpace: "nowrap" }}
+          >
+            <span>Wordfreq ≥</span>
+            <input
+              id="low-info-threshold"
+              type="range"
+              min={0}
+              max={7}
+              step={0.1}
+              value={threshold}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                if (!isNaN(v)) setThreshold(Math.max(0, Math.min(7, v)));
+              }}
+              style={{ width: "90px", cursor: "pointer", verticalAlign: "middle", accentColor: "var(--accent, #2563eb)" }}
+            />
+            <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2.2ch" }}>{threshold.toFixed(1)}</span>
+            {threshold < backendFloor ? (
+              <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${backendFloor}. Re-check to see entries below it.`}>⚠</span>
+            ) : null}
+          </label>
+          <button
+            type="button"
+            disabled={selected.size === 0 || bulkRunning}
+            onClick={applyBulk}
+            style={{
+              fontSize: "0.82rem",
+              background: selected.size > 0 ? "var(--danger, #b91c1c)" : undefined,
+              color: selected.size > 0 ? "white" : undefined,
+              padding: "3px 10px",
+              borderRadius: "4px",
+              cursor: selected.size === 0 || bulkRunning ? "default" : "pointer",
+              opacity: selected.size === 0 || bulkRunning ? 0.5 : 1,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {bulkRunning
+              ? "Applying…"
+              : selected.size > 0
+                ? `Batch set "Not an entity" (${selected.size})`
+                : `Batch set "Not an entity"`}
+          </button>
+        </div>
+      </div>
       <div className="runtime-card">
         <table style={TABLE_STYLE}>
           <thead>
