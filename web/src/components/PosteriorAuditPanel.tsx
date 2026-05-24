@@ -1772,9 +1772,10 @@ function LowInfoTable({
               </th>
               <th style={TH_FIRST}>Span</th>
               <th style={{ ...TH, width: "8%" }} title="Average Zipf frequency of tokens (0–7 scale; ≥6 = 'the/very/nice')">Wordfreq</th>
-              <th style={{ ...TH, width: "22%" }}>Distribution</th>
-              <th style={{ ...TH, width: "8%" }}>Total</th>
-              <th style={{ ...TH, width: "20%" }}>Action</th>
+              <th style={{ ...TH, width: "18%" }}>Distribution</th>
+              <th style={{ ...TH, width: "6%" }}>Total</th>
+              <th style={{ ...TH, width: "26%" }}>Sample</th>
+              <th style={{ ...TH, width: "16%" }}>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -1800,6 +1801,13 @@ function LowInfoTable({
                     <DistributionBar distribution={c.prior_distribution} total={c.prior_total} />
                   </td>
                   <td style={TD}>{c.prior_total}</td>
+                  <td style={TD}>
+                    <OriginalTextCell
+                      projectId={projectId}
+                      storeKey={storeKey}
+                      span={c.span}
+                    />
+                  </td>
                   <td style={TD}>
                     {isDone ? (
                       <span style={{ fontSize: "0.8rem", color: "var(--success, #047857)" }}>✓ done</span>
