@@ -246,6 +246,10 @@ class HumanReviewService:
         if task.status is not TaskStatus.HUMAN_REVIEW:
             raise InvalidTransition(f"task {task_id} is not in human_review")
 
+        # Strip output keys that the current schema doesn't allow (e.g. old
+        # 'classifications'/'relations' fields from a prior schema version)
+        # before validating. Same logic as _autoclean_pre_existing_defects.
+        _strip_schema_disallowed_output_keys(task, answer, self.store)
         # Schema-validate. Raises SchemaValidationError on failure (missing schema OR mismatch).
         validate_payload_against_task_schema(task, answer, store=self.store)
         # Verbatim check — operator-submitted corrections must use exact spans
@@ -746,6 +750,32 @@ def _input_text_by_row(task) -> dict[int, str]:
         if isinstance(text, str):
             out[idx] = text
     return out
+
+
+def _strip_schema_disallowed_output_keys(task, payload: dict, store=None) -> None:
+    """Strip output keys not allowed by the task's current schema, in-place.
+
+    Handles old annotations containing 'classifications'/'relations' from
+    prior schema versions that would fail additionalProperties:false validation.
+    """
+    schema = resolve_output_schema(task, store)
+    if not isinstance(schema, dict):
+        return
+    rows_items = schema.get("properties", {}).get("rows", {}).get("items", {})
+    allowed_output_keys = set(
+        rows_items.get("properties", {}).get("output", {}).get("properties", {}).keys()
+    )
+    if not allowed_output_keys:
+        return
+    for row in payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        for key in list(output.keys()):
+            if key not in allowed_output_keys:
+                del output[key]
 
 
 def _autoclean_pre_existing_defects(task, payload: dict, store=None) -> dict:
