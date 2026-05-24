@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { PosteriorAudit, TaskDeviation, DivergentEntry, LowInfoEntry } from "../types";
 import {
   DistributionBar,
@@ -114,6 +114,10 @@ export function PosteriorAuditPanel({
   // requires a full Re-check (backend won't have scored those entries).
   const LOW_INFO_BACKEND_FLOOR = 4.0;
   const [lowInfoThreshold, setLowInfoThreshold] = useState(4.0);
+  // Lifted from LowInfoTable so the nav bar can show count + trigger bulk
+  const [lowInfoSelected, setLowInfoSelected] = useState<Set<string>>(new Set());
+  const [lowInfoBulkRunning, setLowInfoBulkRunning] = useState(false);
+  const lowInfoApplyBulkRef = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => {
     if (!projectId) {
@@ -334,6 +338,54 @@ export function PosteriorAuditPanel({
                 <span>Save as convention</span>
               </label>
             ) : null}
+            {subtab === "low_info" ? (
+              <>
+                <label
+                  htmlFor="low-info-threshold"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "0.82rem", color: "var(--muted, #6b7280)", whiteSpace: "nowrap" }}
+                >
+                  <span>Wordfreq ≥</span>
+                  <input
+                    id="low-info-threshold"
+                    type="range"
+                    min={0}
+                    max={7}
+                    step={0.1}
+                    value={lowInfoThreshold}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!isNaN(v)) setLowInfoThreshold(Math.max(0, Math.min(7, v)));
+                    }}
+                    style={{ width: "90px", cursor: "pointer", verticalAlign: "middle", accentColor: "var(--accent, #2563eb)" }}
+                  />
+                  <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2ch" }}>{lowInfoThreshold.toFixed(1)}</span>
+                  {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
+                    <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${LOW_INFO_BACKEND_FLOOR}. Re-check to see entries below it.`}>⚠</span>
+                  ) : null}
+                </label>
+                <button
+                  type="button"
+                  disabled={lowInfoSelected.size === 0 || lowInfoBulkRunning}
+                  onClick={() => lowInfoApplyBulkRef.current?.()}
+                  style={{
+                    fontSize: "0.82rem",
+                    background: lowInfoSelected.size > 0 ? "var(--danger, #b91c1c)" : undefined,
+                    color: lowInfoSelected.size > 0 ? "white" : undefined,
+                    padding: "3px 10px",
+                    borderRadius: "4px",
+                    cursor: lowInfoSelected.size === 0 || lowInfoBulkRunning ? "default" : "pointer",
+                    opacity: lowInfoSelected.size === 0 || lowInfoBulkRunning ? 0.5 : 1,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {lowInfoBulkRunning
+                    ? "Applying…"
+                    : lowInfoSelected.size > 0
+                      ? `Batch set "Not an entity" (${lowInfoSelected.size})`
+                      : `Batch set "Not an entity"`}
+                </button>
+              </>
+            ) : null}
           </div>
 
           {subtab === "deviations" ? (
@@ -410,29 +462,6 @@ export function PosteriorAuditPanel({
                   Scored via <code>wordfreq</code> (multilingual; Zipf 0–7, 6+ = "the / very / nice").
                 </span>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", margin: "0.4rem 0 0.6rem", fontSize: "0.85rem" }}>
-                <label htmlFor="low-info-threshold" style={{ color: "var(--muted, #6b7280)" }}>
-                  Wordfreq threshold:
-                </label>
-                <input
-                  id="low-info-threshold"
-                  type="number"
-                  min={0}
-                  max={7}
-                  step={0.5}
-                  value={lowInfoThreshold}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (!isNaN(v)) setLowInfoThreshold(Math.max(0, Math.min(7, v)));
-                  }}
-                  style={{ width: "4.5rem", padding: "1px 4px", fontSize: "0.85rem" }}
-                />
-                {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
-                  <span style={{ color: "var(--warning, #d97706)", fontSize: "0.8rem" }}>
-                    ⚠ Below backend floor ({LOW_INFO_BACKEND_FLOOR}). Re-check to see more entries.
-                  </span>
-                ) : null}
-              </div>
               {(() => {
                 const visibleItems = lowInfo.filter((c) => c.wordfreq >= lowInfoThreshold);
                 return visibleItems.length > 0 ? (
@@ -442,6 +471,11 @@ export function PosteriorAuditPanel({
                     storeKey={storeKey ?? null}
                     onAfterFix={reloadCache}
                     externalFilter={filter}
+                    selected={lowInfoSelected}
+                    setSelected={setLowInfoSelected}
+                    bulkRunning={lowInfoBulkRunning}
+                    setBulkRunning={setLowInfoBulkRunning}
+                    applyBulkRef={lowInfoApplyBulkRef}
                   />
                 ) : (
                   <p className="runtime-muted">
@@ -1589,18 +1623,26 @@ function LowInfoTable({
   storeKey,
   onAfterFix,
   externalFilter,
+  selected,
+  setSelected,
+  bulkRunning,
+  setBulkRunning,
+  applyBulkRef,
 }: {
   items: LowInfoEntry[];
   projectId: string;
   storeKey: string | null;
   onAfterFix?: () => void;
   externalFilter?: string;
+  selected: Set<string>;
+  setSelected: React.Dispatch<React.SetStateAction<Set<string>>>;
+  bulkRunning: boolean;
+  setBulkRunning: React.Dispatch<React.SetStateAction<boolean>>;
+  applyBulkRef: React.MutableRefObject<(() => Promise<void>) | null>;
 }): React.ReactElement {
   const filter = externalFilter ?? "";
   const [page, setPage] = useState(0);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
-  const [bulkRunning, setBulkRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const lower = filter.trim().toLowerCase();
@@ -1695,6 +1737,15 @@ function LowInfoTable({
     onAfterFix?.();
   }
 
+  // Keep the ref up-to-date so the nav bar button always calls the latest closure.
+  const applyBulkLatest = useRef(applyBulk);
+  useEffect(() => { applyBulkLatest.current = applyBulk; });
+  useEffect(() => {
+    applyBulkRef.current = () => applyBulkLatest.current();
+    return () => { applyBulkRef.current = null; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function toggleSelect(span: string) {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -1724,31 +1775,9 @@ function LowInfoTable({
 
   return (
     <>
-      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.4rem 0" }}>
-        <button
-          type="button"
-          disabled={selected.size === 0 || bulkRunning}
-          onClick={applyBulk}
-          style={{
-            fontSize: "0.85rem",
-            background: selected.size > 0 ? "var(--danger, #b91c1c)" : undefined,
-            color: selected.size > 0 ? "white" : undefined,
-            padding: "3px 12px",
-            borderRadius: "4px",
-            cursor: selected.size === 0 || bulkRunning ? "default" : "pointer",
-            opacity: selected.size === 0 || bulkRunning ? 0.5 : 1,
-          }}
-        >
-          {bulkRunning
-            ? "Applying…"
-            : selected.size > 0
-              ? `Batch set "Not an entity" (${selected.size})`
-              : `Batch set "Not an entity"`}
-        </button>
-        <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
-          {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
-          {selected.size > 0 ? ` · ${selected.size} selected` : ""}
-        </span>
+      <div style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)", margin: "0.2rem 0 0.4rem" }}>
+        {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
+        {selected.size > 0 ? ` · ${selected.size} selected` : ""}
       </div>
       {error ? <div className="notice compact">{error}</div> : null}
       <Pagination
