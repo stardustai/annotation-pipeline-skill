@@ -81,6 +81,12 @@ class HumanReviewService:
                                 row.pop("discussion_replies", None)
                 n_applied = _apply_operator_picks(answer, picks)
                 if n_applied:
+                    # Convention spans stored with different casing than the
+                    # verbatim input text get added by _apply_operator_picks
+                    # with non-verbatim casing. Auto-clean them (case fix,
+                    # fuzzy repair, drop if no repair) so submit_correction's
+                    # verbatim check doesn't block the accept path.
+                    answer = _autoclean_pre_existing_defects(task, answer, store=self.store)
                     note = f"accept with {n_applied} operator pick(s) applied"
                     if feedback.strip():
                         note = f"{note} — {feedback.strip()}"
