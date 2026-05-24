@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from robust_json import loads as _robust_json_loads
@@ -115,6 +115,14 @@ def _is_provider_transient_error(exc: BaseException) -> bool:
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and 500 <= status < 600:
         return True
+    # AnthropicSDKClient wraps HTTP status in diagnostics (same pattern as _is_rate_limited).
+    diagnostics = getattr(exc, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        err_ev = diagnostics.get("error_event")
+        if isinstance(err_ev, dict):
+            api_status = err_ev.get("api_error_status")
+            if isinstance(api_status, int) and 500 <= api_status < 600:
+                return True
     text = str(exc).lower()
     return any(s in text for s in (" 500 ", " 502 ", " 503 ", " 504 ",
                                     "internal server error", "service unavailable",
@@ -488,9 +496,14 @@ class SubagentRuntime:
         ARBITRATING for re-pickup — the next worker takes a fresh shot.
         """
         if arb.get("rate_limited"):
-            # Arbiter call was rate-limited (429). Don't count this toward any
-            # failure cap — the task stays in ARBITRATING so the next worker
-            # picks it up after provider backoff resolves.
+            # Transient error (429 / 5xx). Don't count toward any failure cap.
+            # Stamp next_retry_at with exponential backoff (30s × bail#, cap 300s)
+            # so the task isn't immediately re-claimed against the same overloaded
+            # provider.
+            bail_n = int(task.metadata.get("arbiter_transient_bail_count", 0)) + 1
+            task.metadata["arbiter_transient_bail_count"] = bail_n
+            backoff = min(30 * bail_n, 300)
+            task.next_retry_at = utc_now() + timedelta(seconds=backoff)
             return
 
         verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
@@ -498,59 +511,48 @@ class SubagentRuntime:
             count = int(task.metadata.get("arbiter_verbatim_bail_count", 0)) + 1
             task.metadata["arbiter_verbatim_bail_count"] = count
             cap = self.ARBITER_VERBATIM_BAIL_CAP
+            if count >= cap:
+                metadata = {
+                    **hr_extra_metadata,
+                    "arbiter_mechanical_retries": int(task.metadata.get("arbiter_mechanical_retries", 0)),
+                    "arbiter_verbatim_bail_count": count,
+                    "arbiter_ran": arb["ran"],
+                    "arbiter_unresolved": arb["unresolved"],
+                    "arbiter_mechanical_fail": arb["mechanical_fail"],
+                    "arbiter_verbatim_retry_exhausted": True,
+                    "arbiter_failed_correction": arb.get("failed_verbatim_correction"),
+                    "arbiter_failed_verbatim_target": arb.get("failed_verbatim_target"),
+                }
+                for k in ("arbiter_last_exception_class", "arbiter_last_exception_message"):
+                    if task.metadata.get(k):
+                        metadata.setdefault(k, task.metadata[k])
+                target = arb.get("failed_verbatim_target") or {}
+                self._transition(
+                    task,
+                    TaskStatus.HUMAN_REVIEW,
+                    reason=(
+                        f"Arbiter ruled qc/neither but could not produce a verbatim-compliant "
+                        f"correction after {count} pickup(s); routing to human review "
+                        f"(failed span: {target.get('span')!r} at "
+                        f"{target.get('field')!r} row {target.get('row_index')})"
+                    ),
+                    stage=stage,
+                    attempt_id=attempt_id,
+                    metadata=metadata,
+                )
         else:
+            # Mechanical failure (JSON parse / shape errors / LLM exception).
+            # These are transient quality glitches — replaying arbitration usually
+            # succeeds. Stay in ARBITRATING with exponential backoff instead of
+            # escalating to HR; HR cannot fix a parse error and the task would
+            # just be rewound anyway.
             count = int(task.metadata.get("arbiter_mechanical_retries", 0)) + 1
             task.metadata["arbiter_mechanical_retries"] = count
-            cap = self.ARBITER_MECHANICAL_RETRY_CAP
-        if count >= cap:
-            metadata = {
-                **hr_extra_metadata,
-                "arbiter_mechanical_retries": int(task.metadata.get("arbiter_mechanical_retries", 0)),
-                "arbiter_verbatim_bail_count": int(task.metadata.get("arbiter_verbatim_bail_count", 0)),
-                "arbiter_ran": arb["ran"],
-                "arbiter_unresolved": arb["unresolved"],
-                "arbiter_mechanical_fail": arb["mechanical_fail"],
-            }
-            # Surface the latest captured arbiter exception (set by
-            # _arbitrate_and_apply when the LLM call raised, or by the outer
-            # try/except in _run_arbitration_cycle when an uncaught exception
-            # escaped). Lets us tell client-unavail / LLM exception / JSON
-            # parse / missing-verdicts apart in the HR audit row.
             for k in ("exception_class", "exception_message"):
                 if arb.get(k):
-                    metadata[f"arbiter_{k}"] = arb[k]
-            for k in ("arbiter_last_exception_class", "arbiter_last_exception_message"):
-                if task.metadata.get(k):
-                    metadata.setdefault(k, task.metadata[k])
-            # Surface the arbiter's failed verbatim correction so HR can
-            # see what it tried to fix and decide whether to apply it
-            # manually (after fixing the verbatim issue) or send back to
-            # annotation.
-            if verbatim_exhausted:
-                metadata["arbiter_verbatim_retry_exhausted"] = True
-                metadata["arbiter_failed_correction"] = arb.get("failed_verbatim_correction")
-                metadata["arbiter_failed_verbatim_target"] = arb.get("failed_verbatim_target")
-            if verbatim_exhausted:
-                target = arb.get("failed_verbatim_target") or {}
-                reason_text = (
-                    f"Arbiter ruled qc/neither but could not produce a verbatim-compliant "
-                    f"correction after {count} pickup(s); routing to human review "
-                    f"(failed span: {target.get('span')!r} at "
-                    f"{target.get('field')!r} row {target.get('row_index')})"
-                )
-            else:
-                reason_text = (
-                    f"Arbiter retried {count} times but kept failing to return a usable answer "
-                    f"(JSON parse / shape errors / LLM exception); routing to human review"
-                )
-            self._transition(
-                task,
-                TaskStatus.HUMAN_REVIEW,
-                reason=reason_text,
-                stage=stage,
-                attempt_id=attempt_id,
-                metadata=metadata,
-            )
+                    task.metadata[f"arbiter_last_{k}"] = arb[k]
+            backoff = min(30 * count, 300)
+            task.next_retry_at = utc_now() + timedelta(seconds=backoff)
 
     def _retry_round_count(self, task_id: str) -> int:
         """Count how many *open* retry rounds have happened for this task.
@@ -1275,24 +1277,13 @@ class SubagentRuntime:
         dropped: dict[str, int],
         rescued: dict[str, int] | None = None,
     ) -> None:
-        """Append a structured row to alerts.jsonl when the arbiter put
-        valid types in the wrong field (rescued) or invented non-schema
-        types (dropped). Helps track cross-field confusion and hallucination
-        rates so we can tune prompts or promote heavily-used types.
-
-        Not deduped by cooldown — these are per-task data points that
-        matter for the rolling-up dashboard, not floods.
+        """Log a warning when the arbiter put valid types in the wrong field
+        (rescued) or invented non-schema types (dropped).
         """
-        from annotation_pipeline_skill.runtime.alerts import append_alert
-        entry: dict = {
-            "ts": utc_now().isoformat(),
-            "kind": "arbiter_enum_coerce",
-            "task_id": task.task_id,
-            "dropped": dropped,
-        }
-        if rescued:
-            entry["rescued"] = rescued
-        append_alert(self.store.root, entry)
+        logger.warning(
+            "arbiter_enum_coerce task=%s dropped=%s rescued=%s",
+            task.task_id, dropped, rescued or {},
+        )
 
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
         try:
@@ -1842,12 +1833,17 @@ class SubagentRuntime:
         # (e.g., traditional→simplified Chinese, dropped articles) that pass
         # schema but break the input.text substring guarantee. Without this
         # check, hallucinated/normalized spans landed in ACCEPTED tasks
-        # (5% audit found ~11% violation rate). On failure, return None so
-        # _terminal_from_arbiter falls through to HUMAN_REVIEW instead of
-        # saving a bad corrected_annotation as the final artifact.
-        verbatim_failure = self._check_verbatim_spans(_masked_task, corrected)
-        if verbatim_failure is not None:
-            return None
+        # (5% audit found ~11% violation rate). Strip hallucinated spans and
+        # retry before giving up: the arbiter's intent (type correction for
+        # the disputed span) is usually correct even when it hallucinates an
+        # unrelated entity alongside it. Only return None if violations remain
+        # after stripping (i.e., the target span itself is non-verbatim).
+        from annotation_pipeline_skill.core.schema_validation import find_verbatim_violations
+        violations = find_verbatim_violations(_masked_task, corrected)
+        if violations:
+            _strip_non_verbatim_spans_in_place(corrected, violations)
+            if find_verbatim_violations(_masked_task, corrected):
+                return None
         # Cross-type collision — same span tagged as two entity types. Block
         # the correction; arbiter's internal retry loop already ran, so the
         # outer caller will hit mechanical_fail and either retry or escalate.
@@ -2097,6 +2093,27 @@ class SubagentRuntime:
         if second_payload.get("_verbatim_retry_exhausted"):
             failed_correction = second_payload.get("corrected_annotation")
             failed_target = second_payload.get("_verbatim_failed_target") or {}
+            # Non-verbatim spans in the correction are hallucinated entities —
+            # strip them and try to apply the pruned correction before giving
+            # up to HR. The arbiter's type choice for the disputed span is
+            # usually correct even when it adds a spurious entity alongside.
+            if isinstance(failed_correction, dict):
+                from annotation_pipeline_skill.core.schema_validation import find_verbatim_violations
+                from annotation_pipeline_skill.services.row_mask_service import (
+                    apply_masks_to_task as _apply_masks_to_task,
+                )
+                _masked = _apply_masks_to_task(self.store, task)
+                viols = find_verbatim_violations(_masked, failed_correction)
+                if viols:
+                    _strip_non_verbatim_spans_in_place(failed_correction, viols)
+                if not find_verbatim_violations(_masked, failed_correction):
+                    applied = self._apply_arbiter_correction(
+                        task, attempt_id, failed_correction, second_payload
+                    )
+                    if applied is not None:
+                        self._clear_divergence_flag(task)
+                        self.store.save_task(task)
+                        return
             task.metadata["prior_verifier_action"] = "second_arbiter_verbatim_failed"
             self._clear_divergence_flag(task)
             self._transition(
@@ -2106,10 +2123,10 @@ class SubagentRuntime:
                     f"Second arbiter tried to correct {span!r} but its "
                     f"corrected_annotation contains a non-verbatim span "
                     f"({failed_target.get('span')!r} at "
-                    f"{failed_target.get('field')!r}) after retries exhausted. "
-                    f"Bad correction preserved in event metadata; needs human "
-                    f"review (first arbiter said {first_type!r}, project prior "
-                    f"dominant {prior_type!r})"
+                    f"{failed_target.get('field')!r}) after retries exhausted "
+                    f"and strip could not salvage a valid correction. "
+                    f"Needs human review (first arbiter said {first_type!r}, "
+                    f"project prior dominant {prior_type!r})"
                 ),
                 stage="prior_verifier",
                 attempt_id=attempt_id,
@@ -3018,9 +3035,9 @@ class SubagentRuntime:
                         except Exception:  # noqa: BLE001
                             pass
                         # `result` now holds fallback output — skip the raise.
-                elif _is_rate_limited(exc):
+                elif _is_provider_transient_error(exc):
                     raise _ArbiterRateLimited(
-                        f"rate_limit/{type(exc).__name__}: {exc!s}{tail}"
+                        f"transient/{type(exc).__name__}: {exc!s}{tail}"
                     ) from exc
                 else:
                     raise _ArbiterCallFailed(
@@ -3539,6 +3556,13 @@ def _build_qc_instructions(
         "also appears as an entity type, treat the json_structures version as OPTIONAL — do NOT flag tasks for "
         "missing json_structures entries just because the same name appears in entities. "
         "\n\n"
+        "SEVERITY: every entry in failures MUST include a severity field set to ONE of these "
+        "strings exactly (the runtime rejects any other value):\n"
+        "  - \"blocking\" = prevents downstream use; task cannot proceed without this fix.\n"
+        "  - \"error\"    = clear defect that must be corrected (wrong type, verbatim mismatch, missing required entity).\n"
+        "  - \"warning\"  = likely defect but debatable; annotator should review (e.g. borderline case, tentative type choice).\n"
+        "  - \"info\"     = advisory note; does not require a fix but worth flagging.\n"
+        "\n"
         "CONFIDENCE: every entry in failures MUST include a confidence field set to ONE of these "
         "strings (no numbers; the runtime won't accept them):\n"
         "  - \"certain\"   = you can quote the exact verbatim span the annotation got wrong; any reasonable "
@@ -4014,7 +4038,7 @@ def _feedback_from_qc_decision(task: Task, attempt_id: str, decision: dict[str, 
             task_id=task.task_id,
             attempt_id=attempt_id,
             source_stage=FeedbackSource.QC,
-            severity=FeedbackSeverity(failure.get("severity") or decision["severity"]),
+            severity=FeedbackSeverity(failure.get("severity") or decision.get("severity") or FeedbackSeverity.WARNING.value),
             category=str(failure.get("category") or decision.get("category") or "qc"),
             message=str(failure.get("message") or decision.get("message") or "QC rejected the annotation result."),
             target=failure.get("target") if isinstance(failure.get("target"), dict) else decision.get("target") if isinstance(decision.get("target"), dict) else {},
@@ -4032,3 +4056,34 @@ def _severity_value(value: object) -> str:
         except ValueError:
             return FeedbackSeverity.WARNING.value
     return FeedbackSeverity.WARNING.value
+
+
+def _strip_non_verbatim_spans_in_place(corrected: dict, violations: list[dict]) -> int:
+    """Remove hallucinated (non-verbatim) spans from a corrected_annotation dict.
+
+    Mutates ``corrected`` in-place. Returns the number of spans removed.
+    Each violation is a dict with keys ``row_index``, ``field`` (e.g.
+    ``"entities.organization"``), and ``span``.
+    """
+    removed = 0
+    for v in violations:
+        row_idx = v.get("row_index")
+        field = v.get("field", "")   # e.g. "entities.organization"
+        span = v.get("span")
+        if span is None or not field:
+            continue
+        parts = field.split(".", 1)
+        if len(parts) != 2:
+            continue
+        typ_dict_key, type_name = parts
+        for row in corrected.get("rows", []):
+            if not isinstance(row, dict) or row.get("row_index") != row_idx:
+                continue
+            output = row.get("output")
+            if not isinstance(output, dict):
+                continue
+            items = output.get(typ_dict_key, {}).get(type_name)
+            if isinstance(items, list) and span in items:
+                items.remove(span)
+                removed += 1
+    return removed
