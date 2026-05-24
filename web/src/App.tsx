@@ -3,16 +3,18 @@ import {
   fetchKanbanSnapshot,
   fetchProjects,
   fetchRuntimeMonitor,
+  fetchRuntimeSnapshot,
   fetchStores,
   fetchTaskDetail,
   postHumanReviewDecision,
   postTaskMove,
+  startRuntime,
+  stopRuntime,
 } from "./api";
 import { ConfigPanel } from "./components/ConfigPanel";
 import { DashboardStatsBar } from "./components/DashboardStatsBar";
 import { AnnotationRulesPanel } from "./components/AnnotationRulesPanel";
 import { SchemaPanel } from "./components/SchemaPanel";
-import { EventLogPanel } from "./components/EventLogPanel";
 import { EntityKnowledgePanel } from "./components/EntityKnowledgePanel";
 import { KanbanBoard } from "./components/KanbanBoard";
 import { OutputPanel } from "./components/OutputPanel";
@@ -48,12 +50,13 @@ type ViewMode =
   | "output";
 
 // Backward-compatible aliases for old URLs that still link to the
-// since-merged standalone tabs. `alerts` used to be a top-level tab; it
-// now lives as a sub-tab inside Runtime, so route the old URL there.
+// since-merged standalone tabs. `alerts` and `events` used to be top-level
+// tabs; they now live as sub-tabs inside Runtime.
 function canonicalizeViewMode(raw: string): ViewMode {
   if (raw === "distribution") return "statistics";
   if (raw === "schema") return "annotation-rules";
   if (raw === "alerts") return "runtime";
+  if (raw === "events") return "runtime";
   return raw as ViewMode;
 }
 
@@ -93,20 +96,29 @@ export default function App() {
   const [runtimeSubtab, setRuntimeSubtab] = useState<RuntimeSubtab>("overview");
   useEffect(() => {
     if (urlState.view === "alerts") setRuntimeSubtab("alerts");
+    else if (urlState.view === "events") setRuntimeSubtab("events");
   }, [urlState.view]);
 
   // ── Runtime issue badge ───────────────────────────────────────────────
   // Poll the runtime monitor every 30s so the Runtime tab can show a red
   // dot + failure count even when the operator is on a different tab.
   const [runtimeIssueCount, setRuntimeIssueCount] = useState(0);
+  const [runtimeHealthy, setRuntimeHealthy] = useState<boolean | null>(null);
+  const [runtimeStarting, setRuntimeStarting] = useState(false);
+  const [runtimeStopping, setRuntimeStopping] = useState(false);
   useEffect(() => {
     let active = true;
     let timer: number | null = null;
+    setRuntimeHealthy(null);
     async function poll() {
       try {
-        const report = await fetchRuntimeMonitor(selectedStoreKey);
+        const [report, snap] = await Promise.all([
+          fetchRuntimeMonitor(selectedStoreKey),
+          fetchRuntimeSnapshot(selectedStoreKey),
+        ]);
         if (!active) return;
         setRuntimeIssueCount(report.ok ? 0 : report.failures.length);
+        setRuntimeHealthy(snap.runtime_status.healthy);
       } catch {
         if (active) setRuntimeIssueCount(0);
       } finally {
@@ -119,6 +131,30 @@ export default function App() {
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [selectedStoreKey]);
+
+  async function handleRuntimeStart() {
+    setRuntimeStarting(true);
+    try {
+      await startRuntime(selectedStoreKey);
+      await new Promise((r) => setTimeout(r, 1500));
+      const snap = await fetchRuntimeSnapshot(selectedStoreKey);
+      setRuntimeHealthy(snap.runtime_status.healthy);
+    } catch { /* ignore */ } finally {
+      setRuntimeStarting(false);
+    }
+  }
+
+  async function handleRuntimeStop() {
+    setRuntimeStopping(true);
+    try {
+      await stopRuntime(selectedStoreKey);
+      await new Promise((r) => setTimeout(r, 1500));
+      const snap = await fetchRuntimeSnapshot(selectedStoreKey);
+      setRuntimeHealthy(snap.runtime_status.healthy);
+    } catch { /* ignore */ } finally {
+      setRuntimeStopping(false);
+    }
+  }
 
   const [selectedDetail, setSelectedDetail] = useState<TaskDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -243,7 +279,18 @@ export default function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>Annotation Pipeline</h1>
+          <div className="topbar-title-row">
+            <h1>Annotation Pipeline</h1>
+            {runtimeHealthy === false ? (
+              <button className="primary-button topbar-runtime-btn" type="button" disabled={runtimeStarting} onClick={handleRuntimeStart}>
+                {runtimeStarting ? "Starting…" : "▶ Start"}
+              </button>
+            ) : runtimeHealthy === true ? (
+              <button className="view-tab danger topbar-runtime-btn" type="button" disabled={runtimeStopping} onClick={handleRuntimeStop}>
+                {runtimeStopping ? "Stopping…" : "⏹ Stop"}
+              </button>
+            ) : null}
+          </div>
           <p>{countCards(snapshot)} tasks across operational stages</p>
           {workspacePath ? (
             <p className="workspace-path" title="serve --workspace argument">
@@ -360,15 +407,6 @@ export default function App() {
           Configuration
         </button>
         <button
-          className={viewMode === "events" ? "view-tab selected" : "view-tab"}
-          role="tab"
-          aria-selected={viewMode === "events"}
-          type="button"
-          onClick={() => setView("events")}
-        >
-          Event Log
-        </button>
-        <button
           className={viewMode === "entity-knowledge" ? "view-tab selected" : "view-tab"}
           role="tab"
           aria-selected={viewMode === "entity-knowledge"}
@@ -412,6 +450,7 @@ export default function App() {
       {viewMode === "runtime" ? (
         <RuntimePanel
           storeKey={selectedStoreKey}
+          projectId={selectedProjectId}
           subtab={runtimeSubtab}
           onSubtabChange={setRuntimeSubtab}
         />
@@ -419,7 +458,6 @@ export default function App() {
       {viewMode === "output" ? <OutputPanel projectId={selectedProjectId} storeKey={selectedStoreKey} storePath={stores.find((s) => s.key === selectedStoreKey)?.path ?? null} /> : null}
       {viewMode === "providers" ? <ProvidersPanel /> : null}
       {viewMode === "config" ? <ConfigPanel storeKey={selectedStoreKey} /> : null}
-      {viewMode === "events" ? <EventLogPanel projectId={selectedProjectId} storeKey={selectedStoreKey} /> : null}
       {viewMode === "annotation-rules" ? (
         <section className="runtime-panel" aria-label="Annotation rules and schema">
           <nav className="sub-tabs" aria-label="Annotation rules sections" role="tablist">

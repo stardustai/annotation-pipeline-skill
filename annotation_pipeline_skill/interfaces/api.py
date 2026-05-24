@@ -43,6 +43,15 @@ _BACKGROUND_JOBS_LOCK = threading.Lock()
 _BACKGROUND_INFLIGHT: dict[tuple[str, str], str] = {}
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the given PID is still running (Linux/macOS)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _start_background_job(
     *,
     kind: str,
@@ -1097,6 +1106,10 @@ class DashboardApi:
         project_id = query.get("project", [None])[0]
         if route == "/api/runtime/run-once":
             return self._runtime_run_once_response()
+        if route == "/api/runtime/start":
+            return self._runtime_start_response(store)
+        if route == "/api/runtime/stop":
+            return self._runtime_stop_response(store)
         if route == "/api/posterior-audit/retroactive-fix":
             return self._post_posterior_audit_retroactive_fix(store, body)
         if route == "/api/entity-statistics/recount":
@@ -1540,6 +1553,68 @@ class DashboardApi:
             return self._json_response(409, {"error": "runtime_runner_unavailable"})
         snapshot = self.runtime_once()
         return self._json_response(200, {"ok": True, "snapshot": snapshot.to_dict()})
+
+    def _runtime_start_response(self, store: SqliteStore) -> tuple[int, dict[str, str], bytes]:
+        import shutil
+        import subprocess
+
+        owner_path = store.root / "runtime" / "scheduler_owner.json"
+        if owner_path.exists():
+            try:
+                owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                pid = owner.get("pid")
+                if pid and _pid_alive(pid):
+                    return self._json_response(409, {
+                        "error": "already_running",
+                        "pid": pid,
+                        "project_root": str(store.root.parent),
+                    })
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        project_root = store.root.parent
+        binary = shutil.which("annotation-pipeline")
+        if not binary:
+            return self._json_response(500, {"error": "annotation-pipeline binary not found on PATH"})
+
+        log_path = self.workspace_root / "runtime.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as log_f:
+            proc = subprocess.Popen(
+                [binary, "runtime", "run", "--project-root", str(project_root)],
+                stdout=log_f,
+                stderr=log_f,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        return self._json_response(200, {
+            "ok": True,
+            "pid": proc.pid,
+            "project_root": str(project_root),
+        })
+
+    def _runtime_stop_response(self, store: SqliteStore) -> tuple[int, dict[str, str], bytes]:
+        import signal
+
+        owner_path = store.root / "runtime" / "scheduler_owner.json"
+        if not owner_path.exists():
+            return self._json_response(404, {"error": "no_scheduler_running"})
+        try:
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return self._json_response(500, {"error": "cannot_read_owner", "detail": str(exc)})
+
+        pid = owner.get("pid")
+        if not pid:
+            return self._json_response(404, {"error": "no_pid_in_owner"})
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            owner_path.unlink(missing_ok=True)
+            return self._json_response(404, {"error": "process_not_found"})
+        except PermissionError:
+            return self._json_response(403, {"error": "permission_denied"})
+        return self._json_response(200, {"ok": True, "pid": pid})
 
     def _provider_config_response(self, store: SqliteStore) -> tuple[int, dict[str, str], bytes]:
         try:

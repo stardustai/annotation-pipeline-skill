@@ -58,10 +58,13 @@ def build_runtime_snapshot(
         active_count=active_count,
         available_slots=max(config.max_concurrent_tasks - active_count, 0),
     )
+    _claimable = {TaskStatus.PENDING, TaskStatus.QC, TaskStatus.ARBITRATING, TaskStatus.ANNOTATING}
     due_retries = sorted(
         task.task_id
         for task in tasks
-        if task.next_retry_at is not None and task.next_retry_at <= generated_at
+        if task.next_retry_at is not None
+        and task.next_retry_at <= generated_at
+        and task.status in _claimable
     )
 
     return RuntimeSnapshot(

@@ -4,16 +4,20 @@ import {
   fetchRuntimeMonitor,
   fetchRuntimeSnapshot,
   runRuntimeOnce,
+  startRuntime,
+  stopRuntime,
   type AlertEntry,
 } from "../api";
 import { formatRuntimeDate, orderedQueueCounts } from "../runtime";
 import type { ActiveRun, RuntimeMonitorReport, RuntimeSnapshot } from "../types";
 import { AlertsPanel } from "./AlertsPanel";
+import { EventLogPanel } from "./EventLogPanel";
 
-export type RuntimeSubtab = "overview" | "alerts";
+export type RuntimeSubtab = "overview" | "alerts" | "events";
 
 interface RuntimePanelProps {
   storeKey: string | null;
+  projectId: string | null;
   subtab: RuntimeSubtab;
   onSubtabChange: (subtab: RuntimeSubtab) => void;
 }
@@ -21,12 +25,14 @@ interface RuntimePanelProps {
 const REFRESH_MS = 5000;
 const RECENT_ALERTS_LIMIT = 20;
 
-export function RuntimePanel({ storeKey, subtab, onSubtabChange }: RuntimePanelProps) {
+export function RuntimePanel({ storeKey, projectId, subtab, onSubtabChange }: RuntimePanelProps) {
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
   const [monitor, setMonitor] = useState<RuntimeMonitorReport | null>(null);
   const [alerts, setAlerts] = useState<AlertEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function load() {
@@ -76,6 +82,34 @@ export function RuntimePanel({ storeKey, subtab, onSubtabChange }: RuntimePanelP
     }
   }
 
+  async function handleStart() {
+    setStarting(true);
+    setError(null);
+    try {
+      await startRuntime(storeKey);
+      await new Promise((r) => setTimeout(r, 1500));
+      await load();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "Unable to start runtime");
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  async function handleStop() {
+    setStopping(true);
+    setError(null);
+    try {
+      await stopRuntime(storeKey);
+      await new Promise((r) => setTimeout(r, 1500));
+      await load();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "Unable to stop runtime");
+    } finally {
+      setStopping(false);
+    }
+  }
+
   if (loading && !snapshot) return <section className="runtime-panel">Loading runtime…</section>;
   if (!snapshot) return <section className="runtime-panel notice compact">{error ?? "Runtime unavailable"}</section>;
 
@@ -83,7 +117,7 @@ export function RuntimePanel({ storeKey, subtab, onSubtabChange }: RuntimePanelP
   const alertCount = alerts.length;
 
   return (
-    <section className="runtime-panel">
+    <section className={subtab === "events" ? "runtime-panel runtime-panel--events" : "runtime-panel"}>
       <nav className="sub-tabs" aria-label="Runtime sections" role="tablist">
         <button
           className={subtab === "overview" ? "sub-tab selected" : "sub-tab"}
@@ -105,10 +139,21 @@ export function RuntimePanel({ storeKey, subtab, onSubtabChange }: RuntimePanelP
           Alerts
           {alertCount > 0 ? <span className="sub-tab-badge sub-tab-badge--warn">{alertCount}</span> : null}
         </button>
+        <button
+          className={subtab === "events" ? "sub-tab selected" : "sub-tab"}
+          role="tab"
+          type="button"
+          aria-selected={subtab === "events"}
+          onClick={() => onSubtabChange("events")}
+        >
+          Event Log
+        </button>
       </nav>
 
       {subtab === "alerts" ? (
         <AlertsPanel storeKey={storeKey} />
+      ) : subtab === "events" ? (
+        <EventLogPanel projectId={projectId} storeKey={storeKey} />
       ) : (
         <RuntimeOverview
           snapshot={snapshot}
@@ -116,8 +161,12 @@ export function RuntimePanel({ storeKey, subtab, onSubtabChange }: RuntimePanelP
           recentAlerts={alerts}
           totalAlerts={alertCount}
           running={running}
+          starting={starting}
+          stopping={stopping}
           error={error}
           onRunOnce={runOnce}
+          onStart={handleStart}
+          onStop={handleStop}
           onViewAllAlerts={() => onSubtabChange("alerts")}
         />
       )}
@@ -131,8 +180,12 @@ interface OverviewProps {
   recentAlerts: AlertEntry[];
   totalAlerts: number;
   running: boolean;
+  starting: boolean;
+  stopping: boolean;
   error: string | null;
   onRunOnce: () => void;
+  onStart: () => void;
+  onStop: () => void;
   onViewAllAlerts: () => void;
 }
 
@@ -142,8 +195,12 @@ function RuntimeOverview({
   recentAlerts,
   totalAlerts,
   running,
+  starting,
+  stopping,
   error,
   onRunOnce,
+  onStart,
+  onStop,
   onViewAllAlerts,
 }: OverviewProps) {
   const queueItems = orderedQueueCounts(snapshot);
@@ -189,9 +246,20 @@ function RuntimeOverview({
             as of {ageSince(snapshot.generated_at)} ago
           </span>
         </div>
-        <button className="primary-button" type="button" disabled={running} onClick={onRunOnce}>
-          {running ? "Running…" : "Drain queue"}
-        </button>
+        <div className="runtime-action-row">
+          {healthy ? (
+            <button className="view-tab danger" type="button" disabled={stopping} onClick={onStop}>
+              {stopping ? "Stopping…" : "⏹ Stop"}
+            </button>
+          ) : (
+            <button className="primary-button" type="button" disabled={starting} onClick={onStart}>
+              {starting ? "Starting…" : "▶ Start"}
+            </button>
+          )}
+          <button className="view-tab" type="button" disabled={running} onClick={onRunOnce}>
+            {running ? "Running…" : "Drain queue"}
+          </button>
+        </div>
       </div>
 
       <QueueBar items={queueItems} total={queueTotal} />

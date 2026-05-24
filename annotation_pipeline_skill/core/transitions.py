@@ -6,6 +6,9 @@ class InvalidTransition(ValueError):
     pass
 
 
+_TERMINAL = {TaskStatus.ACCEPTED, TaskStatus.REJECTED, TaskStatus.BLOCKED, TaskStatus.CANCELLED}
+
+
 ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.DRAFT: {TaskStatus.PENDING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
     TaskStatus.PENDING: {TaskStatus.ANNOTATING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
@@ -75,6 +78,8 @@ def transition_task(
 
     task.status = next_status
     task.updated_at = utc_now()
+    if next_status in _TERMINAL:
+        task.next_retry_at = None
     return AuditEvent.new(
         task_id=task.task_id,
         previous_status=previous_status,

@@ -33,7 +33,7 @@ interface AlertItem {
 type MarqueeItem = TransitionItem | AlertItem;
 
 /**
- * Top-bar scrolling marquee of recent provider alerts and task transitions.
+ * Top-bar scrolling marquee of recent system alerts and task transitions.
  *
  * Renders nothing when there are no fresh items. Polls /api/alerts every 15s
  * (freshness controlled by `freshnessMinutes`) and /api/events every 15s

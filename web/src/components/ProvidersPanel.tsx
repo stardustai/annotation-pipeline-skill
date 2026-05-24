@@ -11,7 +11,7 @@ import type { ProviderConfigSnapshot, Runtime, ProviderProfileConfig } from "../
 const stageTargets = [
   "annotation", "qc",
   "arbiter", "arbiter_secondary",
-  "coordinator", "fallback",
+  "fallback",
 ];
 
 export function ProvidersPanel() {
@@ -178,6 +178,8 @@ export function ProvidersPanel() {
             <select value={newRuntime} onChange={(event) => setNewRuntime(event.target.value as Runtime)}>
               <option value="claude_cli">claude_cli</option>
               <option value="codex_cli">codex_cli</option>
+              <option value="anthropic_sdk">anthropic_sdk</option>
+              <option value="openai_sdk">openai_sdk</option>
             </select>
             <button className="view-tab" type="button" onClick={addProfile}>
               Add
@@ -212,7 +214,7 @@ export function ProvidersPanel() {
                 <SelectField
                   label="Runtime"
                   value={selected.runtime}
-                  options={["claude_cli", "codex_cli"]}
+                  options={["claude_cli", "codex_cli", "anthropic_sdk", "openai_sdk"]}
                   onChange={(value) => updateSelected({ runtime: value as Runtime })}
                 />
                 <TextField label="Model" value={selected.model} onChange={(value) => updateSelected({ model: value })} />

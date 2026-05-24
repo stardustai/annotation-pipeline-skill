@@ -815,6 +815,12 @@ class LocalRuntimeScheduler:
                     file=sys.stderr,
                     flush=True,
                 )
+                from annotation_pipeline_skill.runtime.alerts import append_alert
+                append_alert(self.store.root, {
+                    "ts": self._now_fn().isoformat(),
+                    "kind": "config_reload",
+                    "message": f"max_concurrent_tasks: {old} → {new_max}",
+                })
                 while spawned_workers < new_max:
                     worker_tasks.append(asyncio.create_task(worker(spawned_workers)))
                     spawned_workers += 1
@@ -836,6 +842,12 @@ class LocalRuntimeScheduler:
                         file=sys.stderr,
                         flush=True,
                     )
+                    from annotation_pipeline_skill.runtime.alerts import append_alert
+                    append_alert(self.store.root, {
+                        "ts": self._now_fn().isoformat(),
+                        "kind": "config_reload",
+                        "message": ", ".join(changes),
+                    })
                 self._registry = reg
 
         async def config_watcher() -> None:

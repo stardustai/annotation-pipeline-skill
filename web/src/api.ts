@@ -365,6 +365,24 @@ export async function runRuntimeOnce(storeKey: string | null = null): Promise<Ru
   return response.json() as Promise<RuntimeRunOnceResponse>;
 }
 
+export async function startRuntime(storeKey: string | null = null): Promise<{ ok: boolean; pid: number; project_root: string }> {
+  const response = await fetch(withStore("/api/runtime/start", storeKey), { method: "POST", body: "{}" });
+  const payload = (await response.json().catch(() => null)) as { ok?: boolean; pid?: number; project_root?: string; error?: string } | null;
+  if (!response.ok) {
+    throw new Error(payload?.error ?? `Runtime start API returned ${response.status}`);
+  }
+  return payload as { ok: boolean; pid: number; project_root: string };
+}
+
+export async function stopRuntime(storeKey: string | null = null): Promise<{ ok: boolean; pid: number }> {
+  const response = await fetch(withStore("/api/runtime/stop", storeKey), { method: "POST", body: "{}" });
+  const payload = (await response.json().catch(() => null)) as { ok?: boolean; pid?: number; error?: string } | null;
+  if (!response.ok) {
+    throw new Error(payload?.error ?? `Runtime stop API returned ${response.status}`);
+  }
+  return payload as { ok: boolean; pid: number };
+}
+
 export async function fetchProviderConfig(storeKey: string | null = null): Promise<ProviderConfigSnapshot> {
   const response = await fetch(withStore("/api/providers", storeKey));
   if (!response.ok) {

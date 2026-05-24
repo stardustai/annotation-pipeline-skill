@@ -47,10 +47,10 @@ export function AlertsPanel({ storeKey }: AlertsPanelProps) {
   const summary = useMemo(() => summarize(alerts), [alerts]);
 
   return (
-    <section className="work-panel alerts-panel" aria-label="Provider alerts">
+    <section className="work-panel alerts-panel" aria-label="System alerts">
       <div className="panel-header">
         <div>
-          <h2>Provider Alerts</h2>
+          <h2>System Alerts</h2>
           <p>
             {alerts.length} entr{alerts.length === 1 ? "y" : "ies"} from <code>{path}</code>
             {summary.lastTs ? ` · most recent ${ageDescription(summary.lastTs, now)}` : ""}
@@ -68,8 +68,8 @@ export function AlertsPanel({ storeKey }: AlertsPanelProps) {
       {error ? <div className="drawer-error">{error}</div> : null}
       {!loading && alerts.length === 0 && !error ? (
         <div className="drawer-state empty">
-          No alerts on file. This is good — provider health probes pass and no
-          permanent provider errors have been raised since the last alerts.jsonl
+          No system alerts on file. Provider health probes pass, no config
+          reloads logged, and no permanent errors since the last alerts.jsonl
           rotation.
         </div>
       ) : null}

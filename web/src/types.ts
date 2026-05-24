@@ -251,7 +251,7 @@ export interface OutboxSummary {
   records: OutboxRecord[];
 }
 
-export type Runtime = "claude_cli" | "codex_cli";
+export type Runtime = "claude_cli" | "codex_cli" | "anthropic_sdk" | "openai_sdk";
 
 export interface ProviderProfileConfig {
   name: string;

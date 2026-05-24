@@ -179,11 +179,12 @@ def _profile_to_dict(profile: LLMProfile) -> dict[str, Any]:
 
 
 def _profile_diagnostics(profile: LLMProfile, *, env: Mapping[str, str]) -> dict[str, Any]:
-    # codex_cli is the only remaining runtime that shells out to a binary.
-    # SDK runtimes (anthropic_sdk, openai_sdk) talk HTTP from Python; the
-    # legacy cli_binary_found check just returns ok for them since there's
-    # nothing to look up on PATH.
-    binary = "codex" if profile.runtime == "codex_cli" else None
+    # CLI runtimes shell out to a binary; SDK runtimes talk HTTP from Python.
+    binary = (
+        "codex" if profile.runtime == "codex_cli"
+        else "claude" if profile.runtime == "claude_cli"
+        else None
+    )
     checks: list[dict[str, Any]] = []
     if binary is not None:
         found = _cli_binary_found(binary)
