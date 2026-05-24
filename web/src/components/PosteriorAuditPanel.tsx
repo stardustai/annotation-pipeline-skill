@@ -307,15 +307,6 @@ export function PosteriorAuditPanel({
                 Low info entries ({lowInfo.length})
               </button>
             </nav>
-            <input
-              type="search"
-              placeholder={
-                subtab === "deviations" ? "Filter task / span / type…" : "Filter span…"
-              }
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              style={{ width: "min(300px, 40%)", marginLeft: "auto" }}
-            />
             {subtab === "contested" ? (
               <label
                 style={{
@@ -360,6 +351,7 @@ export function PosteriorAuditPanel({
                   storeKey={storeKey ?? null}
                   onSendToHr={onSendToHr}
                   externalFilter={filter}
+                  onFilterChange={setFilter}
                   onAfterFix={() => {
                     if (!projectId) return;
                     fetch(urlWithStore("/api/posterior-audit", projectId, storeKey))
@@ -395,6 +387,7 @@ export function PosteriorAuditPanel({
                   onDeclare={onDeclareCanonical}
                   onAfterRetroactiveFix={reloadCache}
                   externalFilter={filter}
+                  onFilterChange={setFilter}
                   saveAsConvention={saveAsConvention}
                 />
               ) : (
@@ -423,6 +416,7 @@ export function PosteriorAuditPanel({
                     storeKey={storeKey ?? null}
                     onAfterFix={reloadCache}
                     externalFilter={filter}
+                    onFilterChange={setFilter}
                     selected={lowInfoSelected}
                     setSelected={setLowInfoSelected}
                     bulkRunning={lowInfoBulkRunning}
@@ -457,6 +451,7 @@ function DeviationsTable({
   onSendToHr,
   onAfterFix,
   externalFilter,
+  onFilterChange,
 }: {
   items: TaskDeviation[];
   projectId: string;
@@ -464,6 +459,7 @@ function DeviationsTable({
   onSendToHr: (taskId: string) => Promise<void> | void;
   onAfterFix: () => void;
   externalFilter?: string;
+  onFilterChange?: (v: string) => void;
 }): React.ReactElement {
   const filter = externalFilter ?? "";
   const [page, setPage] = useState(0);
@@ -792,18 +788,25 @@ function DeviationsTable({
           </div>
         </div>
       ) : null}
-      <div style={{ margin: "0.4rem 0", fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
-        {filter ? `${filtered.length} of ${deduped.length}` : `${deduped.length} unique`}
-        {items.length !== deduped.length
-          ? ` (${items.length} raw rows deduped)`
-          : ""}
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.4rem 0", flexWrap: "wrap" }}>
+        <div style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+          {filter ? `${filtered.length} of ${deduped.length}` : `${deduped.length} unique`}
+          {items.length !== deduped.length ? ` (${items.length} raw rows deduped)` : ""}
+        </div>
+        <Pagination
+          total={filtered.length}
+          page={page}
+          pageSize={PAGE_SIZE}
+          onPageChange={setPage}
+        />
+        <input
+          type="search"
+          placeholder="Filter task / span / type…"
+          value={filter}
+          onChange={(e) => onFilterChange?.(e.target.value)}
+          style={{ marginLeft: "auto", width: "min(260px, 38%)" }}
+        />
       </div>
-      <Pagination
-        total={filtered.length}
-        page={page}
-        pageSize={PAGE_SIZE}
-        onPageChange={setPage}
-      />
       <div className="runtime-card">
         <table style={TABLE_STYLE}>
           <thead>
@@ -1057,6 +1060,7 @@ function ContestedTable({
   onDeclare,
   onAfterRetroactiveFix,
   externalFilter,
+  onFilterChange,
   saveAsConvention,
 }: {
   items: DivergentEntry[];
@@ -1065,6 +1069,7 @@ function ContestedTable({
   onDeclare: (span: string, entityType: string) => Promise<void> | void;
   onAfterRetroactiveFix?: () => void;
   externalFilter?: string;
+  onFilterChange?: (v: string) => void;
   saveAsConvention?: boolean;
 }): React.ReactElement {
   const filter = externalFilter ?? "";
@@ -1355,16 +1360,25 @@ function ContestedTable({
           </div>
         </div>
       ) : null}
-      <div style={{ margin: "0.4rem 0", fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
-        {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
-      </div>
       {error ? <div className="notice compact">{error}</div> : null}
-      <Pagination
-        total={filtered.length}
-        page={page}
-        pageSize={CONTESTED_PAGE_SIZE}
-        onPageChange={setPage}
-      />
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.4rem 0", flexWrap: "wrap" }}>
+        <div style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+          {filter ? `${filtered.length} of ${items.length}` : `${items.length} total`}
+        </div>
+        <Pagination
+          total={filtered.length}
+          page={page}
+          pageSize={CONTESTED_PAGE_SIZE}
+          onPageChange={setPage}
+        />
+        <input
+          type="search"
+          placeholder="Filter span…"
+          value={filter}
+          onChange={(e) => onFilterChange?.(e.target.value)}
+          style={{ marginLeft: "auto", width: "min(260px, 38%)" }}
+        />
+      </div>
       <div className="runtime-card">
         <table style={TABLE_STYLE}>
           <thead>
@@ -1579,6 +1593,7 @@ function LowInfoTable({
   storeKey,
   onAfterFix,
   externalFilter,
+  onFilterChange,
   selected,
   setSelected,
   bulkRunning,
@@ -1594,6 +1609,7 @@ function LowInfoTable({
   storeKey: string | null;
   onAfterFix?: () => void;
   externalFilter?: string;
+  onFilterChange?: (v: string) => void;
   selected: Set<string>;
   setSelected: React.Dispatch<React.SetStateAction<Set<string>>>;
   bulkRunning: boolean;
@@ -1750,6 +1766,13 @@ function LowInfoTable({
           page={page}
           pageSize={LOW_INFO_PAGE_SIZE}
           onPageChange={setPage}
+        />
+        <input
+          type="search"
+          placeholder="Filter span…"
+          value={filter}
+          onChange={(e) => onFilterChange?.(e.target.value)}
+          style={{ width: "min(200px, 30%)" }}
         />
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.6rem" }}>
           <label
