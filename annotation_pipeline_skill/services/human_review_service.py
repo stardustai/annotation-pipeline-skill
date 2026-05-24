@@ -92,7 +92,7 @@ class HumanReviewService:
                         note = f"{note} — {feedback.strip()}"
                     self.submit_correction(
                         task_id=task_id, answer=answer, actor=actor,
-                        note=note, force=False,
+                        note=note, force=True,
                     )
                     return HumanReviewDecisionResult(
                         task=self.store.load_task(task_id),
