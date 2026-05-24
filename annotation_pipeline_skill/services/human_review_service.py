@@ -12,6 +12,7 @@ from annotation_pipeline_skill.core.schema_validation import (
     find_cross_type_collisions,
     find_trailing_punctuation_spans,
     find_verbatim_violations,
+    resolve_output_schema,
     validate_payload_against_task_schema,
 )
 from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource, TaskStatus
@@ -570,7 +571,7 @@ class HumanReviewService:
         # adjudicate manually, but they will block submit_correction's
         # strict checks. We auto-fix them deterministically so the
         # operator's scoped edit doesn't get derailed by unrelated noise.
-        new_answer = _autoclean_pre_existing_defects(task, new_answer)
+        new_answer = _autoclean_pre_existing_defects(task, new_answer, store=self.store)
 
         # Transition ACCEPTED → HUMAN_REVIEW so submit_correction's
         # required-status check passes. Reason surfaces in audit log.
@@ -747,9 +748,11 @@ def _input_text_by_row(task) -> dict[int, str]:
     return out
 
 
-def _autoclean_pre_existing_defects(task, payload: dict) -> dict:
+def _autoclean_pre_existing_defects(task, payload: dict, store=None) -> dict:
     """Mutate `payload` in place to clean defects that submit_correction
     rejects:
+      - schema-disallowed output keys (e.g. old 'classifications'/'relations'
+        fields from a prior schema version) → stripped silently
       - non-verbatim spans → first try to repair (case fix, whitespace
         normalization, fuzzy substring match); drop only if no repair works
       - trailing-sentence-punctuation spans → replace with trimmed form
@@ -757,6 +760,23 @@ def _autoclean_pre_existing_defects(task, payload: dict) -> dict:
         types in one row) → keep the first listed type, drop the others
     Returns the same `payload` reference for chaining.
     """
+    # Strip output keys that the current schema does not allow.
+    schema = resolve_output_schema(task, store)
+    if isinstance(schema, dict):
+        rows_items = schema.get("properties", {}).get("rows", {}).get("items", {})
+        allowed_output_keys = set(
+            rows_items.get("properties", {}).get("output", {}).get("properties", {}).keys()
+        )
+        if allowed_output_keys:
+            for row in payload.get("rows", []):
+                if not isinstance(row, dict):
+                    continue
+                output = row.get("output")
+                if not isinstance(output, dict):
+                    continue
+                for key in list(output.keys()):
+                    if key not in allowed_output_keys:
+                        del output[key]
     # Non-verbatim spans: repair first, drop only as last resort.
     input_by_row = _input_text_by_row(task)
     for v in find_verbatim_violations(task, payload):
