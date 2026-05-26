@@ -2318,3 +2318,77 @@ def test_resolve_uncertain_arbiter_unavailable_goes_to_hr(tmp_path):
     after = store.load_task("t-unc4")
     assert after.status is TaskStatus.HUMAN_REVIEW, f"expected HUMAN_REVIEW, got {after.status}"
     assert not after.metadata.get("arbiter_uncertain_needs_second")
+
+
+def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
+    """Arbiter 5xx transient errors must NOT count toward ARBITER_MECHANICAL_RETRY_CAP.
+    A task that keeps seeing 500s should stay in ARBITRATING indefinitely, not go to HR.
+    Each failure must stamp next_retry_at with exponential backoff (30s × n, cap 300s)."""
+    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task, FeedbackRecord, FeedbackDiscussionEntry
+    from annotation_pipeline_skill.core.states import FeedbackSource, FeedbackSeverity, TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+    class Transient500Client:
+        async def generate(self, request):
+            raise LocalCLIExecutionError(
+                "local CLI provider failed",
+                {
+                    "runtime": "anthropic_sdk",
+                    "error_event": {"api_error_status": 500, "result_text": "Internal Server Error"},
+                },
+            )
+
+    store = SqliteStore.open(tmp_path)
+
+    # Create task in ARBITRATING state with an annotation artifact so the arbiter
+    # can build its prompt (mirrors _make_uncertain_task pattern).
+    task = Task.new(
+        task_id="t-500", pipeline_id="pipe",
+        source_ref={"kind": "jsonl", "payload": {
+            "rows": [{"row_id": "r0", "row_index": 0, "input": "alpha"}],
+        }},
+    )
+    task.status = TaskStatus.ARBITRATING
+    store.save_task(task)
+
+    ann_dir = store.root / "artifact_payloads" / "t-500"
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    ann_payload = {"rows": [{"row_id": "r0", "row_index": 0, "output": {"entities": {}}}]}
+    ann_path = ann_dir / "ann.json"
+    ann_path.write_text(json.dumps({"text": json.dumps(ann_payload)}), encoding="utf-8")
+    store.append_artifact(ArtifactRef.new(
+        task_id="t-500", kind="annotation_result",
+        path=f"artifact_payloads/t-500/ann.json", content_type="application/json",
+    ))
+
+    fb = FeedbackRecord.new(
+        task_id="t-500", attempt_id="t-500-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="missing",
+        target={}, suggested_action="arbiter", created_by="qc",
+    )
+    store.append_feedback(fb)
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t-500", feedback_id=fb.feedback_id,
+        role="annotator", stance="disagree", message="nope", consensus=False, created_by="annotator",
+    ))
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda target: Transient500Client())
+
+    # run_task drives the arbiter directly (run_once only picks up PENDING)
+    cap = SubagentRuntime.ARBITER_MECHANICAL_RETRY_CAP
+    n_runs = cap + 2
+    for _ in range(n_runs):
+        task = store.load_task("t-500")
+        runtime.run_task(task, stage_target="arbiter")
+
+    after = store.load_task("t-500")
+    assert after.status is TaskStatus.ARBITRATING, (
+        f"task should stay ARBITRATING on transient 500s, got {after.status}"
+    )
+    # Backoff must be set (30s × bail#, cap 300s)
+    assert after.next_retry_at is not None, "next_retry_at should be set after transient bail"
+    bail_n = after.metadata.get("arbiter_transient_bail_count", 0)
+    assert bail_n == n_runs, f"expected {n_runs} transient bails, got {bail_n}"

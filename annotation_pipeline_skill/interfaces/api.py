@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import threading
 import traceback
 import uuid
+import zipfile
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -280,6 +282,7 @@ def find_typical_text_for_span(
     exclude_task_ids: list[str] | None = None,
     exclude_keys: list[str] | None = None,
     task_id_filter: str | None = None,
+    source_only: bool = False,
 ) -> dict | None:
     """Return one random ACCEPTED task whose *annotation* tags this exact span
     as an entity or json_structures phrase. Returns the row's input.text so
@@ -296,6 +299,11 @@ def find_typical_text_for_span(
     task's annotation_result → look for the EXACT span string in any
     row's entities/json_structures lists → return the corresponding
     row's input.text.
+
+    When ``source_only=True`` the annotation membership check is skipped:
+    we return any row whose input text contains the span as a whole word
+    (word-boundary match). Useful for Low-Info Entries where the span may
+    have been stripped from annotations but still exists in source text.
 
     Result shape: ``{"task_id": str, "row_index": int, "text": str}`` or None.
     """
@@ -372,6 +380,13 @@ def find_typical_text_for_span(
                         return True
         return False
 
+    # Compile word-boundary pattern for source_only mode once, outside loop.
+    import re as _re_inner
+    _span_word_re = _re_inner.compile(
+        r"(?<![^\W\d_])" + _re_inner.escape(span) + r"(?![^\W\d_])",
+        _re_inner.IGNORECASE,
+    ) if source_only else None
+
     for r in rows:
         if r["task_id"] in excluded:
             continue
@@ -385,41 +400,67 @@ def find_typical_text_for_span(
         input_rows = payload.get("rows")
         if not isinstance(input_rows, list):
             continue
-        ann = _load_annotation(r["task_id"])
-        if not isinstance(ann, dict):
-            continue
-        ann_rows = ann.get("rows")
-        if not isinstance(ann_rows, list):
-            continue
-        # Index annotation rows by row_index for join with input rows.
-        ann_by_idx: dict[int, dict] = {}
-        for i, ar in enumerate(ann_rows):
-            if not isinstance(ar, dict):
+
+        if source_only:
+            # Skip annotation loading entirely; just find rows where the span
+            # appears as a whole word in the input text.
+            for ir in input_rows:
+                if not isinstance(ir, dict):
+                    continue
+                text = ir.get("input")
+                if isinstance(text, dict):
+                    text = text.get("text")
+                if not isinstance(text, str):
+                    continue
+                if not _span_word_re.search(text):  # type: ignore[union-attr]
+                    continue
+                row_index = ir.get("row_index", 0) if isinstance(ir.get("row_index"), int) else 0
+                key = f"{r['task_id']}:{row_index}"
+                if key in excluded_keys:
+                    continue
+                candidates.append({
+                    "task_id": r["task_id"],
+                    "row_index": row_index,
+                    "text": text,
+                })
+                if len(candidates) >= 200:
+                    break
+        else:
+            ann = _load_annotation(r["task_id"])
+            if not isinstance(ann, dict):
                 continue
-            idx = ar.get("row_index") if isinstance(ar.get("row_index"), int) else i
-            ann_by_idx[idx] = ar
-        for ir in input_rows:
-            if not isinstance(ir, dict):
+            ann_rows = ann.get("rows")
+            if not isinstance(ann_rows, list):
                 continue
-            text = ir.get("input")
-            if isinstance(text, dict):
-                text = text.get("text")
-            if not isinstance(text, str):
-                continue
-            row_index = ir.get("row_index", 0) if isinstance(ir.get("row_index"), int) else 0
-            ann_row = ann_by_idx.get(row_index)
-            if not ann_row or not _row_has_span_in_annotation(ann_row, span_lower):
-                continue
-            key = f"{r['task_id']}:{row_index}"
-            if key in excluded_keys:
-                continue
-            candidates.append({
-                "task_id": r["task_id"],
-                "row_index": row_index,
-                "text": text,
-            })
-            if len(candidates) >= 200:
-                break
+            # Index annotation rows by row_index for join with input rows.
+            ann_by_idx: dict[int, dict] = {}
+            for i, ar in enumerate(ann_rows):
+                if not isinstance(ar, dict):
+                    continue
+                idx = ar.get("row_index") if isinstance(ar.get("row_index"), int) else i
+                ann_by_idx[idx] = ar
+            for ir in input_rows:
+                if not isinstance(ir, dict):
+                    continue
+                text = ir.get("input")
+                if isinstance(text, dict):
+                    text = text.get("text")
+                if not isinstance(text, str):
+                    continue
+                row_index = ir.get("row_index", 0) if isinstance(ir.get("row_index"), int) else 0
+                ann_row = ann_by_idx.get(row_index)
+                if not ann_row or not _row_has_span_in_annotation(ann_row, span_lower):
+                    continue
+                key = f"{r['task_id']}:{row_index}"
+                if key in excluded_keys:
+                    continue
+                candidates.append({
+                    "task_id": r["task_id"],
+                    "row_index": row_index,
+                    "text": text,
+                })
+                if len(candidates) >= 200:
+                    break
         if len(candidates) >= 200:
             break
     if not candidates:
@@ -775,14 +816,49 @@ def write_type_statistics_cache(
 
 
 CONFIG_FILE_DEFINITIONS: dict[str, str] = {
-    "annotation_rules.yaml": "Annotation Rules",
     "annotators.yaml": "Annotation Agents",
     "workflow.yaml": "Workflow",
     "external_tasks.yaml": "External Task API",
     "callbacks.yaml": "Callbacks",
     # llm_profiles.yaml is workspace-global; edit via the Providers panel,
     # not the per-project Config panel.
+    # annotation_rules are versioned documents in the DB — not a config file.
 }
+
+
+def _load_active_rules(store) -> tuple[str, str]:
+    """Return (version_label, content) of the latest annotation_rules document version."""
+    try:
+        doc_rows = store._conn.execute(
+            "SELECT document_id, metadata_json FROM documents"
+        ).fetchall()
+    except Exception:
+        return "unknown", ""
+    target_doc_id: str | None = None
+    for r in doc_rows:
+        try:
+            meta = json.loads(r["metadata_json"]) if r["metadata_json"] else {}
+        except Exception:
+            meta = {}
+        if isinstance(meta, dict) and meta.get("role") == "annotation_rules":
+            target_doc_id = r["document_id"]
+            break
+    if not target_doc_id:
+        return "unknown", ""
+    try:
+        ver_row = store._conn.execute(
+            "SELECT version, content_path FROM document_versions "
+            "WHERE document_id = ? ORDER BY created_at DESC LIMIT 1",
+            (target_doc_id,),
+        ).fetchone()
+    except Exception:
+        return "unknown", ""
+    if ver_row is None or not ver_row["content_path"]:
+        return "unknown", ""
+    content_file = store.root / ver_row["content_path"]
+    if not content_file.exists():
+        return ver_row["version"], ""
+    return ver_row["version"], content_file.read_text(encoding="utf-8")
 
 
 class DashboardApi:
@@ -921,6 +997,26 @@ class DashboardApi:
                 return self._json_response(404, {"error": "not_found"})
             filename = candidate.name
             return (200, {"content-type": "application/octet-stream", "content-disposition": f'attachment; filename="{filename}"'}, candidate.read_bytes())
+        if route == "/api/export-zip":
+            export_id = query.get("export_id", [None])[0]
+            if not export_id:
+                return self._json_response(400, {"error": "export_id_required"})
+            export_dir = (store.root / "exports" / export_id).resolve()
+            if not str(export_dir).startswith(str(store.root.resolve())):
+                return self._json_response(403, {"error": "forbidden"})
+            if not export_dir.exists():
+                return self._json_response(404, {"error": "not_found"})
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for f in sorted(export_dir.iterdir()):
+                    if f.is_file():
+                        zf.write(f, arcname=f"{export_id}/{f.name}")
+            zip_bytes = buf.getvalue()
+            return (200, {
+                "content-type": "application/zip",
+                "content-disposition": f'attachment; filename="{export_id}.zip"',
+                "content-length": str(len(zip_bytes)),
+            }, zip_bytes)
         if route == "/api/outbox":
             return self._json_response(200, build_outbox_summary(store, project_id=project_id))
         if route == "/api/conventions":
@@ -1017,6 +1113,7 @@ class DashboardApi:
             exclude = query.get("exclude", [])
             exclude_keys = query.get("exclude_key", [])
             task_id_filter = query.get("task", [None])[0]
+            source_only = query.get("source_only", ["0"])[0] in ("1", "true", "yes")
             result = find_typical_text_for_span(
                 store,
                 project_id=project_id,
@@ -1024,6 +1121,7 @@ class DashboardApi:
                 exclude_task_ids=exclude,
                 exclude_keys=exclude_keys,
                 task_id_filter=task_id_filter,
+                source_only=source_only,
             )
             if result is None:
                 return self._json_response(200, {"found": False})

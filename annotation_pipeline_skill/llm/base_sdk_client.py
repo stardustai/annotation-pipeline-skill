@@ -31,7 +31,7 @@ _MAX_AGENT_ITERATIONS = 10
 _TOOL_FAILURE_BREAKER = 3
 
 
-class LocalCLIExecutionError(Exception):
+class ProviderCallError(Exception):
     """Raised on any unrecoverable provider error, uniform across runtimes."""
 
     def __init__(self, message: str, diagnostics: dict[str, Any] | None = None) -> None:
@@ -85,7 +85,7 @@ class BaseSdkClient(ABC):
         try:
             return await asyncio.wait_for(self._generate(request), timeout=float(timeout))
         except asyncio.TimeoutError:
-            raise LocalCLIExecutionError(
+            raise ProviderCallError(
                 f"sdk timeout after {timeout}s",
                 {"timeout_seconds": timeout, "runtime": self.profile.runtime},
             ) from None
@@ -143,7 +143,7 @@ class BaseSdkClient(ABC):
                 break
 
             if result.stop_reason == "refusal":
-                raise LocalCLIExecutionError(
+                raise ProviderCallError(
                     "model refusal",
                     {"runtime": self.profile.runtime, "iterations": iteration + 1, "stop_reason": "refusal"},
                 )
@@ -153,12 +153,12 @@ class BaseSdkClient(ABC):
                 messages.extend(tool_msgs)
                 continue
 
-            raise LocalCLIExecutionError(
+            raise ProviderCallError(
                 f"unknown stop_reason: {result.stop_reason!r}",
                 {"runtime": self.profile.runtime, "iterations": iteration + 1, "stop_reason": result.stop_reason},
             )
         else:
-            raise LocalCLIExecutionError(
+            raise ProviderCallError(
                 f"agent loop exceeded {_MAX_AGENT_ITERATIONS} iterations",
                 {"runtime": self.profile.runtime, "iterations": _MAX_AGENT_ITERATIONS, "stop_reason": "iteration_cap"},
             )
@@ -207,7 +207,7 @@ class BaseSdkClient(ABC):
                 key = (name, type(exc).__name__)
                 failure_counts[key] = failure_counts.get(key, 0) + 1
                 if failure_counts[key] >= _TOOL_FAILURE_BREAKER:
-                    raise LocalCLIExecutionError(
+                    raise ProviderCallError(
                         f"tool stuck in failure loop: {name} kept raising {type(exc).__name__}",
                         {
                             "runtime": self.profile.runtime,

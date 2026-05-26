@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 from annotation_pipeline_skill.llm.base_sdk_client import (
     _ApiCallResult,
     BaseSdkClient,
-    LocalCLIExecutionError,
+    ProviderCallError,
 )
 from annotation_pipeline_skill.llm.profiles import LLMProfile
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
@@ -74,7 +74,7 @@ class OpenAISDKClient(BaseSdkClient):
 
             response = await self._client.chat.completions.create(**kwargs)
         except openai.APIError as exc:
-            raise LocalCLIExecutionError(
+            raise ProviderCallError(
                 str(exc),
                 {
                     "runtime": "openai_sdk",

@@ -127,17 +127,15 @@ button {
 }
 
 .dashboard-stats-bar {
-  align-items: stretch;
   background: #ffffff;
   border: 1px solid #d7e0e5;
   border-radius: 6px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 1px;
+  flex-direction: column;
+  gap: 6px;
   margin: 0 auto 12px;
   max-width: 1680px;
-  overflow: hidden;
-  background-color: #d7e0e5;
+  padding: 7px 12px;
 }
 
 .dashboard-stats-bar.dashboard-stats-bar-loading,
@@ -145,43 +143,127 @@ button {
   background: #f5f8fa;
   color: #52616b;
   font-size: 12px;
-  padding: 8px 12px;
 }
 
-.dashboard-stat {
-  background: #ffffff;
+.dsb-bar-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.dsb-bar-stack {
+  background: #eef2f5;
+  border-radius: 3px;
+  cursor: default;
   display: flex;
-  flex: 1 1 110px;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 110px;
-  padding: 8px 12px;
+  height: 10px;
+  overflow: hidden;
+  width: 100%;
 }
 
-.dashboard-stat span {
-  color: #52616b;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
+/* Tooltip: hidden by default, revealed on bar hover */
+.dsb-bar-tooltip {
+  background: #fff;
+  border: 1px solid #d7e0e5;
+  border-radius: 7px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.10);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  left: 0;
+  opacity: 0;
+  padding: 10px 14px;
+  pointer-events: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  transform: translateY(-4px);
+  white-space: nowrap;
+  z-index: 200;
 }
 
-.dashboard-stat strong {
+.dsb-bar-wrap:hover .dsb-bar-tooltip {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.dsb-metrics-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.dsb-bar-seg {
+  height: 100%;
+  transition: width 220ms ease;
+}
+
+.dsb-bar-empty {
+  background: #eef2f5;
+  flex: 1;
+}
+
+.dsb-legend-item {
+  align-items: center;
   color: #172026;
-  font-size: 18px;
-  font-weight: 700;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 4px;
+  white-space: nowrap;
 }
 
-.dashboard-stat.warning strong {
+.dsb-legend-item.zero {
+  color: #9aa6ad;
+}
+
+.dsb-legend-swatch {
+  background: var(--dsb-color, #9aa6ad);
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
+  height: 10px;
+  width: 10px;
+}
+
+.dsb-legend-key {
+  color: #52616b;
+}
+
+.dsb-legend-item strong {
+  font-weight: 600;
+}
+
+.dsb-divider {
+  background: #d7e0e5;
+  flex-shrink: 0;
+  height: 14px;
+  width: 1px;
+}
+
+.dsb-metric {
+  align-items: center;
+  color: #172026;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.dsb-metric span {
+  color: #52616b;
+}
+
+.dsb-metric strong {
+  font-weight: 600;
+}
+
+.dsb-metric.warning strong {
   color: #b8631d;
 }
 
-.dashboard-stat.critical strong {
+.dsb-metric.critical strong {
   color: #a92e1f;
-}
-
-.dashboard-stat.success strong {
-  color: #1a5244;
 }
 
 .view-tabs {
@@ -691,6 +773,32 @@ button {
 .convention-list ul { margin: 4px 0 0; padding-left: 18px; }
 .convention-list code { background: #e8eef2; padding: 1px 3px; border-radius: 3px; }
 
+.convention-correction-failed {
+  margin: 6px 0 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.correction-failed-card {
+  background: #fff8f0;
+  border: 1px solid #f0a060;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+.correction-failed-card strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #b85000;
+}
+.correction-failed-card p {
+  margin: 4px 0;
+  color: #444;
+}
+.correction-failed-hint {
+  color: #666;
+  font-style: italic;
+}
 .convention-quick-picks {
   display: flex;
   flex-direction: column;
@@ -1550,28 +1658,82 @@ button {
   padding: 8px 9px;
 }
 
-.timeline-item {
-  border: 1px solid #d7e0e5;
-  border-radius: 6px;
-  margin-bottom: 8px;
+/* ── Unified Logs Tab ──────────────────────────────── */
+.log-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 0 8px;
+}
+
+/* Individual log items — single-line format:
+   {title} -- {meta}  [tag]  -- {timestamp}            */
+.log-item {
+  border-radius: 5px;
   overflow: hidden;
 }
-
-.timeline-item summary {
+.log-item-summary {
+  align-items: center;
   cursor: pointer;
-  display: grid;
-  gap: 3px;
-  list-style-position: inside;
-  padding: 9px 10px;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0;
+  list-style: none;
+  overflow: hidden;
+  padding: 4px 6px;
+  user-select: none;
+  white-space: nowrap;
+}
+.log-item-summary::-webkit-details-marker { display: none; }
+.log-item-summary:hover { background: rgba(0,0,0,.04); border-radius: 4px; }
+.log-item[open] > .log-item-summary { background: rgba(0,0,0,.04); border-radius: 4px 4px 0 0; }
+
+.log-item-title {
+  color: #172026;
+  flex-shrink: 0;
+  font-family: monospace;
+  font-size: 12px;
+  font-weight: 600;
 }
 
-.timeline-item summary span {
-  font-size: 13px;
-  font-weight: 680;
-  overflow-wrap: anywhere;
+.log-item-sep {
+  color: #c0cdd3;
+  flex-shrink: 0;
+  padding: 0 5px;
 }
 
-.timeline-item summary small,
+.log-item-meta {
+  color: #52616b;
+  flex: 1;
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-item-tag {
+  border-radius: 3px;
+  color: #fff;
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  margin: 0 6px 0 4px;
+  padding: 1px 5px;
+}
+
+.log-item-ts {
+  color: #9aafba;
+  flex-shrink: 0;
+  font-family: monospace;
+  font-size: 11px;
+}
+
+.log-item-body {
+  border-top: 1px solid #eef1f3;
+  padding: 4px 8px 8px;
+}
+
 .empty-detail {
   color: #52616b;
   font-size: 12px;
@@ -3562,6 +3724,8 @@ button {
   background: #f7fafb;
   border: 1px solid #e4eaed;
   border-radius: 6px;
+  min-width: 0;         /* prevent flex children from expanding past parent */
+  overflow: hidden;
   padding: 10px 12px 6px;
 }
 
@@ -3574,6 +3738,44 @@ button {
 .event-histogram-svg {
   display: block;
   width: 100%;
+}
+
+/* Scrollable container for the Plotly histogram.
+   width:100% + min-width:0 gives the container a definite width so that
+   overflow-x:auto creates a scrollbar instead of expanding the parent. */
+.event-histogram-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-radius: 4px;
+  width: 100%;
+  min-width: 0;
+  cursor: default;
+}
+/* Override Plotly's default white background on the modebar area */
+.event-histogram-scroll .js-plotly-plot .plotly .modebar {
+  display: none;
+}
+
+.event-histogram-loading {
+  color: #8fa3af;
+  font-size: 12px;
+  padding: 8px 0;
+  text-align: center;
+}
+
+.event-histogram-reset {
+  background: none;
+  border: 1px solid #c0c7cc;
+  border-radius: 3px;
+  color: #8fa3af;
+  cursor: pointer;
+  font-size: 10px;
+  margin-left: 8px;
+  padding: 1px 6px;
+}
+.event-histogram-reset:hover {
+  background: #e8eef1;
+  color: #52616b;
 }
 
 .event-histogram-legend {

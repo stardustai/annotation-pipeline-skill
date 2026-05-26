@@ -344,7 +344,7 @@ export default function App() {
           setView("runtime");
         }}
       />
-      <DashboardStatsBar projectId={selectedProjectId} storeKey={selectedStoreKey} />
+      <DashboardStatsBar projectId={selectedProjectId} storeKey={selectedStoreKey} runtimeHealthy={runtimeHealthy} />
 
       <nav className="view-tabs" aria-label="Dashboard views" role="tablist">
         <button

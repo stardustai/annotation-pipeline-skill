@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { fetchAlerts, fetchEventLog, type AlertEntry } from "../api";
+
+const EventHistogramChart = lazy(() => import("./EventHistogramChart"));
 
 interface EventLogPanelProps {
   projectId: string | null;
@@ -28,11 +30,6 @@ const ALERTS_LIMIT = 200;
 const PAGE_SIZE = 100;
 const REFRESH_MS = 30_000;
 
-// SVG histogram dimensions
-const VW = 960;
-const VH = 150;
-const PAD = { top: 10, right: 10, bottom: 28, left: 38 };
-const N_BINS = 32;
 
 const STATUS_COLORS: Record<string, string> = {
   // task statuses (by next_status)
@@ -51,7 +48,6 @@ const STATUS_COLORS: Record<string, string> = {
   arbiter_enum_coerce: "#ae3ec9",
   config_reload: "#1971c2",
 };
-const STATUS_ORDER = Object.keys(STATUS_COLORS);
 
 function toLogEntry(e: Record<string, unknown>): LogEntry {
   return {
@@ -141,7 +137,9 @@ export function EventLogPanel({ projectId, storeKey }: EventLogPanelProps) {
         </div>
       </div>
 
-      <EventHistogram entries={entries} />
+      <Suspense fallback={<div className="event-histogram-wrap event-histogram-loading">Loading chart…</div>}>
+        <EventHistogramChart entries={entries} totalCount={entries.length} />
+      </Suspense>
 
       {loading ? <div className="drawer-state">Loading events</div> : null}
       {error ? <div className="drawer-error">{error}</div> : null}
@@ -254,153 +252,6 @@ function chipStyle(key: string): React.CSSProperties {
   return { background: color + "28", color, borderColor: color + "60" };
 }
 
-// ── Histogram ────────────────────────────────────────────────────────────────
-
-interface BinData {
-  ts: number;
-  counts: Record<string, number>;
-  total: number;
-}
-
-interface HistData {
-  bins: BinData[];
-  keys: string[];
-  minTs: number;
-  rangeMs: number;
-  maxBinTotal: number;
-}
-
-function buildHistogram(entries: LogEntry[], nBins: number): HistData | null {
-  if (entries.length === 0) return null;
-  const times = entries.map((e) => Date.parse(e.ts)).filter(Number.isFinite);
-  if (times.length === 0) return null;
-
-  const minTs = Math.min(...times);
-  const maxTs = Math.max(...times);
-  const rangeMs = maxTs - minTs || 1;
-
-  const bins: BinData[] = Array.from({ length: nBins }, (_, i) => ({
-    ts: minTs + (i / nBins) * rangeMs,
-    counts: {},
-    total: 0,
-  }));
-
-  const keySet = new Set<string>();
-  for (const e of entries) {
-    const t = Date.parse(e.ts);
-    if (!Number.isFinite(t)) continue;
-    const key = e.rowKind === "transition"
-      ? (e.next_status ?? "unknown")
-      : (e.alert_kind ?? "alert");
-    keySet.add(key);
-    const binIdx = Math.min(nBins - 1, Math.floor(((t - minTs) / rangeMs) * nBins));
-    bins[binIdx].counts[key] = (bins[binIdx].counts[key] ?? 0) + 1;
-    bins[binIdx].total += 1;
-  }
-
-  const maxBinTotal = Math.max(1, ...bins.map((b) => b.total));
-  const keys = [
-    ...STATUS_ORDER.filter((k) => keySet.has(k)),
-    ...Array.from(keySet).filter((k) => !STATUS_ORDER.includes(k)),
-  ];
-
-  return { bins, keys, minTs, rangeMs, maxBinTotal };
-}
-
-function EventHistogram({ entries }: { entries: LogEntry[] }) {
-  const data = useMemo(() => buildHistogram(entries, N_BINS), [entries]);
-  if (!data) return null;
-
-  const { bins, keys, minTs, rangeMs, maxBinTotal } = data;
-  const innerW = VW - PAD.left - PAD.right;
-  const innerH = VH - PAD.top - PAD.bottom;
-  const binW = innerW / N_BINS;
-
-  const xTicks = Array.from({ length: 6 }, (_, i) => {
-    const frac = i / 5;
-    return { x: PAD.left + frac * innerW, label: fmtTick(minTs + frac * rangeMs, rangeMs) };
-  });
-
-  const yTicks = [0, Math.round(maxBinTotal / 2), maxBinTotal].map((v) => ({
-    y: PAD.top + innerH - (v / maxBinTotal) * innerH,
-    label: String(v),
-  }));
-
-  return (
-    <div className="event-histogram-wrap">
-      <div className="event-histogram-caption">
-        Last {entries.length.toLocaleString()} entries (transitions + alerts) · binned by time · colored by event type
-      </div>
-      <svg
-        viewBox={`0 0 ${VW} ${VH}`}
-        className="event-histogram-svg"
-        aria-label="Event log over time"
-        preserveAspectRatio="xMidYMid meet"
-      >
-        {yTicks.map(({ y, label }) => (
-          <g key={label}>
-            <line x1={PAD.left} x2={VW - PAD.right} y1={y} y2={y} stroke="#e8eef1" strokeWidth="1" />
-            <text x={PAD.left - 5} y={y + 4} textAnchor="end" fontSize="11" fill="#8fa3af">
-              {label}
-            </text>
-          </g>
-        ))}
-
-        {bins.map((bin, i) => {
-          const x = PAD.left + i * binW + 1;
-          const w = Math.max(0, binW - 2);
-          let cumH = 0;
-          return keys.map((key) => {
-            const count = bin.counts[key] ?? 0;
-            if (count === 0) return null;
-            const barH = (count / maxBinTotal) * innerH;
-            const y = PAD.top + innerH - cumH - barH;
-            cumH += barH;
-            return (
-              <rect
-                key={`${i}-${key}`}
-                x={x}
-                y={y}
-                width={w}
-                height={barH}
-                fill={STATUS_COLORS[key] ?? "#9aa6ad"}
-                opacity={0.88}
-              >
-                <title>{key}: {count} · {fmtTick(bin.ts, rangeMs)}</title>
-              </rect>
-            );
-          });
-        })}
-
-        <line
-          x1={PAD.left}
-          x2={VW - PAD.right}
-          y1={PAD.top + innerH}
-          y2={PAD.top + innerH}
-          stroke="#d7e0e5"
-          strokeWidth="1"
-        />
-        {xTicks.map(({ x, label }) => (
-          <text key={label} x={x} y={VH - 6} textAnchor="middle" fontSize="10" fill="#8fa3af">
-            {label}
-          </text>
-        ))}
-      </svg>
-
-      <div className="event-histogram-legend">
-        {keys.map((key) => (
-          <span key={key} className="event-legend-item">
-            <span
-              className="event-legend-swatch"
-              style={{ background: STATUS_COLORS[key] ?? "#9aa6ad" }}
-            />
-            {key}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -410,12 +261,6 @@ function fmtTs(tsIso: string): string {
   return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
-function fmtTick(tsMs: number, rangeMs: number): string {
-  const d = new Date(tsMs);
-  if (rangeMs < 3_600_000) return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  if (rangeMs < 86_400_000) return `${d.getMonth() + 1}/${d.getDate()} ${pad2(d.getHours())}h`;
-  return `${d.getMonth() + 1}/${d.getDate()}`;
-}
 
 function pad2(n: number): string {
   return n.toString().padStart(2, "0");

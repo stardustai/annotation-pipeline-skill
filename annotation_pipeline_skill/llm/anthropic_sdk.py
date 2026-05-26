@@ -5,7 +5,7 @@ wire format before each API call, and converts the response back to
 OpenAI format for storage. Tool schemas are used as-is (already in
 Anthropic input_schema format).
 
-Re-exports LocalCLIExecutionError for backward compatibility with
+Re-exports ProviderCallError for backward compatibility with
 callers that import it from this module.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from anthropic import AsyncAnthropic
 from annotation_pipeline_skill.llm.base_sdk_client import (
     _ApiCallResult,
     BaseSdkClient,
-    LocalCLIExecutionError,  # noqa: F401  re-exported for callers
+    ProviderCallError,  # noqa: F401  re-exported for callers
 )
 from annotation_pipeline_skill.llm.profiles import LLMProfile
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
@@ -83,7 +83,7 @@ class AnthropicSDKClient(BaseSdkClient):
                     extra_headers=extra_headers or None,
                 )
             except anthropic.APIError as exc:
-                raise LocalCLIExecutionError(
+                raise ProviderCallError(
                     str(exc),
                     {
                         "runtime": "anthropic_sdk",

@@ -389,11 +389,13 @@ export function OriginalTextCell({
   storeKey,
   span,
   taskId,
+  sourceOnly,
 }: {
   projectId: string;
   storeKey: string | null;
   span: string;
   taskId?: string;
+  sourceOnly?: boolean;
 }): React.ReactElement {
   const [example, setExample] = React.useState<
     { task_id: string; row_index: number; text: string } | null
@@ -406,6 +408,7 @@ export function OriginalTextCell({
     setLoading(true);
     const storeQ = storeKey ? `&store=${encodeURIComponent(storeKey)}` : "";
     const taskQ = taskId ? `&task=${encodeURIComponent(taskId)}` : "";
+    const sourceOnlyQ = sourceOnly ? "&source_only=1" : "";
     // When taskId is set, exclude is on (task_id:row_index) keys;
     // otherwise exclude is on task_ids.
     const excludeParam = taskId ? "exclude_key" : "exclude";
@@ -413,7 +416,7 @@ export function OriginalTextCell({
       .map((k) => `&${excludeParam}=${encodeURIComponent(k)}`)
       .join("");
     fetch(
-      `/api/typical-text?project=${encodeURIComponent(projectId)}&span=${encodeURIComponent(span)}${storeQ}${taskQ}${excludeQ}`,
+      `/api/typical-text?project=${encodeURIComponent(projectId)}&span=${encodeURIComponent(span)}${storeQ}${taskQ}${sourceOnlyQ}${excludeQ}`,
     )
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {

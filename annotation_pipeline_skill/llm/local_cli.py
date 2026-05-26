@@ -26,7 +26,7 @@ _SAFE_ENV_KEYS = {
 }
 
 
-class LocalCLIExecutionError(RuntimeError):
+class ProviderCallError(RuntimeError):
     def __init__(self, message: str, diagnostics: dict[str, Any]):
         super().__init__(message)
         self.diagnostics = diagnostics
@@ -74,7 +74,7 @@ def build_codex_command(
     thread_id: str | None,
     model: str,
     reasoning_effort: str | None,
-) -> tuple[list[str], Path]:
+) -> tuple[list[str], Path, bytes]:
     import tempfile
     prompt_file = Path(tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False).name)
     full_prompt = prompt
@@ -106,8 +106,13 @@ def build_codex_command(
         command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
     if thread_id:
         command.append(thread_id)
-    command.append(prompt_file.read_text(encoding="utf-8"))
-    return command, prompt_file
+    # Pass "-" so codex reads the prompt from stdin rather than a CLI argument.
+    # Embedding the full prompt as a positional argument hits OS ARG_MAX limits
+    # (~2 MB on Linux) for long-context prompts (e.g. arbitration with many
+    # feedback rounds).  Both `codex exec` and `codex exec resume` support "-"
+    # to signal stdin input.
+    command.append("-")
+    return command, prompt_file, full_prompt.encode("utf-8")
 
 
 @contextmanager
@@ -300,7 +305,7 @@ class LocalCLIClient:
         developer_instructions = _inject_schema_into_instructions(
             request.instructions, request.response_format
         )
-        command, prompt_file = build_codex_command(
+        command, prompt_file, prompt_bytes = build_codex_command(
             binary="codex",
             prompt=request.prompt or _messages_to_prompt(request.input_items),
             developer_instructions=developer_instructions,
@@ -322,13 +327,14 @@ class LocalCLIClient:
                     *command,
                     cwd=str(request.cwd) if request.cwd else None,
                     env=env,
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     preexec_fn=_die_with_parent,
                 )
                 try:
                     stdout, stderr = await asyncio.wait_for(
-                        process.communicate(),
+                        process.communicate(input=prompt_bytes),
                         timeout=self.profile.timeout_seconds,
                     )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -351,7 +357,7 @@ class LocalCLIClient:
             if stderr:
                 diagnostics["stderr"] = stderr.decode("utf-8", errors="replace")[-4000:]
             if process.returncode != 0:
-                raise LocalCLIExecutionError("local CLI provider failed", diagnostics)
+                raise ProviderCallError("local CLI provider failed", diagnostics)
             new_thread_id = result.continuity_handle
             new_handle = f"{resolved_home_id}::{new_thread_id}" if new_thread_id else None
             return LLMGenerateResult(

@@ -1,0 +1,2 @@
+{"role": "user", "content": "{\"task\":\"hello\"}"}
+{"role": "assistant", "content": [{"citations": null, "text": "ok", "type": "text"}]}

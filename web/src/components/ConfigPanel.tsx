@@ -4,7 +4,6 @@ import type { ConfigFile } from "../types";
 import { AnnotatorsForm } from "./AnnotatorsForm";
 
 const configHints: Record<string, string> = {
-  "annotation_rules.yaml": "Rules that guide how annotators should label the data.",
   "annotators.yaml": "Annotator capability profiles, modalities, annotation types, and renderer hooks.",
   "llm_profiles.yaml": "Subagent provider profiles, API keys, base URLs, local CLI binaries, and stage target bindings.",
   "workflow.yaml": "Workflow stages, target bindings, and Human Review policy.",

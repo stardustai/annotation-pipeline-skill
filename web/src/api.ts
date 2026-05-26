@@ -55,6 +55,17 @@ export interface DashboardStats {
   outbox_pending_count: number;
   throughput_per_window: Record<string, number>;
   throughput_window_minutes: number;
+  /** Tasks that transitioned to accepted in the last throughput_window_minutes */
+  accepted_in_window: number;
+  /** All-time pipeline health metrics */
+  accepted_count: number;
+  terminal_count: number;
+  /** Accepted tasks that required no arbitration */
+  first_pass_count: number;
+  /** Terminal tasks (accepted+rejected) that entered arbitration at least once */
+  arb_entered_count: number;
+  /** Average number of succeeded annotation+qc+arb LLM calls per accepted task */
+  avg_llm_calls: number;
 }
 
 export async function fetchDashboardStats(

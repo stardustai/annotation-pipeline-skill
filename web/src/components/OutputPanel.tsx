@@ -152,9 +152,7 @@ export function OutputPanel({ projectId, storeKey, storePath }: OutputPanelProps
             <tbody>
               {readiness.exports.map((exp) => {
                 const relPath = exp.output_paths[0];
-                const downloadHref = relPath
-                  ? `/api/export-file?path=${encodeURIComponent(relPath)}${storeKey ? `&store=${storeKey}` : ""}`
-                  : null;
+                const zipHref = `/api/export-zip?export_id=${encodeURIComponent(exp.export_id)}${storeKey ? `&store=${storeKey}` : ""}`;
                 return (
                   <tr key={exp.export_id} style={{ borderBottom: "1px solid var(--border, #2a2f3a)" }}>
                     <td style={{ padding: "0.4rem 0.75rem 0.4rem 0", fontFamily: "monospace" }}>{exp.export_id}</td>
@@ -163,11 +161,9 @@ export function OutputPanel({ projectId, storeKey, storePath }: OutputPanelProps
                     <td style={{ padding: "0.4rem 0.75rem" }}>{exp.excluded}</td>
                     <td style={{ padding: "0.4rem 0.75rem", fontFamily: "monospace", fontSize: "0.8rem" }}>{relPath ?? "—"}</td>
                     <td style={{ padding: "0.4rem 0" }}>
-                      {downloadHref ? (
-                        <a href={downloadHref} download="training_data.jsonl" style={{ fontSize: "0.8rem", whiteSpace: "nowrap" }}>
-                          Download
-                        </a>
-                      ) : null}
+                      <a href={zipHref} download={`${exp.export_id}.zip`} style={{ fontSize: "0.8rem", whiteSpace: "nowrap" }}>
+                        Download
+                      </a>
                     </td>
                   </tr>
                 );

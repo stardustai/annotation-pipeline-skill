@@ -234,6 +234,12 @@ class LocalRuntimeScheduler:
                 client = self.client_factory(target)
             except Exception:  # noqa: BLE001 — target may not be configured
                 continue
+            # codex_cli authenticates via OAuth auth.json, not an API key,
+            # and spawns a full CLI process — the probe's ephemeral isolated
+            # home lacks project-trust config, causing false-positive failures.
+            # Balance / auth errors don't apply to OAuth sessions, so skip.
+            if getattr(getattr(client, "profile", None), "runtime", None) == "codex_cli":
+                continue
             try:
                 result = await client.generate(ping_request)
             except Exception as exc:  # noqa: BLE001
@@ -312,6 +318,11 @@ class LocalRuntimeScheduler:
         recovered = 0
         for task in self.store.list_tasks_by_status({TaskStatus.ANNOTATING, TaskStatus.QC}):
             if task.task_id in leased or task.task_id in active:
+                continue
+            # QC tasks with runtime_next_stage=qc are waiting for QC-only re-claim,
+            # not orphaned annotation tasks — leave them for the scheduler's normal
+            # pickup loop instead of resetting to PENDING.
+            if task.status is TaskStatus.QC and task.metadata.get("runtime_next_stage") == "qc":
                 continue
             try:
                 event = transition_task(
@@ -545,7 +556,7 @@ class LocalRuntimeScheduler:
                     )
                     last_exception_was_permanent = _is_provider_permanent_error(worker_exc)
                     last_exception_was_transient = _is_provider_transient_error(worker_exc)
-                    # Mirror of the arbiter wrap site: LocalCLIExecutionError
+                    # Mirror of the arbiter wrap site: ProviderCallError
                     # only stringifies to "local CLI provider failed"; the
                     # actual cause (auth, model name, OOM, API 5xx) is in
                     # .diagnostics (returncode + last 4KB of stderr). Without

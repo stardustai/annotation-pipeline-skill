@@ -198,6 +198,7 @@ export function TaskDrawer({
                 sourceRef={detail.task.source_ref}
                 artifacts={detail.artifacts}
                 feedback={detail.feedback}
+                feedbackDiscussions={detail.feedback_discussions}
                 saving={saving}
                 onSubmitHumanReviewDecision={onSubmitHumanReviewDecision}
               />
@@ -312,36 +313,11 @@ export function TaskDrawer({
             ) : null}
 
             {drawerTab === "logs" ? (
-              <>
-                <DetailSection title={`Attempts (${detail.attempts.length})`}>
-                  {detail.attempts.length === 0 ? (
-                    <p className="empty-detail">No attempts recorded.</p>
-                  ) : (
-                    detail.attempts.map((attempt) => (
-                      <TimelineItem
-                        key={String(attempt.attempt_id)}
-                        title={`#${String(attempt.index)} ${String(attempt.stage)} · ${String(attempt.status)}`}
-                        meta={`${String(attempt.provider_id ?? "provider unknown")} · ${String(attempt.model ?? "model unknown")}`}
-                        value={attempt}
-                      />
-                    ))
-                  )}
-                </DetailSection>
-                <DetailSection title={`Round Changes (${detail.events.length})`}>
-                  {detail.events.length === 0 ? (
-                    <p className="empty-detail">No round changes recorded.</p>
-                  ) : (
-                    detail.events.map((event) => (
-                      <TimelineItem
-                        key={String(event.event_id)}
-                        title={`${String(event.previous_status)} → ${String(event.next_status)}`}
-                        meta={`${String(event.stage)} · ${String(event.reason)}`}
-                        value={event}
-                      />
-                    ))
-                  )}
-                </DetailSection>
-              </>
+              <LogsTab
+                attempts={detail.attempts}
+                events={detail.events}
+                feedback={detail.feedback}
+              />
             ) : null}
           </div>
         </>
@@ -643,14 +619,159 @@ function DetailSection({ title, children }: { title: string; children: ReactNode
   );
 }
 
-function TimelineItem({ title, meta, value }: { title: string; meta: string; value: unknown }) {
+function fmtLogTs(iso: string | undefined | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return "";
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${mo}/${da} ${hh}:${mm}:${ss}`;
+}
+
+// ── Unified Logs Tab ──────────────────────────────────────────────────────────
+
+type LogItemKind = "attempt" | "event" | "feedback";
+
+interface UnifiedLogItem {
+  kind: LogItemKind;
+  ts: string;
+  title: string;
+  meta: string;
+  value: unknown;
+}
+
+function buildLogItems(
+  attempts: Array<Record<string, unknown>>,
+  events: Array<Record<string, unknown>>,
+  feedback: Array<Record<string, unknown>>,
+): UnifiedLogItem[] {
+  const all: UnifiedLogItem[] = [];
+
+  for (const a of attempts) {
+    const m = String(a.model ?? "");
+    const p = String(a.provider_id ?? "");
+    const modelMeta = m && p && m !== p ? `${m} / ${p}` : m || p;
+    all.push({
+      kind: "attempt",
+      ts: String(a.started_at ?? ""),
+      title: `${String(a.stage ?? "")} · ${String(a.status ?? "")}`,
+      meta: modelMeta,
+      value: a,
+    });
+  }
+  for (const e of events) {
+    all.push({
+      kind: "event",
+      ts: String(e.created_at ?? ""),
+      title: `${String(e.previous_status ?? "")} → ${String(e.next_status ?? "")}`,
+      meta: [e.stage, e.reason].filter(Boolean).join(" · "),
+      value: e,
+    });
+  }
+  for (const f of feedback) {
+    const cat = String(f.category ?? "");
+    const msg = String(f.message ?? "");
+    all.push({
+      kind: "feedback",
+      ts: String(f.created_at ?? ""),
+      title: cat,
+      meta: msg.length > 90 ? msg.slice(0, 90) + "…" : msg,
+      value: f,
+    });
+  }
+
+  all.sort((a, b) => a.ts.localeCompare(b.ts));
+  return all;
+}
+
+function LogsTab({
+  attempts,
+  events,
+  feedback,
+}: {
+  attempts: Array<Record<string, unknown>>;
+  events: Array<Record<string, unknown>>;
+  feedback: Array<Record<string, unknown>>;
+}) {
+  const items = useMemo(
+    () => buildLogItems(attempts, events, feedback),
+    [attempts, events, feedback],
+  );
+
+  if (items.length === 0) {
+    return <p className="empty-detail">No log entries recorded.</p>;
+  }
+
   return (
-    <details className="timeline-item">
-      <summary>
-        <span>{title}</span>
-        <small>{meta}</small>
+    <div className="log-items-list">
+      {items.map((item, idx) => (
+        <LogItemRow key={idx} item={item} />
+      ))}
+    </div>
+  );
+}
+
+// Status → color mapping (matches pipeline stage palette)
+const LOG_STATUS_COLORS: Record<string, string> = {
+  draft: "#c0c7cc",
+  pending: "#9aa6ad",
+  annotating: "#4f8fd1",
+  qc: "#7b6cb8",
+  arbitrating: "#d68b3a",
+  human_review: "#d23a2a",
+  accepted: "#3aa563",
+  rejected: "#7a5848",
+  blocked: "#52616b",
+  cancelled: "#a9b3b9",
+  // attempt statuses
+  succeeded: "#3aa563",
+  failed: "#d23a2a",
+  running: "#4f8fd1",
+  // feedback severities
+  critical: "#d23a2a",
+  warning: "#d68b3a",
+  info: "#4f8fd1",
+};
+
+function getItemTag(item: UnifiedLogItem): { label: string; color: string } | null {
+  const v = item.value as Record<string, unknown>;
+  let label = "";
+  if (item.kind === "event") label = String(v.next_status ?? "");
+  else if (item.kind === "attempt") label = String(v.status ?? "");
+  else if (item.kind === "feedback") label = String(v.severity ?? "");
+  if (!label) return null;
+  return { label, color: LOG_STATUS_COLORS[label] ?? "#9aa6ad" };
+}
+
+function LogItemRow({ item }: { item: UnifiedLogItem }) {
+  const tag = getItemTag(item);
+  return (
+    <details className={`log-item log-item-${item.kind}`}>
+      <summary className="log-item-summary">
+        <span className="log-item-title">{item.title}</span>
+        {item.meta ? (
+          <>
+            <span className="log-item-sep">--</span>
+            <span className="log-item-meta">{item.meta}</span>
+          </>
+        ) : null}
+        {tag ? (
+          <span
+            className="log-item-tag"
+            style={{ background: tag.color }}
+          >
+            {tag.label}
+          </span>
+        ) : null}
+        <span className="log-item-sep">--</span>
+        <time className="log-item-ts">{fmtLogTs(item.ts)}</time>
       </summary>
-      <JsonViewer value={value} />
+      <div className="log-item-body">
+        <JsonViewer value={item.value} />
+      </div>
     </details>
   );
 }
@@ -672,6 +793,7 @@ function ManualReviewTab({
   sourceRef,
   artifacts,
   feedback,
+  feedbackDiscussions,
   saving,
   onSubmitHumanReviewDecision,
 }: {
@@ -680,6 +802,7 @@ function ManualReviewTab({
   sourceRef: unknown;
   artifacts: TaskDetailArtifact[];
   feedback: Array<Record<string, unknown>>;
+  feedbackDiscussions: Array<Record<string, unknown>>;
   saving: boolean;
   onSubmitHumanReviewDecision: (payload: Record<string, unknown>) => Promise<void>;
 }) {
@@ -692,6 +815,7 @@ function ManualReviewTab({
         sourceRef={sourceRef}
         artifacts={artifacts}
         feedback={feedback}
+        feedbackDiscussions={feedbackDiscussions}
         hrSaving={saving}
         onSubmitHumanReviewDecision={onSubmitHumanReviewDecision}
       />
@@ -1080,6 +1204,7 @@ function EntityConventionForm({
   sourceRef,
   artifacts,
   feedback,
+  feedbackDiscussions,
   hrSaving,
   onSubmitHumanReviewDecision,
 }: {
@@ -1088,6 +1213,7 @@ function EntityConventionForm({
   sourceRef: unknown;
   artifacts: TaskDetailArtifact[];
   feedback?: Array<Record<string, unknown>>;
+  feedbackDiscussions?: Array<Record<string, unknown>>;
   hrSaving?: boolean;
   onSubmitHumanReviewDecision?: (payload: Record<string, unknown>) => Promise<void>;
 }) {
@@ -1110,10 +1236,10 @@ function EntityConventionForm({
   // table.
   const [localPicks, setLocalPicks] = useState<Map<string, string | null>>(() => new Map());
   // Per-card "Save as project convention" checkbox state, keyed by
-  // lowercase span. Default ON (set on first render when undefined).
+  // lowercase span. Default OFF.
   const [saveAsConvention, setSaveAsConvention] = useState<Map<string, boolean>>(() => new Map());
   const getSaveFlag = useCallback(
-    (lower: string) => saveAsConvention.get(lower) ?? true,
+    (lower: string) => saveAsConvention.get(lower) ?? false,
     [saveAsConvention],
   );
 
@@ -1130,25 +1256,77 @@ function EntityConventionForm({
     void reload();
   }, [reload]);
 
-  // Combined text of all QC/HR/arbiter feedback for this task. Used to
-  // filter Manual Review down to spans that some reviewer actually
-  // complained about — annotators emit dozens of entities per task and
-  // most of them aren't in dispute.
+  // IDs of feedback items that have been resolved by consensus — their
+  // spans should no longer appear in Manual Review.
+  const resolvedFeedbackIds = useMemo(() => {
+    const ids = new Set<unknown>();
+    if (feedbackDiscussions) {
+      for (const d of feedbackDiscussions) {
+        if (d.consensus === true) ids.add(d.feedback_id);
+      }
+    }
+    return ids;
+  }, [feedbackDiscussions]);
+
+  // Spans explicitly named in unresolved feedback target fields. These are
+  // the exact entities reviewers flagged and need operator attention. We
+  // prefer structured target.span over free-text matching so that resolved
+  // spans don't bleed through via mentions in unrelated messages.
+  const unresolvedTargetSpans = useMemo(() => {
+    const spans = new Set<string>();
+    if (!feedback) return spans;
+    for (const f of feedback) {
+      if (resolvedFeedbackIds.has(f.feedback_id)) continue;
+      if ((f as { category?: unknown }).category === "non_verbatim_span") continue;
+      const tgt = (f as { target?: unknown }).target;
+      if (tgt && typeof tgt === "object") {
+        const span = (tgt as Record<string, unknown>).span;
+        if (typeof span === "string") spans.add(span.toLowerCase());
+      }
+    }
+    return spans;
+  }, [feedback, resolvedFeedbackIds]);
+
+  // Fallback blob: free-text of unresolved feedback, used only when no
+  // structured target.span data exists (older feedback formats).
   const feedbackBlob = useMemo(() => {
     if (!feedback || feedback.length === 0) return "";
     const parts: string[] = [];
     for (const f of feedback) {
+      if (resolvedFeedbackIds.has(f.feedback_id)) continue;
       const msg = (f as { message?: unknown }).message;
       if (typeof msg === "string") parts.push(msg);
       const tgt = (f as { target?: unknown }).target;
       if (tgt && typeof tgt === "object") parts.push(JSON.stringify(tgt));
     }
     return parts.join("\n").toLowerCase();
-  }, [feedback]);
+  }, [feedback, resolvedFeedbackIds]);
+
+  // Categories that require span DELETION rather than type selection.
+  // These must never drive quickPick display — showing a type-selector for a
+  // non-verbatim span would confuse the operator into thinking the issue is
+  // about the entity type when the real problem is the span text itself.
+  const DELETION_CATEGORIES = new Set(["non_verbatim_span", "arbiter_correction_failed"]);
+
+  // True when there is an unresolved feedback item that is actually about
+  // entity type selection (not just deletion of a bad span).
+  const hasActionableUnresolvedFeedback = useMemo(
+    () => !!feedback && feedback.some(
+      (f) => !resolvedFeedbackIds.has(f.feedback_id)
+        && !DELETION_CATEGORIES.has(String((f as { category?: unknown }).category ?? "")),
+    ),
+    [feedback, resolvedFeedbackIds],
+  );
 
   // Extract entity (span, current_type) pairs from this task's latest
-  // annotation so the operator can declare conventions in one click. When
-  // we have feedback text, narrow to spans that show up in it.
+  // annotation, filtered to only spans with unresolved feedback.
+  // Priority order:
+  //   1. Structured target.span from unresolved feedback (most precise).
+  //   2. Free-text feedbackBlob match — only from actionable (type-selection)
+  //      feedback, never from non_verbatim_span / arbiter_correction_failed.
+  //   3. If all feedback is resolved OR only deletion-category feedback remains
+  //      → show nothing (empty list).
+  //   4. If there is no feedback at all → show everything (discovery mode).
   const quickPicks = useMemo(() => {
     const outputs = extractOutputsByIndex(artifacts);
     const seen = new Set<string>();
@@ -1163,13 +1341,23 @@ function EntityConventionForm({
           const key = `${s}|${type}`;
           if (seen.has(key)) continue;
           seen.add(key);
-          if (feedbackBlob && !feedbackBlob.includes(s.toLowerCase())) continue;
+          if (unresolvedTargetSpans.size > 0) {
+            // Structured unresolved spans available — exact match only.
+            if (!unresolvedTargetSpans.has(s.toLowerCase())) continue;
+          } else if (hasActionableUnresolvedFeedback) {
+            // Actionable unresolved feedback (type-selection) but no structured
+            // span target — fall back to free-text matching.
+            if (feedbackBlob && !feedbackBlob.includes(s.toLowerCase())) continue;
+          } else if (feedback && feedback.length > 0) {
+            // Only deletion-category feedback, or all resolved — nothing to select.
+            continue;
+          }
           pairs.push({ span: s, currentType: type });
         }
       }
     }
     return pairs;
-  }, [artifacts, feedbackBlob]);
+  }, [artifacts, unresolvedTargetSpans, hasActionableUnresolvedFeedback, feedbackBlob, feedback]);
 
   // Build per-span proposal lists from (a) every annotation_result
   // artifact tagged by actor (annotator vs arbiter) and (b) any QC
@@ -1198,6 +1386,21 @@ function EntityConventionForm({
       if (!tgt || typeof tgt !== "object") continue;
       const t = tgt as Record<string, unknown>;
       const span = typeof t.span === "string" ? t.span : undefined;
+      if (!span) continue;
+      // three_way_disagreement / prior_divergence: first_arbiter = proposed_type
+      // (already visible from annotation artifacts). Show the competing signal as
+      // the "QC" dissent so the operator sees there IS a real disagreement.
+      const cat = (f as { category?: unknown }).category;
+      if (cat === "three_way_disagreement") {
+        const secondType = typeof t.second_arbiter_type === "string" ? t.second_arbiter_type : undefined;
+        if (secondType) push(span, "qc", secondType);
+        continue;
+      }
+      if (cat === "prior_divergence") {
+        const priorType = typeof t.prior_dominant_type === "string" ? t.prior_dominant_type : undefined;
+        if (priorType) push(span, "qc", priorType);
+        continue;
+      }
       const type =
         typeof t.proposed_type === "string"
           ? t.proposed_type
@@ -1206,7 +1409,7 @@ function EntityConventionForm({
             : typeof t.type === "string"
               ? (t.type as string)
               : undefined;
-      if (span && type) push(span, "qc", type);
+      if (type) push(span, "qc", type);
     }
     return map;
   }, [artifacts, feedback]);
@@ -1401,6 +1604,48 @@ function EntityConventionForm({
       </p>
       {error ? <p className="convention-error">{error}</p> : null}
       {message ? <p className="convention-ok">{message}</p> : null}
+
+      {quickPicks.length === 0 && feedback && feedback.length > 0 ? (() => {
+        // Show unresolved deletion-category items so the operator understands
+        // why there are no entity type choices to make.
+        const deletionItems = feedback.filter(
+          (f) =>
+            !resolvedFeedbackIds.has(f.feedback_id) &&
+            DELETION_CATEGORIES.has(String((f as { category?: unknown }).category ?? "")),
+        );
+        if (deletionItems.length === 0) return null;
+        // Deduplicate by span text so 39 non_verbatim_span records don't flood the UI.
+        const seen = new Set<string>();
+        const unique = deletionItems.filter((f) => {
+          const tgt = (f as { target?: unknown }).target as Record<string, unknown> | null;
+          const span = tgt && typeof tgt.span === "string" ? tgt.span : String(f.feedback_id);
+          if (seen.has(span)) return false;
+          seen.add(span);
+          return true;
+        });
+        return (
+          <div className="convention-correction-failed">
+            <div className="correction-failed-card">
+              <strong>Non-verbatim spans — no type selection needed</strong>
+              <p>The following span(s) do not appear verbatim in the source text and cannot be fixed by choosing a type:</p>
+              <ul style={{ margin: "4px 0", paddingLeft: 18 }}>
+                {unique.slice(0, 8).map((f) => {
+                  const tgt = (f as { target?: unknown }).target as Record<string, unknown> | null;
+                  const span = tgt && typeof tgt.span === "string" ? tgt.span : null;
+                  const field = tgt && typeof tgt.field === "string" ? tgt.field : null;
+                  return span ? (
+                    <li key={String(f.feedback_id)}>
+                      <code>{span}</code>{field ? <> in <code>{field}</code></> : null}
+                    </li>
+                  ) : null;
+                })}
+                {unique.length > 8 ? <li>…and {unique.length - 8} more</li> : null}
+              </ul>
+              <p className="correction-failed-hint">Use <strong>Request Changes</strong> to re-queue for annotation, or <strong>Reject</strong> if unfixable.</p>
+            </div>
+          </div>
+        );
+      })() : null}
 
       {quickPicks.length > 0 ? (
         <div className="convention-quick-picks">

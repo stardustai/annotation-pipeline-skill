@@ -90,12 +90,6 @@ runtime:
     preview_renderer_id: image_bbox_preview
     enabled: true
 """,
-    "annotation_rules.yaml": """rules:
-  - id: entity_span_defaults
-    applies_to: [entity_span]
-    instruction: Label person, organization, location, date, product, and event mentions with exact text spans.
-    examples: []
-""",
     "external_tasks.yaml": """external_tasks:
   default:
     enabled: false
@@ -174,24 +168,24 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--document-version-id")
     create_parser.set_defaults(handler=handle_create_tasks)
 
-    document_parser = subparsers.add_parser("document")
+    document_parser = subparsers.add_parser("document", help="manage annotation documents and versions")
     document_subparsers = document_parser.add_subparsers(required=True)
 
-    doc_create = document_subparsers.add_parser("create")
+    doc_create = document_subparsers.add_parser("create", help="create a new document record")
     doc_create.add_argument("--project-root", type=Path, default=Path.cwd())
     doc_create.add_argument("--title", required=True)
     doc_create.add_argument("--description", default="")
     doc_create.add_argument("--created-by", default="operator")
     doc_create.set_defaults(handler=handle_document_create)
 
-    doc_list = document_subparsers.add_parser("list")
+    doc_list = document_subparsers.add_parser("list", help="list all documents in the project")
     doc_list.add_argument("--project-root", type=Path, default=Path.cwd())
     doc_list.set_defaults(handler=handle_document_list)
 
-    doc_version_parser = document_subparsers.add_parser("version")
+    doc_version_parser = document_subparsers.add_parser("version", help="manage document versions")
     doc_version_subparsers = doc_version_parser.add_subparsers(required=True)
 
-    doc_version_add = doc_version_subparsers.add_parser("add")
+    doc_version_add = doc_version_subparsers.add_parser("add", help="add a new version from a content file")
     doc_version_add.add_argument("--project-root", type=Path, default=Path.cwd())
     doc_version_add.add_argument("--document-id", required=True)
     doc_version_add.add_argument("--version", required=True)
@@ -200,15 +194,41 @@ def build_parser() -> argparse.ArgumentParser:
     doc_version_add.add_argument("--created-by", default="operator")
     doc_version_add.set_defaults(handler=handle_document_version_add)
 
-    doc_version_list = doc_version_subparsers.add_parser("list")
+    doc_version_list = doc_version_subparsers.add_parser("list", help="list all versions for a document")
     doc_version_list.add_argument("--project-root", type=Path, default=Path.cwd())
     doc_version_list.add_argument("--document-id", required=True)
     doc_version_list.set_defaults(handler=handle_document_version_list)
 
-    doc_version_show = doc_version_subparsers.add_parser("show")
+    doc_version_show = doc_version_subparsers.add_parser("show", help="show version metadata as JSON (includes content field)")
     doc_version_show.add_argument("--project-root", type=Path, default=Path.cwd())
     doc_version_show.add_argument("--version-id", required=True)
     doc_version_show.set_defaults(handler=handle_document_version_show)
+
+    guideline_parser = subparsers.add_parser("guideline", help="query and manage the active annotation guideline")
+    guideline_subparsers = guideline_parser.add_subparsers(required=True)
+
+    guideline_show = guideline_subparsers.add_parser("show", help="print active guideline content (plain text)")
+    guideline_show.add_argument("--project-root", type=Path, default=Path.cwd())
+    guideline_show.add_argument("--version", default=None, help="version label (e.g. v7); defaults to latest")
+    guideline_show.set_defaults(handler=handle_guideline_show)
+
+    guideline_export = guideline_subparsers.add_parser("export", help="export guideline content to a file")
+    guideline_export.add_argument("--project-root", type=Path, default=Path.cwd())
+    guideline_export.add_argument("--version", default=None, help="version label (e.g. v7); defaults to latest")
+    guideline_export.add_argument("--output", type=Path, required=True, help="destination file path")
+    guideline_export.set_defaults(handler=handle_guideline_export)
+
+    guideline_update = guideline_subparsers.add_parser("update", help="publish a new guideline version from a content file")
+    guideline_update.add_argument("--project-root", type=Path, default=Path.cwd())
+    guideline_update.add_argument("--content-file", type=Path, required=True)
+    guideline_update.add_argument("--version", required=True, help="version label for the new version (e.g. v8)")
+    guideline_update.add_argument("--changelog", default="", help="description of changes in this version")
+    guideline_update.add_argument("--created-by", default="operator")
+    guideline_update.set_defaults(handler=handle_guideline_update)
+
+    guideline_list = guideline_subparsers.add_parser("list", help="list all guideline versions with changelog and timestamps")
+    guideline_list.add_argument("--project-root", type=Path, default=Path.cwd())
+    guideline_list.set_defaults(handler=handle_guideline_list)
 
     import_parser = subparsers.add_parser("import")
     import_subparsers = import_parser.add_subparsers(required=True)
@@ -955,6 +975,30 @@ def _batched_output_schema(
     return schema
 
 
+def _current_rules_version_label(store) -> str | None:
+    """Return the label (e.g. 'v6') of the latest annotation_rules version in the DB, or None."""
+    try:
+        rows = store._conn.execute("SELECT document_id, metadata_json FROM documents").fetchall()
+        doc_id = None
+        for r in rows:
+            try:
+                meta = json.loads(r["metadata_json"]) if r["metadata_json"] else {}
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict) and meta.get("role") == "annotation_rules":
+                doc_id = r["document_id"]
+                break
+        if not doc_id:
+            return None
+        ver = store._conn.execute(
+            "SELECT version FROM document_versions WHERE document_id=? ORDER BY created_at DESC LIMIT 1",
+            (doc_id,),
+        ).fetchone()
+        return ver["version"] if ver else None
+    except Exception:
+        return None
+
+
 def _normalize_prelabel_output(output: dict, *, task_id: str, row_index: int) -> dict:
     """Normalize v2 prelabeled output to the v3 schema shape.
 
@@ -1023,7 +1067,7 @@ def _save_jsonl_prelabeled_task(
             "payload": {
                 "rows": rows_payload,
                 "annotation_guidance": {
-                    "rules_path": "annotation_rules.yaml",
+                    "rules_version": _current_rules_version_label(store),
                 },
             },
         },
@@ -1148,6 +1192,86 @@ def handle_document_version_show(args: argparse.Namespace) -> int:
     store = SqliteStore.open(args.project_root / ".annotation-pipeline")
     ver = store.load_document_version(args.version_id)
     print(json.dumps(ver.to_dict(), sort_keys=True, indent=2))
+    return 0
+
+
+def _find_annotation_rules_doc(store: SqliteStore):
+    """Return the annotation-rules document, or raise SystemExit if not found."""
+    for doc in store.list_documents():
+        if isinstance(doc.metadata, dict) and doc.metadata.get("role") == "annotation_rules":
+            return doc
+    print("error: no annotation-rules document found in this project", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _resolve_guideline_version(store: SqliteStore, doc, version_label: str | None):
+    """Return the requested version (latest if None), or raise SystemExit."""
+    versions = store.list_document_versions(doc.document_id)
+    if not versions:
+        print(f"error: document {doc.document_id!r} has no versions", file=sys.stderr)
+        raise SystemExit(1)
+    if version_label is None:
+        return versions[-1]
+    for ver in versions:
+        if ver.version == version_label:
+            return ver
+    labels = ", ".join(v.version for v in versions)
+    print(f"error: version {version_label!r} not found; available: {labels}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def handle_guideline_show(args: argparse.Namespace) -> int:
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    doc = _find_annotation_rules_doc(store)
+    ver = _resolve_guideline_version(store, doc, args.version)
+    print(f"# {doc.title}  [{ver.version}]  {ver.created_at}")
+    if ver.changelog:
+        print(f"# changelog: {ver.changelog}")
+    print()
+    print(ver.content, end="")
+    return 0
+
+
+def handle_guideline_export(args: argparse.Namespace) -> int:
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    doc = _find_annotation_rules_doc(store)
+    ver = _resolve_guideline_version(store, doc, args.version)
+    args.output.write_text(ver.content, encoding="utf-8")
+    print(f"exported {doc.title} [{ver.version}] → {args.output}")
+    return 0
+
+
+def handle_guideline_update(args: argparse.Namespace) -> int:
+    from annotation_pipeline_skill.core.models import AnnotationDocumentVersion
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    doc = _find_annotation_rules_doc(store)
+    content = args.content_file.read_text(encoding="utf-8")
+    ver = AnnotationDocumentVersion.new(
+        document_id=doc.document_id,
+        version=args.version,
+        content=content,
+        changelog=args.changelog,
+        created_by=args.created_by,
+    )
+    store.save_document_version(ver)
+    print(json.dumps(ver.to_dict(), sort_keys=True, indent=2))
+    return 0
+
+
+def handle_guideline_list(args: argparse.Namespace) -> int:
+    store = SqliteStore.open(args.project_root / ".annotation-pipeline")
+    doc = _find_annotation_rules_doc(store)
+    versions = store.list_document_versions(doc.document_id)
+    rows = []
+    for ver in versions:
+        rows.append({
+            "version": ver.version,
+            "version_id": ver.version_id,
+            "created_at": str(ver.created_at),
+            "created_by": ver.created_by,
+            "changelog": ver.changelog,
+        })
+    print(json.dumps({"document_id": doc.document_id, "title": doc.title, "versions": rows}, indent=2))
     return 0
 
 

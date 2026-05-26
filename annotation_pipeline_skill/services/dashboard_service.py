@@ -82,7 +82,7 @@ def build_dashboard_stats(
     store: SqliteStore,
     *,
     project_id: str | None = None,
-    throughput_window_minutes: int = 60,
+    throughput_window_minutes: int = 5,
 ) -> dict:
     """Counts + per-stage throughput for the always-visible stats bar.
 
@@ -108,11 +108,15 @@ def build_dashboard_stats(
     )
 
     since = datetime.now(timezone.utc) - timedelta(minutes=throughput_window_minutes)
+    since_iso = since.isoformat()
     raw_throughput = store.count_succeeded_attempts_since(
-        since.isoformat(),
+        since_iso,
         pipeline_id=project_id,
     )
     throughput = {stage: raw_throughput.get(stage, 0) for stage in THROUGHPUT_STAGES}
+
+    accepted_in_window = store.count_accepted_since(since_iso, pipeline_id=project_id)
+    health = store.fetch_pipeline_health_metrics(pipeline_id=project_id)
 
     return {
         "project_id": project_id,
@@ -122,6 +126,12 @@ def build_dashboard_stats(
         "outbox_pending_count": outbox_pending_count,
         "throughput_per_window": throughput,
         "throughput_window_minutes": throughput_window_minutes,
+        "accepted_in_window": accepted_in_window,
+        "accepted_count": health["accepted_count"],
+        "terminal_count": health["terminal_count"],
+        "first_pass_count": health["first_pass_count"],
+        "arb_entered_count": health["arb_entered_count"],
+        "avg_llm_calls": health["avg_llm_calls"],
     }
 
 

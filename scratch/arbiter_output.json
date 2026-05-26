@@ -1,0 +1,84 @@
+{
+  "verdicts": [
+    {
+      "feedback_id": "feedback-8bd5202ddf424905b0ddf91d4b3fb8f2",
+      "verdict": "qc",
+      "confidence": "tentative",
+      "reasoning": "QC correctly identifies a NO DUPLICATES violation. The span '2016' appears twice in entities.number for a row in the omitted set (not visible in slim view). The duplicate violates the NO DUPLICATES rule. Unable to fix because the affected row is in the omitted set and its input text is not available in the slim prompt."
+    },
+    {
+      "feedback_id": "feedback-56fa8cf6fa4644c6a13c217a6414a8d2",
+      "verdict": "annotator",
+      "confidence": "certain",
+      "reasoning": "The current annotation for row 2 does not contain json_structures.status at all; the span 'has yet to be established empirically' exists only in row 0's status (where it is a verbatim substring of that row's input text). The annotator's current annotation is correct on this item."
+    },
+    {
+      "feedback_id": "feedback-12294a0f0c2045e6bea3052e10561a0b",
+      "verdict": "neither",
+      "confidence": "unsure",
+      "reasoning": "The row containing references to 'women' is in the omitted set and not visible. Without the source text, cannot determine whether 'women' should be annotated or which entity type would be appropriate. Routing to human review."
+    },
+    {
+      "feedback_id": "feedback-171702e67f4f4ec885dd23a16e7d61ba",
+      "verdict": "qc",
+      "confidence": "certain",
+      "reasoning": "Verified by character-level analysis: annotation uses U+2011 (NON-BREAKING HYPHEN, '‑') in 'COVID‑19' where input text uses U+2010 (HYPHEN, '‐'). Corrected span uses the verbatim characters from the input."
+    },
+    {
+      "feedback_id": "feedback-afb61318e37345189d3b409a2eb13490",
+      "verdict": "qc",
+      "confidence": "certain",
+      "reasoning": "Two defects: (1) Character substitution — annotation uses U+2011 (NON-BREAKING HYPHEN) where input uses U+2010 (HYPHEN) in 'USDA‑Agricultural'. (2) Missing word — input has 'USDA‐Agricultural Marketing Service Service' (double 'Service') but annotation has only single 'Service'. Both fixed in corrected_annotation."
+    },
+    {
+      "feedback_id": "feedback-6d7eee56da6e4fe882431cd0acf8f6f4",
+      "verdict": "qc",
+      "confidence": "certain",
+      "reasoning": "Annotation uses U+2011 (NON-BREAKING HYPHEN) in 'USDA‑Agricultural' within the strategy span where input uses U+2010 (HYPHEN). The 'Service Service' duplication is correctly preserved. Only the character substitution needed fixing."
+    }
+  ],
+  "corrected_annotation": {
+    "rows": [
+      {
+        "row_index": 0,
+        "row_id": "11_preseen_50k_case_batches_002860",
+        "output": {
+          "entities": {
+            "document": [
+              "Labor shortages and agricultural trucking rates"
+            ],
+            "event": [
+              "COVID‐19 pandemic"
+            ],
+            "location": [
+              "United States"
+            ],
+            "organization": [
+              "US Bureau of Census",
+              "Current Population Survey",
+              "USDA‐Agricultural Marketing Service Service"
+            ]
+          },
+          "json_structures": {
+            "goal": [
+              "establish the linkage between trucker supply and the demand for trucking services"
+            ],
+            "reason": [
+              "rising truck rates is a signal of a broader shortage of truckers"
+            ],
+            "status": [
+              "has yet to be established empirically"
+            ],
+            "strategy": [
+              "combining US Bureau of Census Current Population Survey data on truck driver wages with USDA‐Agricultural Marketing Service Service data on truck rates"
+            ],
+            "task": [
+              "develop an empirical examination",
+              "estimate the model"
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

@@ -75,7 +75,7 @@ def _is_rate_limited(exc: BaseException) -> bool:
     Covers openai.RateLimitError (status 429), generic APIStatusError with
     .status_code==429, and CLI-style errors that just carry a message — we
     inspect both the type name and the string representation.
-    Also covers LocalCLIExecutionError from AnthropicSDKClient which buries
+    Also covers ProviderCallError from AnthropicSDKClient which buries
     the HTTP status in diagnostics["error_event"]["api_error_status"].
     """
     name = type(exc).__name__
@@ -84,7 +84,7 @@ def _is_rate_limited(exc: BaseException) -> bool:
     status = getattr(exc, "status_code", None)
     if status == 429:
         return True
-    # AnthropicSDKClient wraps anthropic.APIError as LocalCLIExecutionError
+    # AnthropicSDKClient wraps anthropic.APIError as ProviderCallError
     # with the HTTP status in diagnostics["error_event"]["api_error_status"].
     diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(diagnostics, dict):
@@ -150,7 +150,7 @@ def _is_provider_permanent_error(exc: BaseException) -> bool:
     if any(s in text for s in ("not found", "unauthorized", "forbidden",
                                     " 400 ", " 401 ", " 403 ", " 404 ", " 422 ")):
         return True
-    # LocalCLIExecutionError surfaces CLI exit failures with diagnostics
+    # ProviderCallError surfaces CLI exit failures with diagnostics
     # (stderr, returncode). Subprocess providers don't raise SDK-style
     # NotFoundError/AuthenticationError — they exit non-zero and bury the
     # cause in stderr. Without this branch, OAuth-broken / bad-api-key /
@@ -305,9 +305,14 @@ class SubagentRuntime:
             and task.current_attempt == 0
             and task.metadata.get("prelabeled")
         ):
+            # Use the pre-label annotation as-is, skipping the LLM call.
+            # current_attempt == 0 is the guard: after any real annotation
+            # attempt (pass or fail) current_attempt > 0, so we fall through to
+            # a fresh LLM call rather than reusing a stale or invalid result.
             prelabeled = [
                 artifact for artifact in self.store.list_artifacts(task.task_id)
                 if artifact.kind == "annotation_result"
+                and artifact.metadata.get("runtime") == "import"
             ]
             if prelabeled:
                 annotation_artifact = prelabeled[-1]
@@ -527,6 +532,30 @@ class SubagentRuntime:
                     if task.metadata.get(k):
                         metadata.setdefault(k, task.metadata[k])
                 target = arb.get("failed_verbatim_target") or {}
+                failed_span = target.get("span")
+                if failed_span:
+                    self.store.append_feedback(
+                        FeedbackRecord.new(
+                            task_id=task.task_id,
+                            attempt_id=attempt_id,
+                            source_stage=FeedbackSource.HUMAN_REVIEW,
+                            severity=FeedbackSeverity.ERROR,
+                            category="arbiter_correction_failed",
+                            message=(
+                                f"Arbiter could not produce a verbatim-compliant correction "
+                                f"for span {failed_span!r} at {target.get('field')!r} "
+                                f"row {target.get('row_index')} after {count} attempt(s). "
+                                f"The span does not appear verbatim in the source text."
+                            ),
+                            target={
+                                "span": failed_span,
+                                "field": target.get("field"),
+                                "row_index": target.get("row_index"),
+                            },
+                            suggested_action="request_changes",
+                            created_by="arbiter",
+                        )
+                    )
                 self._transition(
                     task,
                     TaskStatus.HUMAN_REVIEW,
@@ -551,8 +580,26 @@ class SubagentRuntime:
             for k in ("exception_class", "exception_message"):
                 if arb.get(k):
                     task.metadata[f"arbiter_last_{k}"] = arb[k]
-            backoff = min(30 * count, 300)
-            task.next_retry_at = utc_now() + timedelta(seconds=backoff)
+            if count >= self.ARBITER_MECHANICAL_RETRY_CAP:
+                self._transition(
+                    task,
+                    TaskStatus.HUMAN_REVIEW,
+                    reason=(
+                        f"Arbiter retried {count} times but kept failing to return a usable "
+                        f"answer (JSON parse / shape errors); routing to human review"
+                    ),
+                    stage=stage,
+                    attempt_id=attempt_id,
+                    metadata={
+                        **hr_extra_metadata,
+                        "arbiter_mechanical_retries": count,
+                        "arbiter_ran": arb["ran"],
+                        "arbiter_mechanical_fail": arb["mechanical_fail"],
+                    },
+                )
+            else:
+                backoff = min(30 * count, 300)
+                task.next_retry_at = utc_now() + timedelta(seconds=backoff)
 
     def _retry_round_count(self, task_id: str) -> int:
         """Count how many *open* retry rounds have happened for this task.
@@ -1740,7 +1787,10 @@ class SubagentRuntime:
                     arb["mechanical_fail"] += 1
                     return None
                 # Row coverage check: every source row_id must appear in the
-                # annotation. Hard boundary — no fallback acceptance.
+                # annotation. When the latest artifact fails this check (e.g.
+                # a previous arbiter correction dropped some rows), try rolling
+                # back to the most recent annotation artifact with full coverage
+                # instead of looping forever on the broken correction.
                 try:
                     source_rows = task.source_ref["payload"]["rows"]
                     if isinstance(source_rows, list) and source_rows:
@@ -1749,8 +1799,29 @@ class SubagentRuntime:
                             ann_rows = _payload.get("rows", [])
                             ann_ids = {r["row_id"] for r in ann_rows if isinstance(r, dict) and "row_id" in r}
                             if source_ids - ann_ids:
-                                arb["mechanical_fail"] += 1
-                                return None
+                                prior = self._find_last_complete_annotation_artifact(
+                                    task, annotation_artifact.artifact_id, source_ids
+                                )
+                                if prior is None:
+                                    arb["mechanical_fail"] += 1
+                                    return None
+                                prior_payload = self._load_annotation_payload(prior)
+                                if not isinstance(prior_payload, dict):
+                                    arb["mechanical_fail"] += 1
+                                    return None
+                                if (find_verbatim_violations(task, prior_payload)
+                                        or find_cross_type_collisions(prior_payload)
+                                        or find_trailing_punctuation_spans(task, prior_payload)):
+                                    arb["mechanical_fail"] += 1
+                                    return None
+                                prior_ids = {r["row_id"] for r in prior_payload.get("rows", []) if isinstance(r, dict) and "row_id" in r}
+                                if source_ids - prior_ids:
+                                    arb["mechanical_fail"] += 1
+                                    return None
+                                # Prior artifact is complete and clean — promote it
+                                # so _latest_annotation_artifact returns it next time.
+                                annotation_artifact = self._promote_annotation_artifact(task, prior)
+                                _payload = prior_payload
                 except (KeyError, TypeError):
                     pass
             self._increment_entity_statistics_for_task(
@@ -1778,6 +1849,47 @@ class SubagentRuntime:
             )
             return TaskStatus.ACCEPTED
         return None
+
+    def _find_last_complete_annotation_artifact(
+        self,
+        task: Task,
+        exclude_artifact_id: str,
+        source_ids: set[str],
+    ) -> "ArtifactRef | None":
+        """Walk annotation_result artifacts in reverse seq order, skipping
+        ``exclude_artifact_id``, and return the most recent one whose payload
+        contains every row_id in ``source_ids``. Returns None if no such
+        artifact exists.
+        """
+        artifacts = [
+            a for a in self.store.list_artifacts(task.task_id)
+            if a.kind == "annotation_result" and a.artifact_id != exclude_artifact_id
+        ]
+        for art in reversed(artifacts):
+            payload = self._load_annotation_payload(art)
+            if not isinstance(payload, dict):
+                continue
+            ann_ids = {r["row_id"] for r in payload.get("rows", []) if isinstance(r, dict) and "row_id" in r}
+            if not (source_ids - ann_ids):
+                return art
+        return None
+
+    def _promote_annotation_artifact(self, task: Task, artifact: "ArtifactRef") -> "ArtifactRef":
+        """Re-insert an annotation_result artifact at the highest seq so that
+        _latest_annotation_artifact returns it on the next pickup. The original
+        artifact_ref is left intact; a new one pointing to the same file is
+        appended.
+        """
+        from annotation_pipeline_skill.core.models import ArtifactRef
+        new_ref = ArtifactRef.new(
+            task_id=task.task_id,
+            kind="annotation_result",
+            path=artifact.path,
+            content_type=artifact.content_type,
+            metadata={**artifact.metadata, "promoted_from": artifact.artifact_id},
+        )
+        self.store.append_artifact(new_ref)
+        return new_ref
 
     def _apply_arbiter_correction(
         self,
@@ -2068,6 +2180,23 @@ class SubagentRuntime:
             # that's the rubber-stamp bug. Route to HR so a human can adjudicate.
             task.metadata["prior_verifier_action"] = "second_arbiter_unavailable"
             self._clear_divergence_flag(task)
+            self.store.append_feedback(
+                FeedbackRecord.new(
+                    task_id=task.task_id,
+                    attempt_id=attempt_id,
+                    source_stage=FeedbackSource.HUMAN_REVIEW,
+                    severity=FeedbackSeverity.ERROR,
+                    category="prior_divergence",
+                    message=(
+                        f"Span {span!r}: arbiter selected {first_type!r} but project history "
+                        f"dominant is {prior_type!r}. Second arbiter unavailable — choose the correct type."
+                    ),
+                    target={"span": span, "first_arbiter_type": first_type,
+                            "prior_dominant_type": prior_type, "proposed_type": first_type},
+                    suggested_action="human_select_type",
+                    created_by="prior_verifier",
+                )
+            )
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
@@ -2116,6 +2245,23 @@ class SubagentRuntime:
                         return
             task.metadata["prior_verifier_action"] = "second_arbiter_verbatim_failed"
             self._clear_divergence_flag(task)
+            self.store.append_feedback(
+                FeedbackRecord.new(
+                    task_id=task.task_id,
+                    attempt_id=attempt_id,
+                    source_stage=FeedbackSource.HUMAN_REVIEW,
+                    severity=FeedbackSeverity.ERROR,
+                    category="prior_divergence",
+                    message=(
+                        f"Span {span!r}: arbiter selected {first_type!r} but project history "
+                        f"dominant is {prior_type!r}. Second arbiter correction failed verbatim check — choose the correct type."
+                    ),
+                    target={"span": span, "first_arbiter_type": first_type,
+                            "prior_dominant_type": prior_type, "proposed_type": first_type},
+                    suggested_action="human_select_type",
+                    created_by="prior_verifier",
+                )
+            )
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
@@ -2181,6 +2327,23 @@ class SubagentRuntime:
             # Truly silent / uncertain. Route to HR rather than rubber-stamp.
             task.metadata["prior_verifier_action"] = "second_arbiter_silent"
             self._clear_divergence_flag(task)
+            self.store.append_feedback(
+                FeedbackRecord.new(
+                    task_id=task.task_id,
+                    attempt_id=attempt_id,
+                    source_stage=FeedbackSource.HUMAN_REVIEW,
+                    severity=FeedbackSeverity.ERROR,
+                    category="prior_divergence",
+                    message=(
+                        f"Span {span!r}: arbiter selected {first_type!r} but project history "
+                        f"dominant is {prior_type!r}. Second arbiter gave no confident verdict — choose the correct type."
+                    ),
+                    target={"span": span, "first_arbiter_type": first_type,
+                            "prior_dominant_type": prior_type, "proposed_type": first_type},
+                    suggested_action="human_select_type",
+                    created_by="prior_verifier",
+                )
+            )
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
@@ -2241,6 +2404,30 @@ class SubagentRuntime:
         else:
             task.metadata["prior_verifier_action"] = "escalated_to_hr"
             self._clear_divergence_flag(task)
+            # Generate a feedback record so the Manual Review panel has
+            # structured content to display. Without this the operator sees
+            # an empty review screen and has no way to know what to decide.
+            self.store.append_feedback(
+                FeedbackRecord.new(
+                    task_id=task.task_id,
+                    attempt_id=attempt_id,
+                    source_stage=FeedbackSource.HUMAN_REVIEW,
+                    severity=FeedbackSeverity.ERROR,
+                    category="three_way_disagreement",
+                    message=(
+                        f"Span {span!r}: first arbiter selected {first_type!r}, "
+                        f"second arbiter selected {second_type!r}, "
+                        f"project history dominant is {prior_type!r}. "
+                        f"All three signals disagree — choose the correct type."
+                    ),
+                    target={"span": span, "proposed_type": first_type,
+                            "first_arbiter_type": first_type,
+                            "second_arbiter_type": second_type,
+                            "prior_dominant_type": prior_type},
+                    suggested_action="human_select_type",
+                    created_by="prior_verifier",
+                )
+            )
             self._transition(
                 task,
                 TaskStatus.HUMAN_REVIEW,
@@ -2985,7 +3172,7 @@ class SubagentRuntime:
                 # message exceptions (asyncio.CancelledError / TimeoutError /
                 # bare subprocess errors) where str(exc) is "" and we lose
                 # the only clue about what went wrong.
-                # LocalCLIExecutionError carries .diagnostics (returncode +
+                # ProviderCallError carries .diagnostics (returncode +
                 # stderr + error_event with parsed api_error_status). Without
                 # surfacing diagnostics the wrapped message is just "local
                 # CLI provider failed" and the cause (auth/balance/wrong
@@ -3090,10 +3277,17 @@ class SubagentRuntime:
                             + candidates_block
                         )
                         continue
-                    # Retries exhausted. Keep the bad corrected_annotation
-                    # so callers can preserve it in HR metadata; the flag
-                    # tells them NOT to apply it as a real correction.
-                    verbatim_exhausted_target = verbatim_failure.get("target", {})
+                    # Retries exhausted. Before giving up, try stripping the
+                    # non-verbatim spans — the arbiter's type correction for
+                    # the target span is usually right even when it hallucinates
+                    # an unrelated entity alongside it. Only mark as exhausted
+                    # if violations remain after stripping.
+                    from annotation_pipeline_skill.core.schema_validation import find_verbatim_violations
+                    all_viols = find_verbatim_violations(task, corrected_check)
+                    if all_viols:
+                        _strip_non_verbatim_spans_in_place(corrected_check, all_viols)
+                    if self._check_verbatim_spans(task, corrected_check) is not None:
+                        verbatim_exhausted_target = verbatim_failure.get("target", {})
                 else:
                     # Cross-type collision: same span tagged under two entity
                     # types. _apply_arbiter_correction blocks this silently;
@@ -3659,15 +3853,29 @@ def _parse_qc_decision(text: str) -> dict[str, Any]:
     }
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> blocks, returning stripped text or '' if nothing remains."""
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
+
 def _parse_llm_json(text: str) -> Any:
     """Robust JSON parser for LLM-emitted text.
 
-    Primary path: ``robust-json-parser`` library, which handles:
-      - <think>...</think> reasoning blocks (minimax / deepseek-reasoner / qwen-r1)
+    Primary path: strip ``<think>...</think>`` blocks first (robust-json-parser
+    scans for the largest/first JSON object in the full text and incorrectly
+    picks up annotation JSON embedded inside thinking rather than the QC answer
+    that follows ``</think>``), then call ``robust-json-parser`` which handles:
       - markdown code fences (```json ... ```)
       - prose preambles ("I'm rebuilding the annotations..." from codex CLI)
       - single quotes instead of doubles, trailing commas, inline comments
       - truncated / partial JSON (auto-closes braces)
+
+    If stripping think blocks leaves nothing (model hit max_tokens mid-think and
+    never produced an answer), fall back to the original full text so the library
+    can attempt recovery via partial-JSON auto-close.
 
     Fallback path (when the library fails): scan for top-level ``{`` and
     use ``json.JSONDecoder.raw_decode`` to extract the first balanced JSON
@@ -3680,8 +3888,10 @@ def _parse_llm_json(text: str) -> Any:
     unrecoverable input — call sites already catching ``json.JSONDecodeError``
     keep working because ``JSONDecodeError`` is a subclass.
     """
+    stripped = _strip_think_blocks(text)
+    parse_target = stripped if stripped else text
     try:
-        return _robust_json_loads(text)
+        return _robust_json_loads(parse_target)
     except (ValueError, TypeError) as primary_err:
         # Fallback: scan for every "{" position and try ``raw_decode``;
         # collect successfully-parsed candidates, then pick the one most
@@ -3699,11 +3909,11 @@ def _parse_llm_json(text: str) -> Any:
         decoder = json.JSONDecoder()
         candidates: list[tuple[Any, int]] = []  # (parsed, span_len)
         for opener in ("{", "["):
-            for i in range(len(text)):
-                if text[i] != opener:
+            for i in range(len(parse_target)):
+                if parse_target[i] != opener:
                     continue
                 try:
-                    obj, end = decoder.raw_decode(text, i)
+                    obj, end = decoder.raw_decode(parse_target, i)
                 except json.JSONDecodeError:
                     continue
                 candidates.append((obj, end - i))

@@ -81,6 +81,7 @@ WHERE rn = 1
 ARBITER_RESET_KEYS = (
     "arbiter_mechanical_retries",
     "arbiter_verbatim_bail_count",
+    "arbiter_transient_bail_count",
     "arbiter_last_exception_class",
     "arbiter_last_exception_message",
 )

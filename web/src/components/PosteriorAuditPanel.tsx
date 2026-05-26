@@ -105,10 +105,9 @@ export function PosteriorAuditPanel({
   const [subtab, setSubtab] = useState<Subtab>("deviations");
   const [filter, setFilter] = useState("");
   // Default ON: Contested-spans Apply-to-all also writes a project
-  // convention. Operator can flip off (per-session) when they want a
-  // bulk task fix WITHOUT introducing a project rule (e.g. context-
-  // specific span where the type only applies in this corpus).
-  const [saveAsConvention, setSaveAsConvention] = useState(true);
+  // convention. Operator can flip on when they want a bulk task fix
+  // WITH a project rule; default off to avoid accidental convention writes.
+  const [saveAsConvention, setSaveAsConvention] = useState(false);
   // Low-info threshold — client-side filter over the backend's pre-scored list.
   // Backend floor is 4.0; raising this narrows the list. Lowering below 4.0
   // requires a full Re-check (backend won't have scored those entries).
@@ -407,6 +406,27 @@ export function PosteriorAuditPanel({
                   Scored via <code>wordfreq</code> (multilingual; Zipf 0–7, 6+ = "the / very / nice").
                 </span>
               </div>
+              {/* Threshold slider — always visible so the operator can lower it when no rows show */}
+              <div style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "0.82rem", color: "var(--muted, #6b7280)", margin: "0.3rem 0 0.5rem" }}>
+                <span>Wordfreq ≥</span>
+                <input
+                  id="low-info-threshold"
+                  type="range"
+                  min={0}
+                  max={7}
+                  step={0.1}
+                  value={lowInfoThreshold}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!isNaN(v)) setLowInfoThreshold(Math.max(0, Math.min(7, v)));
+                  }}
+                  style={{ width: "90px", cursor: "pointer", verticalAlign: "middle", accentColor: "var(--accent, #2563eb)" }}
+                />
+                <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2.2ch" }}>{lowInfoThreshold.toFixed(1)}</span>
+                {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
+                  <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${LOW_INFO_BACKEND_FLOOR}. Re-check to see entries below it.`}>⚠</span>
+                ) : null}
+              </div>
               {(() => {
                 const visibleItems = lowInfo.filter((c) => c.wordfreq >= lowInfoThreshold);
                 return visibleItems.length > 0 ? (
@@ -422,8 +442,6 @@ export function PosteriorAuditPanel({
                     bulkRunning={lowInfoBulkRunning}
                     setBulkRunning={setLowInfoBulkRunning}
                     applyBulkRef={lowInfoApplyBulkRef}
-                    threshold={lowInfoThreshold}
-                    setThreshold={setLowInfoThreshold}
                     backendFloor={LOW_INFO_BACKEND_FLOOR}
                     totalBeforeFilter={lowInfo.length}
                   />
@@ -467,10 +485,10 @@ function DeviationsTable({
   const [picked, setPicked] = useState<Record<string, string | null>>({});
   // Per-row status: "submitting" | "submitted" | "error: ..." | undefined
   const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
-  // Per-row "Save as project convention" checkbox — default ON; when off
-  // the fix patches this task only and doesn't promote to a project rule.
+  // Per-row "Save as project convention" checkbox — default OFF; when on
+  // the fix also promotes the fix to a project-wide rule.
   const [saveConv, setSaveConv] = useState<Record<string, boolean>>({});
-  const getSaveConv = (key: string) => saveConv[key] ?? true;
+  const getSaveConv = (key: string) => saveConv[key] ?? false;
   // Apply-to-all flow: confirmation dialog + per-span progress + final
   // summary. Keyed by span (not row key) since one apply-to-all affects
   // every row sharing the same span.
@@ -1599,8 +1617,6 @@ function LowInfoTable({
   bulkRunning,
   setBulkRunning,
   applyBulkRef,
-  threshold,
-  setThreshold,
   backendFloor,
   totalBeforeFilter,
 }: {
@@ -1615,8 +1631,6 @@ function LowInfoTable({
   bulkRunning: boolean;
   setBulkRunning: React.Dispatch<React.SetStateAction<boolean>>;
   applyBulkRef: React.MutableRefObject<(() => Promise<void>) | null>;
-  threshold: number;
-  setThreshold: (v: number) => void;
   backendFloor: number;
   totalBeforeFilter: number;
 }): React.ReactElement {
@@ -1767,37 +1781,7 @@ function LowInfoTable({
           pageSize={LOW_INFO_PAGE_SIZE}
           onPageChange={setPage}
         />
-        <input
-          type="search"
-          placeholder="Filter span…"
-          value={filter}
-          onChange={(e) => onFilterChange?.(e.target.value)}
-          style={{ width: "min(200px, 30%)" }}
-        />
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.6rem" }}>
-          <label
-            htmlFor="low-info-threshold"
-            style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "0.82rem", color: "var(--muted, #6b7280)", whiteSpace: "nowrap" }}
-          >
-            <span>Wordfreq ≥</span>
-            <input
-              id="low-info-threshold"
-              type="range"
-              min={0}
-              max={7}
-              step={0.1}
-              value={threshold}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                if (!isNaN(v)) setThreshold(Math.max(0, Math.min(7, v)));
-              }}
-              style={{ width: "90px", cursor: "pointer", verticalAlign: "middle", accentColor: "var(--accent, #2563eb)" }}
-            />
-            <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2.2ch" }}>{threshold.toFixed(1)}</span>
-            {threshold < backendFloor ? (
-              <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${backendFloor}. Re-check to see entries below it.`}>⚠</span>
-            ) : null}
-          </label>
           <button
             type="button"
             disabled={selected.size === 0 || bulkRunning}
@@ -1819,6 +1803,13 @@ function LowInfoTable({
                 ? `Batch set "Not an entity" (${selected.size})`
                 : `Batch set "Not an entity"`}
           </button>
+          <input
+            type="search"
+            placeholder="Filter span…"
+            value={filter}
+            onChange={(e) => onFilterChange?.(e.target.value)}
+            style={{ width: "min(200px, 30%)" }}
+          />
         </div>
       </div>
       <div className="runtime-card">
@@ -1870,6 +1861,7 @@ function LowInfoTable({
                       projectId={projectId}
                       storeKey={storeKey}
                       span={c.span}
+                      sourceOnly
                     />
                   </td>
                   <td style={TD}>

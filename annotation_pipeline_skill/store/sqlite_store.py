@@ -589,12 +589,17 @@ class SqliteStore:
         """Return {stage: count} for attempts with status='succeeded' and
         finished_at >= since_iso. Optionally filtered to one pipeline.
 
+        Zero-duration attempts (started_at = finished_at) are excluded because
+        they are synthetic records injected by migration/import scripts rather
+        than real LLM calls, and would otherwise inflate the throughput metric.
+
         Used by the dashboard stats bar to compute per-stage throughput.
         """
         if pipeline_id is None:
             rows = self._conn.execute(
                 "SELECT stage, COUNT(*) AS c FROM attempts "
                 "WHERE status = 'succeeded' AND finished_at >= ? "
+                "AND started_at != finished_at "
                 "GROUP BY stage",
                 (since_iso,),
             ).fetchall()
@@ -603,11 +608,111 @@ class SqliteStore:
                 "SELECT a.stage, COUNT(*) AS c FROM attempts a "
                 "JOIN tasks t ON a.task_id = t.task_id "
                 "WHERE a.status = 'succeeded' AND a.finished_at >= ? "
+                "AND a.started_at != a.finished_at "
                 "AND t.pipeline_id = ? "
                 "GROUP BY a.stage",
                 (since_iso, pipeline_id),
             ).fetchall()
         return {r["stage"]: r["c"] for r in rows}
+
+    def count_accepted_since(
+        self,
+        since_iso: str,
+        *,
+        pipeline_id: str | None = None,
+    ) -> int:
+        """Return the number of audit_events transitions to 'accepted' since
+        *since_iso*.  Used by the dashboard stats bar to compute ETA.
+        """
+        if pipeline_id is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM audit_events "
+                "WHERE next_status = 'accepted' AND created_at >= ?",
+                (since_iso,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM audit_events e "
+                "JOIN tasks t ON e.task_id = t.task_id "
+                "WHERE e.next_status = 'accepted' AND e.created_at >= ? "
+                "AND t.pipeline_id = ?",
+                (since_iso, pipeline_id),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def fetch_pipeline_health_metrics(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict:
+        """Return aggregate quality metrics for the dashboard stats bar.
+
+        Returns a dict with:
+          - ``accepted_count``      total accepted tasks
+          - ``terminal_count``      accepted + rejected tasks
+          - ``first_pass_count``    accepted tasks with no arbitration attempt
+          - ``arb_entered_count``   terminal tasks that had ≥1 arbitration attempt
+          - ``avg_llm_calls``       avg annotation+qc+arb succeeded attempts per
+                                    accepted task (excludes zero-duration synthetic)
+        """
+        pid_filter_task = "AND t.pipeline_id = ?" if pipeline_id else ""
+        pid_args: tuple = (pipeline_id,) if pipeline_id else ()
+
+        # accepted_count and terminal_count from tasks table
+        rows = self._conn.execute(
+            f"SELECT status, COUNT(*) AS c FROM tasks t "
+            f"WHERE t.status IN ('accepted','rejected') {pid_filter_task} "
+            f"GROUP BY t.status",
+            pid_args,
+        ).fetchall()
+        counts = {r["status"]: r["c"] for r in rows}
+        accepted_count = counts.get("accepted", 0)
+        terminal_count = accepted_count + counts.get("rejected", 0)
+
+        # accepted tasks that entered arbitration (at least one arb attempt)
+        row = self._conn.execute(
+            f"SELECT COUNT(DISTINCT t.task_id) AS c FROM tasks t "
+            f"JOIN attempts a ON a.task_id = t.task_id "
+            f"WHERE t.status = 'accepted' AND a.stage = 'arbitration' "
+            f"{pid_filter_task}",
+            pid_args,
+        ).fetchone()
+        accepted_with_arb = int(row["c"]) if row else 0
+        first_pass_count = accepted_count - accepted_with_arb
+
+        # terminal tasks (accepted or rejected) that entered arbitration
+        row = self._conn.execute(
+            f"SELECT COUNT(DISTINCT t.task_id) AS c FROM tasks t "
+            f"JOIN attempts a ON a.task_id = t.task_id "
+            f"WHERE t.status IN ('accepted','rejected') AND a.stage = 'arbitration' "
+            f"{pid_filter_task}",
+            pid_args,
+        ).fetchone()
+        arb_entered_count = int(row["c"]) if row else 0
+
+        # avg succeeded annotation+qc+arb calls per accepted task
+        row = self._conn.execute(
+            f"SELECT AVG(call_count) AS avg FROM ("
+            f"  SELECT COUNT(*) AS call_count FROM tasks t "
+            f"  JOIN attempts a ON a.task_id = t.task_id "
+            f"  WHERE t.status = 'accepted' "
+            f"  AND a.stage IN ('annotation','qc','arbitration') "
+            f"  AND a.status = 'succeeded' "
+            f"  AND a.started_at != a.finished_at "
+            f"  {pid_filter_task} "
+            f"  GROUP BY t.task_id"
+            f")",
+            pid_args,
+        ).fetchone()
+        avg_llm_calls = round(float(row["avg"]), 2) if row and row["avg"] is not None else 0.0
+
+        return {
+            "accepted_count": accepted_count,
+            "terminal_count": terminal_count,
+            "first_pass_count": first_pass_count,
+            "arb_entered_count": arb_entered_count,
+            "avg_llm_calls": avg_llm_calls,
+        }
 
     def list_attempts(self, task_id: str):
         rows = self._conn.execute(
