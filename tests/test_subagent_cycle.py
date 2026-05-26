@@ -2862,6 +2862,11 @@ def test_qc_instructions_enter_retry_mode_when_qc_feedback_exists():
     )
     # The triggering condition must reference source_stage=="qc"
     assert 'source_stage=="qc"' in instructions
+    # human_review is also a real production source_stage; retry must trigger on it too
+    assert 'source_stage=="human_review"' in instructions, (
+        "Retry mode must also trigger on human_review feedback — "
+        "a future refactor dropping the human_review branch would otherwise pass silently"
+    )
 
 
 def test_clear_feedback_for_attempt_nonexistent_returns_zero(tmp_path):
