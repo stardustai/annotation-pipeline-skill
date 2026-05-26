@@ -2869,3 +2869,28 @@ def test_clear_feedback_for_attempt_nonexistent_returns_zero(tmp_path):
     store = SqliteStore.open(tmp_path)
     result = store.clear_feedback_for_attempt("t-none", "t-none-attempt-99")
     assert result == 0
+
+
+def test_annotation_instructions_include_baseline_preservation_rule():
+    """Regression for task-000238: annotator must copy unchanged rows from
+    prior_artifacts when feedback_bundle only references specific rows.
+    Without this, Qwen drops rows it wasn't asked about."""
+    from annotation_pipeline_skill.runtime.subagent_cycle import _annotation_instructions
+    from annotation_pipeline_skill.core.models import Task
+
+    task = Task.new(
+        task_id="t-bp-1",
+        pipeline_id="pipe",
+        source_ref={"kind": "jsonl", "payload": {"text": "hello"}},
+        modality="text",
+        annotation_requirements={"annotation_types": ["entity_span"]},
+    )
+    instructions = _annotation_instructions(task)
+    assert "BASELINE PRESERVATION" in instructions, (
+        "Annotation instructions must include a BASELINE PRESERVATION rule so "
+        "the model knows to copy unchanged rows from prior_artifacts"
+    )
+    assert "prior_artifacts" in instructions, (
+        "BASELINE PRESERVATION rule must explicitly reference prior_artifacts "
+        "so the model knows where to look for the baseline"
+    )
