@@ -2894,3 +2894,13 @@ def test_annotation_instructions_include_baseline_preservation_rule():
         "BASELINE PRESERVATION rule must explicitly reference prior_artifacts "
         "so the model knows where to look for the baseline"
     )
+
+    # Structural ordering: BASELINE PRESERVATION must sit between
+    # MANDATORY ROW COVERAGE and HANDLING QC FEEDBACK
+    bp_pos = instructions.index("BASELINE PRESERVATION")
+    qc_pos = instructions.index("HANDLING QC FEEDBACK")
+    cov_pos = instructions.index("genuinely contains no instance")
+    assert cov_pos < bp_pos < qc_pos, (
+        "BASELINE PRESERVATION must appear between MANDATORY ROW COVERAGE and "
+        "HANDLING QC FEEDBACK paragraphs"
+    )

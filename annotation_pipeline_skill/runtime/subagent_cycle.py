@@ -3716,7 +3716,7 @@ def _annotation_instructions(
         "(check feedback_bundle.items[*].target.row_index), copy that row's output exactly as-is "
         "into your response. Only re-evaluate rows whose row_index appears in at least one "
         "feedback item's target. This prevents silently dropping correct annotations on rows "
-        "QC has already implicitly accepted."
+        "not targeted by the current feedback round."
         "\n\n"
         "HANDLING QC FEEDBACK: for each item in feedback_bundle, choose either to fix or to rebut:\n"
         "(a) if you accept the complaint — silently fix the annotation; no discussion_reply needed.\n"
