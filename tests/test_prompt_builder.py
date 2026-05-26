@@ -96,6 +96,94 @@ def test_annotation_prompt_filters_unstable_task_metadata(tmp_path):
     store.close()
 
 
+def _make_artifact(store_root, task_id, kind, filename, content_dict):
+    """Write artifact file and register it in the store."""
+    import datetime
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+    from annotation_pipeline_skill.core.models import ArtifactRef
+
+    artifact_dir = store_root / "artifact_payloads" / task_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    fpath = artifact_dir / filename
+    fpath.write_text(json.dumps(content_dict))
+    rel_path = f"artifact_payloads/{task_id}/{filename}"
+
+    store = SqliteStore.open(store_root)
+    artifact = ArtifactRef(
+        artifact_id=f"art-{filename}",
+        task_id=task_id,
+        kind=kind,
+        path=rel_path,
+        content_type="application/json",
+        created_at=datetime.datetime.now(datetime.timezone.utc),
+        metadata={},
+    )
+    store.append_artifact(artifact)
+    store.close()
+    return artifact
+
+
+def test_artifact_context_slims_annotation_result(tmp_path):
+    """annotation_result artifacts use slim_annotation_payload in _artifact_context,
+    returning parsed rows instead of the raw {"text": "big json string"} wrapper."""
+    from annotation_pipeline_skill.runtime.prompt_builder import AnnotationPromptBuilder
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+    store_root = tmp_path / ".annotation-pipeline"
+    annotation_rows = {"rows": [{"row_id": "r1", "entities": [{"span": "hello", "label": "x"}]}]}
+    _make_artifact(store_root, "pb-001", "annotation_result", "ann.json", {
+        "text": json.dumps(annotation_rows),
+        "raw_response": "LARGE RAW DATA",
+        "usage": {"input_tokens": 100},
+        "diagnostics": {"foo": "bar"},
+        "task_id": "pb-001",
+    })
+
+    store = SqliteStore.open(store_root)
+    builder = AnnotationPromptBuilder(store=store, project_id="pipe", config={})
+    contexts = builder._artifact_context("pb-001")
+    store.close()
+
+    assert len(contexts) == 1
+    payload = contexts[0]["payload"]
+    assert isinstance(payload, dict)
+    assert "rows" in payload          # parsed annotation content present
+    assert "text" not in payload      # outer text wrapper gone
+    assert "raw_response" not in payload  # metadata stripped
+
+
+def test_artifact_context_drops_failures_from_qc_result(tmp_path):
+    """qc_result artifacts have decision.failures dropped in _artifact_context
+    since failures duplicate information already in the feedback_bundle."""
+    from annotation_pipeline_skill.runtime.prompt_builder import AnnotationPromptBuilder
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+    store_root = tmp_path / ".annotation-pipeline"
+    _make_artifact(store_root, "pb-002", "qc_result", "qc.json", {
+        "decision": {
+            "passed": False,
+            "failures": [{"message": f"fail {i}", "severity": "blocking"} for i in range(60)],
+            "message": "",
+            "raw_response": "RAW",
+        },
+        "raw_response": "OUTER RAW",
+        "usage": {},
+        "task_id": "pb-002",
+    })
+
+    store = SqliteStore.open(store_root)
+    builder = AnnotationPromptBuilder(store=store, project_id="pipe", config={})
+    contexts = builder._artifact_context("pb-002")
+    store.close()
+
+    assert len(contexts) == 1
+    payload = contexts[0]["payload"]
+    decision = payload.get("decision", {})
+    assert "failures" not in decision      # stripped (duplicates feedback_bundle)
+    assert "raw_response" not in decision  # stripped
+    assert decision.get("passed") is False  # other fields preserved
+
+
 def test_qc_prompt_returns_non_empty_string(tmp_path):
     import datetime
     from annotation_pipeline_skill.runtime.prompt_builder import AnnotationPromptBuilder

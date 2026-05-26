@@ -32,6 +32,7 @@ class ProviderCallError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+
 def _die_with_parent() -> None:
     """preexec_fn that asks the kernel to SIGKILL this child when its parent
     dies (Linux PR_SET_PDEATHSIG). Without this, a SIGKILLed runtime leaves

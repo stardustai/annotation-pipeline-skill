@@ -839,6 +839,34 @@ class SqliteStore:
             for r in rows
         ]
 
+    def clear_feedback_for_attempt(self, task_id: str, attempt_id: str) -> int:
+        """Delete all feedback records and their discussion entries for a
+        specific attempt. Returns the number of feedback records deleted.
+
+        Used by the high-hallucination reset path: when an annotation attempt
+        produces so many non-verbatim spans that recording per-span feedback
+        would blow the context window, we wipe the feedback for that attempt
+        and reset the task to PENDING for a clean re-annotation.
+        """
+        # Collect the feedback_ids so we can cascade to discussions.
+        rows = self._conn.execute(
+            "SELECT feedback_id FROM feedback_records WHERE task_id = ? AND attempt_id = ?",
+            (task_id, attempt_id),
+        ).fetchall()
+        feedback_ids = [r["feedback_id"] for r in rows]
+        if not feedback_ids:
+            return 0
+        placeholders = ",".join("?" * len(feedback_ids))
+        self._conn.execute(
+            f"DELETE FROM feedback_discussions WHERE feedback_id IN ({placeholders})",
+            feedback_ids,
+        )
+        self._conn.execute(
+            "DELETE FROM feedback_records WHERE task_id = ? AND attempt_id = ?",
+            (task_id, attempt_id),
+        )
+        return len(feedback_ids)
+
     def append_artifact(self, artifact) -> None:
         d = artifact.to_dict()
         self._conn.execute(

@@ -11,7 +11,7 @@ import pytest
 from annotation_pipeline_skill.llm.base_sdk_client import (
     _ApiCallResult,
     BaseSdkClient,
-    LocalCLIExecutionError,
+    ProviderCallError,
 )
 from annotation_pipeline_skill.llm.client import LLMGenerateRequest
 from annotation_pipeline_skill.llm.profiles import LLMProfile
@@ -80,21 +80,22 @@ class _StubClient(BaseSdkClient):
         messages: list[dict],
         tools: list[dict],
         task_id: str | None = None,
+        response_format: dict | None = None,
     ) -> _ApiCallResult:
         self._calls.append({"system": system, "messages": list(messages), "tools": tools, "task_id": task_id})
         return next(self._responses)
 
 
-# --- LocalCLIExecutionError -------------------------------------------------
+# --- ProviderCallError ------------------------------------------------------
 
-def test_local_cli_execution_error_carries_diagnostics():
-    err = LocalCLIExecutionError("boom", {"code": 42})
+def test_provider_call_error_carries_diagnostics():
+    err = ProviderCallError("boom", {"code": 42})
     assert str(err) == "boom"
     assert err.diagnostics == {"code": 42}
 
 
-def test_local_cli_execution_error_empty_diagnostics():
-    err = LocalCLIExecutionError("oops")
+def test_provider_call_error_empty_diagnostics():
+    err = ProviderCallError("oops")
     assert err.diagnostics == {}
 
 
@@ -197,7 +198,7 @@ def test_max_tokens_returns_partial_with_truncated_flag(tmp_path: Path, monkeypa
 def test_refusal_raises(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     c = _StubClient(_profile(), [_result(stop_reason="refusal", text="")])
-    with pytest.raises(LocalCLIExecutionError) as exc:
+    with pytest.raises(ProviderCallError) as exc:
         asyncio.run(c.generate(LLMGenerateRequest(
             instructions="s", prompt="p", task_id="t-1",
         )))
@@ -207,7 +208,7 @@ def test_refusal_raises(tmp_path: Path, monkeypatch):
 def test_unknown_stop_reason_raises(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     c = _StubClient(_profile(), [_result(stop_reason="future_reason")])
-    with pytest.raises(LocalCLIExecutionError) as exc:
+    with pytest.raises(ProviderCallError) as exc:
         asyncio.run(c.generate(LLMGenerateRequest(
             instructions="s", prompt="p", task_id="t-1",
         )))
@@ -265,7 +266,7 @@ def test_tool_failure_breaker(tmp_path: Path, monkeypatch):
         dispatch=_boom,
     )
 
-    with pytest.raises(LocalCLIExecutionError) as exc:
+    with pytest.raises(ProviderCallError) as exc:
         asyncio.run(c.generate(LLMGenerateRequest(
             instructions="s", prompt="p", task_id="t-1",
         )))
@@ -290,12 +291,12 @@ def test_timeout_raises(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     class _SlowClient(_StubClient):
-        async def _call_api(self, system, messages, tools, task_id=None):
+        async def _call_api(self, system, messages, tools, task_id=None, response_format=None):
             await asyncio.sleep(10)
             return _result()
 
     c = _SlowClient(_profile(timeout_seconds=1), [])
-    with pytest.raises(LocalCLIExecutionError) as exc:
+    with pytest.raises(ProviderCallError) as exc:
         asyncio.run(c.generate(LLMGenerateRequest(
             instructions="s", prompt="p", task_id="t-1",
         )))

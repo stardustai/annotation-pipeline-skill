@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
+
+logger = logging.getLogger("annotation_pipeline_skill.runtime.subagent_cycle")
 
 from robust_json import loads as _robust_json_loads
 
@@ -389,7 +392,54 @@ class SubagentRuntime:
         )
         annotation_finished_at = utc_now()
         task.current_attempt += 1
-        cleaned_annotation_text = _serialize_llm_json(annotation_result.final_text, task=task)
+        cleaned_annotation_text, _stripped_spans, _total_spans = _serialize_llm_json(
+            annotation_result.final_text, task=task
+        )
+        # High-hallucination reset: if a large fraction of the annotated spans
+        # were hallucinated (non-verbatim), wipe the feedback for this attempt
+        # and reset to PENDING for a clean re-annotation rather than letting
+        # 100s of non_verbatim_span feedback records flood the context window.
+        if self._should_reset_for_high_hallucination(_stripped_spans, _total_spans, task):
+            reset_count = int(task.metadata.get("high_hallucination_reset_count", 0)) + 1
+            task.metadata["high_hallucination_reset_count"] = reset_count
+            if reset_count >= self.HALLUCINATION_RESET_CAP:
+                self._transition(
+                    task,
+                    TaskStatus.HUMAN_REVIEW,
+                    reason=(
+                        f"escalated: annotation hallucination reset cap reached "
+                        f"({reset_count} resets, last attempt stripped "
+                        f"{_stripped_spans}/{_total_spans} spans)"
+                    ),
+                    stage="annotation",
+                    attempt_id=annotation_attempt_id,
+                    metadata={
+                        "high_hallucination_reset_count": reset_count,
+                        "stripped_spans": _stripped_spans,
+                        "total_spans": _total_spans,
+                    },
+                )
+                return
+            deleted = self.store.clear_feedback_for_attempt(
+                task.task_id, annotation_attempt_id
+            )
+            logger.info(
+                "high_hallucination_reset task=%s attempt=%s stripped=%d/%d "
+                "deleted_feedback=%d reset_count=%d",
+                task.task_id, annotation_attempt_id,
+                _stripped_spans, _total_spans, deleted, reset_count,
+            )
+            self._transition(
+                task,
+                TaskStatus.PENDING,
+                reason=(
+                    f"high hallucination reset: {_stripped_spans}/{_total_spans} spans "
+                    f"stripped (reset #{reset_count})"
+                ),
+                stage="annotation",
+                attempt_id=annotation_attempt_id,
+            )
+            return
         annotation_artifact = self._write_stage_artifact(
             task,
             annotation_result,
@@ -486,6 +536,33 @@ class SubagentRuntime:
     # the arbiter is consistently hallucinating on this task, HR is still
     # the right destination, just not after 3 pickups.
     ARBITER_VERBATIM_BAIL_CAP = 6
+
+    # Hallucination-reset thresholds. When _serialize_llm_json strips a
+    # large fraction of spans, the annotation is so noisy that per-span
+    # feedback would blow the context window. Reset to PENDING for a clean
+    # re-annotation instead of recording that feedback.
+    # A reset is triggered when BOTH of the following hold:
+    #   stripped >= HALLUCINATION_COUNT_RESET_THRESHOLD  (absolute floor)
+    #   stripped/total >= HALLUCINATION_RATIO_RESET_THRESHOLD  (fraction)
+    # Requiring both guards against resetting on tasks with legitimately
+    # large annotation counts, and against resetting when only a handful of
+    # spans were stripped from a sparse annotation.
+    HALLUCINATION_COUNT_RESET_THRESHOLD = 50
+    HALLUCINATION_RATIO_RESET_THRESHOLD = 0.7
+    # After this many resets on the same task, give up and escalate to HR.
+    HALLUCINATION_RESET_CAP = 3
+
+    def _should_reset_for_high_hallucination(
+        self, stripped: int, total: int, task: "Task"
+    ) -> bool:
+        """Return True if this attempt's hallucination rate is high enough to
+        warrant clearing feedback and resetting to PENDING."""
+        if stripped < self.HALLUCINATION_COUNT_RESET_THRESHOLD:
+            return False
+        if total <= 0:
+            return False
+        ratio = stripped / total
+        return ratio >= self.HALLUCINATION_RATIO_RESET_THRESHOLD
 
     def _handle_arbiter_mechanical_fail(
         self,
@@ -3984,31 +4061,51 @@ def _auto_fill_missing_rows(task: Task, parsed: Any) -> int:
     return added
 
 
-def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
-    """Parse LLM output, run safe auto-fix, and re-serialize as canonical
-    JSON. Returns the original text if no JSON can be recovered (caller
+def _count_annotation_spans(payload: dict) -> int:
+    """Count total entity and json_structures span entries in an annotation payload."""
+    total = 0
+    for row in payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        for field_key in ("entities", "json_structures"):
+            field = output.get(field_key)
+            if not isinstance(field, dict):
+                continue
+            for spans in field.values():
+                if isinstance(spans, list):
+                    total += len(spans)
+    return total
+
+
+def _serialize_llm_json(
+    text: str, *, task: Task | None = None
+) -> tuple[str, int, int]:
+    """Parse LLM output, run safe auto-fix, strip hallucinated spans, and
+    re-serialize as canonical JSON.
+
+    Returns ``(serialized_text, stripped_count, total_spans_before_strip)``.
+    On parse failure returns the original text with zero counts (caller
     surfaces the error downstream).
 
-    Auto-fix steps (boundary-only, NEVER touches letters):
-      - Strip surrounding whitespace / sentence punctuation / quote chars
-        from spans whose only defect is the boundary (``try_align_to_verbatim``).
-      - For already-verbatim spans where the punct-trimmed form is ALSO
-        verbatim, prefer the trimmed form — matches ``find_trailing_punctuation_spans``
-        ("entity is the name, not the sentence boundary").
-      - Auto-fill missing rows with empty `{entities:{}, json_structures:{}}`
-        stubs (qwen 40% drop rate, see ``_auto_fill_missing_rows``).
-      - Dedupe within-type duplicates.
-
-    Cross-type collisions, hallucinated (genuinely-non-verbatim) spans,
-    schema breakage, and empty annotations are NOT silently rewritten —
-    they fail the verification gate and surface as feedback. Auto-fix only
-    handles cases where the annotator's intent is clear but the boundary
-    was off by trim-safe characters or rows were silently dropped.
+    Auto-fix steps applied in order:
+      1. Boundary-safe trim (``auto_fix_safe_spans_in_place``): whitespace /
+         sentence punctuation / quote chars where the annotator's intent is
+         clear.
+      2. Auto-fill missing rows with empty stubs (qwen 40% drop rate).
+      3. **Strip genuinely-non-verbatim spans** (``_strip_non_verbatim_spans_in_place``):
+         hallucinated spans that are not a verbatim substring of any input row
+         are removed outright.  This prevents a single runaway annotation from
+         generating thousands of feedback records that blow the context window
+         on every subsequent round.
+      4. Dedupe within-type duplicates.
     """
     try:
         parsed = _parse_llm_json(text)
     except (ValueError, TypeError):
-        return text
+        return text, 0, 0
     if task is not None:
         try:
             from annotation_pipeline_skill.core.schema_validation import (
@@ -4021,11 +4118,24 @@ def _serialize_llm_json(text: str, *, task: Task | None = None) -> str:
             _auto_fill_missing_rows(task, parsed)
         except Exception:  # noqa: BLE001 — never block artifact write on auto-fix
             pass
+    stripped = 0
+    total_before = 0
+    if task is not None:
+        try:
+            from annotation_pipeline_skill.core.schema_validation import (
+                find_verbatim_violations,
+            )
+            total_before = _count_annotation_spans(parsed)
+            viols = find_verbatim_violations(task, parsed)
+            if viols:
+                stripped = _strip_non_verbatim_spans_in_place(parsed, viols)
+        except Exception:  # noqa: BLE001 — never block artifact write on strip
+            pass
     _dedupe_within_type_spans(parsed)
     try:
-        return json.dumps(parsed, ensure_ascii=False)
+        return json.dumps(parsed, ensure_ascii=False), stripped, total_before
     except (ValueError, TypeError):
-        return text
+        return text, 0, 0
 
 
 def _coerce_to_enum_in_place(

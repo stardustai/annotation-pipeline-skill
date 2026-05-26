@@ -22,7 +22,7 @@ import pytest
 
 from annotation_pipeline_skill.llm.anthropic_sdk import (
     AnthropicSDKClient,
-    LocalCLIExecutionError,
+    ProviderCallError,
     _openai_to_anthropic_messages,
     _anthropic_content_to_openai_assistant,
 )
@@ -282,7 +282,7 @@ def test_stop_reason_max_tokens_flags_truncated_but_returns(tmp_path, monkeypatc
 def test_stop_reason_refusal_raises(tmp_path, monkeypatch):
     _patch_create(monkeypatch, [_fake_response(stop_reason="refusal", text="")])
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(LocalCLIExecutionError) as excinfo:
+    with pytest.raises(ProviderCallError) as excinfo:
         asyncio.run(AnthropicSDKClient(_profile()).generate(
             LLMGenerateRequest(instructions="i", prompt="p", task_id="t-1")
         ))
@@ -292,7 +292,7 @@ def test_stop_reason_refusal_raises(tmp_path, monkeypatch):
 def test_stop_reason_unknown_raises(tmp_path, monkeypatch):
     _patch_create(monkeypatch, [_fake_response(stop_reason="some_future_reason", text="")])
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(LocalCLIExecutionError) as excinfo:
+    with pytest.raises(ProviderCallError) as excinfo:
         asyncio.run(AnthropicSDKClient(_profile()).generate(
             LLMGenerateRequest(instructions="i", prompt="p", task_id="t-1")
         ))
@@ -375,7 +375,7 @@ def test_tool_failure_breaker_after_three_repeats(tmp_path, monkeypatch):
     )
     client._tool_schemas = [client._tools["broken_tool"].schema]
 
-    with pytest.raises(LocalCLIExecutionError) as excinfo:
+    with pytest.raises(ProviderCallError) as excinfo:
         asyncio.run(client.generate(LLMGenerateRequest(
             instructions="i", prompt="p", task_id="t-1",
         )))
@@ -436,10 +436,10 @@ def test_session_persistence_roundtrip(tmp_path, monkeypatch):
 # ---- timeout --------------------------------------------------------------
 
 
-def test_timeout_raises_local_cli_execution_error(tmp_path, monkeypatch):
+def test_timeout_raises_provider_call_error(tmp_path, monkeypatch):
     """asyncio.wait_for around the whole generate() — a slow
     messages.create must be cancelled and surface as
-    LocalCLIExecutionError so the worker-bail layer treats it
+    ProviderCallError so the worker-bail layer treats it
     uniformly with other timeouts."""
     import annotation_pipeline_skill.llm.anthropic_sdk as sdk_mod
 
@@ -453,7 +453,7 @@ def test_timeout_raises_local_cli_execution_error(tmp_path, monkeypatch):
     ))
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(LocalCLIExecutionError) as excinfo:
+    with pytest.raises(ProviderCallError) as excinfo:
         asyncio.run(AnthropicSDKClient(
             _profile(timeout_seconds=1)
         ).generate(LLMGenerateRequest(instructions="i", prompt="p", task_id="t-1")))
@@ -461,10 +461,10 @@ def test_timeout_raises_local_cli_execution_error(tmp_path, monkeypatch):
     assert excinfo.value.diagnostics["timeout_seconds"] == 1
 
 
-# ---- API error surfaces as LocalCLIExecutionError ------------------------
+# ---- API error surfaces as ProviderCallError --------------------------------
 
 
-def test_api_error_surfaces_as_local_cli_execution_error(tmp_path, monkeypatch):
+def test_api_error_surfaces_as_provider_call_error(tmp_path, monkeypatch):
     import annotation_pipeline_skill.llm.anthropic_sdk as sdk_mod
     import anthropic
 
@@ -480,7 +480,7 @@ def test_api_error_surfaces_as_local_cli_execution_error(tmp_path, monkeypatch):
     ))
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(LocalCLIExecutionError) as excinfo:
+    with pytest.raises(ProviderCallError) as excinfo:
         asyncio.run(AnthropicSDKClient(_profile()).generate(
             LLMGenerateRequest(instructions="i", prompt="p", task_id="t-1")
         ))

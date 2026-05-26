@@ -76,7 +76,9 @@ class AnnotationPromptBuilder:
                     # Mutating per turn — kept at the tail so the head stays
                     # bytes-identical across turns of the same task.
                     "prior_artifacts": self._artifact_context(task.task_id),
-                    "feedback_bundle": build_feedback_bundle(self._store, task.task_id),
+                    "feedback_bundle": build_feedback_bundle(
+                        self._store, task.task_id, max_items=50, latest_attempt_only=True
+                    ),
                 },
             )
         # Continuation turn: only send unseen feedback items.
@@ -97,7 +99,9 @@ class AnnotationPromptBuilder:
                     **annotation_artifact.to_dict(),
                     "payload": self.slim_annotation_payload(annotation_artifact),
                 },
-                "feedback_bundle": build_feedback_bundle(self._store, task.task_id),
+                "feedback_bundle": build_feedback_bundle(
+                    self._store, task.task_id, max_items=50, latest_attempt_only=True
+                ),
             },
         )
 
@@ -253,27 +257,37 @@ class AnnotationPromptBuilder:
         for artifact in selected:
             payload = self._read_artifact_payload(artifact)
             if isinstance(payload, dict):
-                payload = {
-                    k: v
-                    for k, v in payload.items()
-                    if k not in {"raw_response", "usage", "diagnostics", "task_id"}
-                }
-                if artifact.kind == "arbiter_result":
-                    payload = {k: v for k, v in payload.items() if k != "items"}
-                decision = payload.get("decision")
-                if isinstance(decision, dict):
-                    drop_decision_keys = {"raw_response"}
+                if artifact.kind == "annotation_result":
+                    # Replace full payload (which is {"text": "big json string",
+                    # raw_response, usage, …}) with the parsed annotation rows.
+                    # Avoids JSON-in-JSON escaping overhead and drops bulky metadata.
+                    payload = self.slim_annotation_payload(artifact)
+                else:
+                    payload = {
+                        k: v
+                        for k, v in payload.items()
+                        if k not in {"raw_response", "usage", "diagnostics", "task_id"}
+                    }
                     if artifact.kind == "arbiter_result":
-                        drop_decision_keys.add("corrected_annotation")
-                    if any(k in decision for k in drop_decision_keys):
-                        payload = {
-                            **payload,
-                            "decision": {
-                                k: v
-                                for k, v in decision.items()
-                                if k not in drop_decision_keys
-                            },
-                        }
+                        payload = {k: v for k, v in payload.items() if k != "items"}
+                    decision = payload.get("decision")
+                    if isinstance(decision, dict):
+                        drop_decision_keys = {"raw_response"}
+                        if artifact.kind == "arbiter_result":
+                            drop_decision_keys.add("corrected_annotation")
+                        if artifact.kind == "qc_result":
+                            # failures duplicates the feedback_bundle items
+                            # already sent in the prompt — drop to save tokens.
+                            drop_decision_keys.add("failures")
+                        if any(k in decision for k in drop_decision_keys):
+                            payload = {
+                                **payload,
+                                "decision": {
+                                    k: v
+                                    for k, v in decision.items()
+                                    if k not in drop_decision_keys
+                                },
+                            }
             wrapper = {
                 k: v
                 for k, v in artifact.to_dict().items()

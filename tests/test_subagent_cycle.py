@@ -1409,10 +1409,18 @@ def test_confidence_normalization_uses_per_role_history(tmp_path):
     assert runtime._normalize_confidence("annotator", 0.0) == 0.0
 
 
-def test_verbatim_check_flags_hallucinated_span(tmp_path):
-    """Validation now requires every entity / phrase string to be a substring
-    of the corresponding row's input text. A made-up span trips the check
-    even when the JSON shape is fine."""
+def test_verbatim_check_strips_hallucinated_span_at_write_time(tmp_path):
+    """Non-verbatim spans are now stripped in _serialize_llm_json at artifact
+    write time rather than surfaced as feedback. This prevents runaway
+    annotations from generating thousands of feedback records that blow the
+    context window on every subsequent round.
+
+    Verifies:
+    - The hallucinated span ('GPT-J') is absent from the written artifact.
+    - No non_verbatim_span feedback record is generated (span was already gone
+      by the time validation ran).
+    - The verbatim span ('deployed v1 today') survives in the artifact.
+    """
     from annotation_pipeline_skill.core.models import Task as _Task
 
     store = SqliteStore.open(tmp_path)
@@ -1468,7 +1476,8 @@ def test_verbatim_check_flags_hallucinated_span(tmp_path):
     task.status = TaskStatus.PENDING
     store.save_task(task)
 
-    # 'GPT-J' is not in the input — the verbatim check must catch it.
+    # 'GPT-J' is not in the input — it should be stripped at write time.
+    # 'deployed v1 today' IS in the input — it should survive.
     annotation_payload = {
         "rows": [
             {
@@ -1490,13 +1499,27 @@ def test_verbatim_check_flags_hallucinated_span(tmp_path):
 
     runtime.run_once(stage_target="annotation")
 
+    # The hallucinated span is stripped silently — no non_verbatim_span feedback.
     feedbacks = store.list_feedback("t-verbatim")
     categories = {f.category for f in feedbacks}
-    assert "non_verbatim_span" in categories, f"expected non_verbatim_span feedback, got {categories}"
-    # The matching json_structures.decision span IS in the input, so the
-    # failure must be the entities.technology entry.
-    span_feedbacks = [f for f in feedbacks if f.category == "non_verbatim_span"]
-    assert "GPT-J" in span_feedbacks[0].message
+    assert "non_verbatim_span" not in categories, (
+        f"non_verbatim_span feedback should not be generated after write-time strip; got {categories}"
+    )
+
+    # The written artifact must NOT contain 'GPT-J'.
+    artifacts = store.list_artifacts("t-verbatim")
+    ann_artifact = next((a for a in artifacts if a.kind == "annotation_result"), None)
+    assert ann_artifact is not None, "annotation_result artifact must exist"
+    artifact_text = (store.root / ann_artifact.path).read_text(encoding="utf-8")
+    artifact_payload = json.loads(artifact_text)
+    written_text = artifact_payload.get("text", artifact_text)
+    assert "GPT-J" not in written_text, (
+        "hallucinated span 'GPT-J' must be stripped from the artifact text"
+    )
+    # The verbatim span must still be present.
+    assert "deployed v1 today" in written_text, (
+        "verbatim span 'deployed v1 today' must survive in the artifact"
+    )
 
 
 def test_rearbitration_invokes_arbiter_without_annotator_rebuttal(tmp_path):
@@ -1855,38 +1878,38 @@ def test_apply_arbiter_correction_rejects_non_verbatim_spans(tmp_path):
 
 
 def test_permanent_classifier_catches_cli_auth_failure_in_stderr():
-    """LocalCLIExecutionError surfaces CLI exit failures with diagnostics
+    """ProviderCallError surfaces CLI exit failures with diagnostics
     (stderr, returncode). The bug we fixed: OAuth-broken claude exits with
     'unauthorized' / '401' in stderr but the classifier only looked at
     exception name + status_code, classifying it as transient and looping
     forever instead of escalating to HR."""
-    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.llm.local_cli import ProviderCallError
     from annotation_pipeline_skill.runtime.subagent_cycle import (
         _is_provider_permanent_error,
     )
 
-    auth_err = LocalCLIExecutionError(
+    auth_err = ProviderCallError(
         "local CLI provider failed",
         {"stderr": "API Error: 401 Unauthorized — invalid api key",
          "returncode": 1},
     )
     assert _is_provider_permanent_error(auth_err) is True
 
-    fwd_err = LocalCLIExecutionError(
+    fwd_err = ProviderCallError(
         "local CLI provider failed",
         {"stderr": "Authentication failed", "returncode": 1},
     )
     assert _is_provider_permanent_error(fwd_err) is True
 
     # 5xx in stderr should still be transient (not permanent).
-    transient = LocalCLIExecutionError(
+    transient = ProviderCallError(
         "local CLI provider failed",
         {"stderr": "API Error: 503 Service Unavailable", "returncode": 1},
     )
     assert _is_provider_permanent_error(transient) is False
 
     # Generic error with no recognizable auth signal stays transient.
-    unknown = LocalCLIExecutionError(
+    unknown = ProviderCallError(
         "local CLI provider failed",
         {"stderr": "connection reset by peer", "returncode": 1},
     )
@@ -1902,11 +1925,11 @@ def test_generate_async_reraises_original_429_when_fallback_not_configured(tmp_p
     instead of surfacing the real cause.
     """
     import asyncio
-    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.llm.local_cli import ProviderCallError
     from annotation_pipeline_skill.llm.profiles import ProfileValidationError
     from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
 
-    rate_limit_exc = LocalCLIExecutionError(
+    rate_limit_exc = ProviderCallError(
         "local CLI provider failed",
         {"error_event": {"api_error_status": 429, "result_text": "usage limit exceeded"}},
     )
@@ -1923,7 +1946,7 @@ def test_generate_async_reraises_original_429_when_fallback_not_configured(tmp_p
     from annotation_pipeline_skill.llm.client import LLMGenerateRequest
     req = LLMGenerateRequest(instructions="test", prompt="ping")
 
-    with pytest.raises(LocalCLIExecutionError) as exc_info:
+    with pytest.raises(ProviderCallError) as exc_info:
         asyncio.run(runtime._generate_async("annotation", req))
 
     assert exc_info.value is rate_limit_exc
@@ -2324,7 +2347,7 @@ def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
     """Arbiter 5xx transient errors must NOT count toward ARBITER_MECHANICAL_RETRY_CAP.
     A task that keeps seeing 500s should stay in ARBITRATING indefinitely, not go to HR.
     Each failure must stamp next_retry_at with exponential backoff (30s × n, cap 300s)."""
-    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.llm.local_cli import ProviderCallError
     from annotation_pipeline_skill.core.models import ArtifactRef, Task, FeedbackRecord, FeedbackDiscussionEntry
     from annotation_pipeline_skill.core.states import FeedbackSource, FeedbackSeverity, TaskStatus
     from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
@@ -2332,7 +2355,7 @@ def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
 
     class Transient500Client:
         async def generate(self, request):
-            raise LocalCLIExecutionError(
+            raise ProviderCallError(
                 "local CLI provider failed",
                 {
                     "runtime": "anthropic_sdk",
@@ -2392,3 +2415,396 @@ def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
     assert after.next_retry_at is not None, "next_retry_at should be set after transient bail"
     bail_n = after.metadata.get("arbiter_transient_bail_count", 0)
     assert bail_n == n_runs, f"expected {n_runs} transient bails, got {bail_n}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: _count_annotation_spans helper
+# ---------------------------------------------------------------------------
+
+def test_count_annotation_spans_empty():
+    from annotation_pipeline_skill.runtime.subagent_cycle import _count_annotation_spans
+    assert _count_annotation_spans({}) == 0
+    assert _count_annotation_spans({"rows": []}) == 0
+
+
+def test_count_annotation_spans_mixed():
+    from annotation_pipeline_skill.runtime.subagent_cycle import _count_annotation_spans
+    payload = {
+        "rows": [
+            {
+                "row_index": 0,
+                "output": {
+                    "entities": {"org": ["Acme", "Corp"], "tech": ["Python"]},
+                    "json_structures": {"decision": ["go live"]},
+                },
+            },
+            {
+                "row_index": 1,
+                "output": {
+                    "entities": {"org": []},
+                    "json_structures": {},
+                },
+            },
+        ]
+    }
+    # 2 org + 1 tech + 1 decision + 0 (second row) = 4
+    assert _count_annotation_spans(payload) == 4
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: high-hallucination reset (clears feedback + resets to PENDING)
+# ---------------------------------------------------------------------------
+
+def _make_schema_task(store, task_id: str, input_text: str) -> Task:
+    """Helper: create and persist a PENDING task with a minimal NER schema."""
+    from annotation_pipeline_skill.core.models import Task as _Task
+    schema = {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "row_index": {"type": "integer"},
+                        "output": {
+                            "type": "object",
+                            "properties": {
+                                "entities": {
+                                    "type": "object",
+                                    "additionalProperties": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "json_structures": {
+                                    "type": "object",
+                                    "additionalProperties": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "required": ["row_index", "output"],
+                },
+            },
+        },
+        "required": ["rows"],
+    }
+    task = _Task.new(
+        task_id=task_id,
+        pipeline_id="p",
+        source_ref={
+            "kind": "jsonl",
+            "payload": {
+                "annotation_guidance": {"output_schema": schema},
+                "rows": [{"row_index": 0, "input": input_text}],
+            },
+        },
+    )
+    task.status = TaskStatus.PENDING
+    store.save_task(task)
+    return task
+
+
+def _make_hallucinated_annotation(count: int, *, verbatim_span: str | None = None) -> str:
+    """Build an annotation with `count` hallucinated spans + 1 optional verbatim span."""
+    entities = {f"fake_type_{i}": [f"hallucinated_span_{i}"] for i in range(count)}
+    js: dict = {}
+    if verbatim_span:
+        js["decision"] = [verbatim_span]
+    return json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": entities, "json_structures": js}}]
+    })
+
+
+def test_high_hallucination_resets_to_pending(tmp_path):
+    """When stripped ratio >= threshold AND count >= threshold, task resets to PENDING.
+
+    The reset wipes feedback for that attempt so the next annotation attempt
+    starts with a clean context window.
+    """
+    store = SqliteStore.open(tmp_path)
+    input_text = "Short input."
+    _make_schema_task(store, "t-reset", input_text)
+
+    # 60 hallucinated spans + 1 verbatim: ratio = 60/61 > 0.7, count = 60 >= 50
+    annotation_text = _make_hallucinated_annotation(60, verbatim_span="Short")
+    annotation_client = StubLLMClient(final_text=annotation_text, provider="annotator")
+    qc_client = StubLLMClient(final_text='{"passed": true}', provider="qc")
+    runtime = SubagentRuntime(
+        store=store,
+        client_factory=lambda target: qc_client if target == "qc" else annotation_client,
+        max_qc_rounds=3,
+    )
+
+    runtime.run_once(stage_target="annotation")
+
+    task = store.load_task("t-reset")
+    assert task.status is TaskStatus.PENDING, (
+        f"task should be reset to PENDING after high-hallucination, got {task.status}"
+    )
+    assert task.metadata.get("high_hallucination_reset_count") == 1
+
+    # Feedback for this attempt must have been wiped.
+    feedbacks = store.list_feedback("t-reset")
+    assert len(feedbacks) == 0, (
+        f"feedback should be cleared after hallucination reset; got {len(feedbacks)} records"
+    )
+
+
+def test_high_hallucination_below_threshold_does_not_reset(tmp_path):
+    """When count < threshold, no reset — normal flow proceeds."""
+    store = SqliteStore.open(tmp_path)
+    input_text = "Acme deployed v1 today."
+    _make_schema_task(store, "t-no-reset", input_text)
+
+    # Only 3 hallucinated spans — below HALLUCINATION_COUNT_RESET_THRESHOLD=50
+    annotation_text = _make_hallucinated_annotation(3, verbatim_span="deployed v1 today")
+    annotation_client = StubLLMClient(final_text=annotation_text, provider="annotator")
+    qc_client = StubLLMClient(final_text='{"passed": true}', provider="qc")
+    runtime = SubagentRuntime(
+        store=store,
+        client_factory=lambda target: qc_client if target == "qc" else annotation_client,
+        max_qc_rounds=3,
+    )
+
+    runtime.run_once(stage_target="annotation")
+
+    task = store.load_task("t-no-reset")
+    # Task should NOT be PENDING — it should have progressed (ANNOTATING or further)
+    assert task.status is not TaskStatus.PENDING, (
+        f"task with only 3 hallucinated spans should NOT be reset, got {task.status}"
+    )
+    assert "high_hallucination_reset_count" not in task.metadata
+
+
+def test_high_hallucination_reset_cap_escalates_to_hr(tmp_path):
+    """After HALLUCINATION_RESET_CAP resets, escalate to HUMAN_REVIEW."""
+    store = SqliteStore.open(tmp_path)
+    input_text = "Short input."
+    task = _make_schema_task(store, "t-cap", input_text)
+
+    # Pre-seed the reset counter at cap - 1 (2 previous resets already)
+    task.metadata["high_hallucination_reset_count"] = SubagentRuntime.HALLUCINATION_RESET_CAP - 1
+    store.save_task(task)
+
+    annotation_text = _make_hallucinated_annotation(60, verbatim_span="Short")
+    annotation_client = StubLLMClient(final_text=annotation_text, provider="annotator")
+    qc_client = StubLLMClient(final_text='{"passed": true}', provider="qc")
+    runtime = SubagentRuntime(
+        store=store,
+        client_factory=lambda target: qc_client if target == "qc" else annotation_client,
+        max_qc_rounds=3,
+    )
+
+    runtime.run_once(stage_target="annotation")
+
+    task = store.load_task("t-cap")
+    assert task.status is TaskStatus.HUMAN_REVIEW, (
+        f"task should escalate to HUMAN_REVIEW after {SubagentRuntime.HALLUCINATION_RESET_CAP} resets, "
+        f"got {task.status}"
+    )
+    assert task.metadata["high_hallucination_reset_count"] == SubagentRuntime.HALLUCINATION_RESET_CAP
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: latest_attempt_only in build_feedback_bundle
+# ---------------------------------------------------------------------------
+
+def test_latest_attempt_only_filters_to_last_attempt():
+    """latest_attempt_only=True keeps only records whose attempt_id matches
+    the most recently created record."""
+    from annotation_pipeline_skill.core.models import FeedbackRecord
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource
+    from annotation_pipeline_skill.services.feedback_service import build_feedback_bundle
+    import datetime
+
+    store = SqliteStore.open("/tmp")  # not used for I/O in this test
+    # Patch list_feedback to return two attempts worth of records
+    attempt_1_records = [
+        FeedbackRecord.new(
+            task_id="t-1",
+            attempt_id="t-1-attempt-1",
+            source_stage=FeedbackSource.VALIDATION,
+            severity=FeedbackSeverity.ERROR,
+            category="non_verbatim_span",
+            message="old attempt feedback",
+            target={},
+            suggested_action=None,
+            created_by="test",
+        )
+        for _ in range(5)
+    ]
+    attempt_2_records = [
+        FeedbackRecord.new(
+            task_id="t-1",
+            attempt_id="t-1-attempt-2",
+            source_stage=FeedbackSource.QC,
+            severity=FeedbackSeverity.WARNING,
+            category="schema_invalid",
+            message="new attempt feedback",
+            target={},
+            suggested_action=None,
+            created_by="test",
+        )
+        for _ in range(2)
+    ]
+    # Simulate created_at ordering: attempt_1 is older
+    base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    for i, r in enumerate(attempt_1_records):
+        r.created_at = base + datetime.timedelta(seconds=i)
+    for i, r in enumerate(attempt_2_records):
+        r.created_at = base + datetime.timedelta(seconds=100 + i)
+
+    all_records = attempt_1_records + attempt_2_records
+
+    class _MockStore:
+        def list_feedback(self, task_id):
+            return all_records
+        def list_feedback_discussions(self, task_id):
+            return []
+
+    bundle = build_feedback_bundle(_MockStore(), "t-1", latest_attempt_only=True)
+    items = bundle["items"]
+    assert len(items) == 2, f"expected 2 items (attempt-2 only), got {len(items)}"
+    assert all(item["attempt_id"] == "t-1-attempt-2" for item in items)
+
+
+def test_latest_attempt_only_false_returns_all():
+    """latest_attempt_only=False (default) returns all attempts."""
+    from annotation_pipeline_skill.core.models import FeedbackRecord
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource
+    from annotation_pipeline_skill.services.feedback_service import build_feedback_bundle
+    import datetime
+
+    records = []
+    base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    for i in range(3):
+        r = FeedbackRecord.new(
+            task_id="t-2",
+            attempt_id=f"t-2-attempt-{i}",
+            source_stage=FeedbackSource.QC,
+            severity=FeedbackSeverity.WARNING,
+            category="schema_invalid",
+            message=f"feedback {i}",
+            target={},
+            suggested_action=None,
+            created_by="test",
+        )
+        r.created_at = base + datetime.timedelta(seconds=i)
+        records.append(r)
+
+    class _MockStore:
+        def list_feedback(self, task_id):
+            return records
+        def list_feedback_discussions(self, task_id):
+            return []
+
+    bundle = build_feedback_bundle(_MockStore(), "t-2", latest_attempt_only=False)
+    assert len(bundle["items"]) == 3
+
+
+def test_latest_attempt_only_handles_attempt_10_correctly():
+    """attempt_id at attempt-10 must not be confused by lexicographic ordering.
+
+    With lexicographic sort, 'attempt-9' > 'attempt-10'. Using records[-1] after
+    sorting by created_at is immune to this.
+    """
+    from annotation_pipeline_skill.core.models import FeedbackRecord
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource
+    from annotation_pipeline_skill.services.feedback_service import build_feedback_bundle
+    import datetime
+
+    base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    records = []
+    for i in range(1, 11):  # attempt-1 through attempt-10
+        r = FeedbackRecord.new(
+            task_id="t-10",
+            attempt_id=f"t-10-attempt-{i}",
+            source_stage=FeedbackSource.QC,
+            severity=FeedbackSeverity.WARNING,
+            category="schema_invalid",
+            message=f"feedback attempt-{i}",
+            target={},
+            suggested_action=None,
+            created_by="test",
+        )
+        r.created_at = base + datetime.timedelta(seconds=i)
+        records.append(r)
+
+    class _MockStore:
+        def list_feedback(self, task_id):
+            return records
+        def list_feedback_discussions(self, task_id):
+            return []
+
+    bundle = build_feedback_bundle(_MockStore(), "t-10", latest_attempt_only=True)
+    items = bundle["items"]
+    assert len(items) == 1
+    # Must be attempt-10 (most recent by created_at), NOT attempt-9
+    assert items[0]["attempt_id"] == "t-10-attempt-10"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 + Fix 4 integration: SqliteStore.clear_feedback_for_attempt
+# ---------------------------------------------------------------------------
+
+def test_clear_feedback_for_attempt(tmp_path):
+    """clear_feedback_for_attempt deletes only records for the given attempt,
+    including their discussion entries, and returns the deleted count."""
+    from annotation_pipeline_skill.core.models import FeedbackRecord, FeedbackDiscussionEntry
+    from annotation_pipeline_skill.core.states import FeedbackSeverity, FeedbackSource
+
+    store = SqliteStore.open(tmp_path)
+
+    task_id = "t-clear"
+    attempt_a = "t-clear-attempt-1"
+    attempt_b = "t-clear-attempt-2"
+
+    # Append 3 records for attempt A, 2 for attempt B
+    for i in range(3):
+        store.append_feedback(FeedbackRecord.new(
+            task_id=task_id, attempt_id=attempt_a,
+            source_stage=FeedbackSource.VALIDATION, severity=FeedbackSeverity.ERROR,
+            category="non_verbatim_span", message=f"a-{i}", target={},
+            suggested_action="fix", created_by="test",
+        ))
+    for i in range(2):
+        store.append_feedback(FeedbackRecord.new(
+            task_id=task_id, attempt_id=attempt_b,
+            source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+            category="schema_invalid", message=f"b-{i}", target={},
+            suggested_action="fix", created_by="test",
+        ))
+
+    # Add a discussion entry for one of the attempt-A records
+    feedback_a_ids = [r.feedback_id for r in store.list_feedback(task_id) if r.attempt_id == attempt_a]
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id=task_id, feedback_id=feedback_a_ids[0],
+        role="annotator", stance="disagree",
+        message="I disagree", agreed_points=[], disputed_points=[],
+        proposed_resolution=None, consensus=False, created_by="annotator",
+    ))
+
+    # Clear attempt A
+    deleted = store.clear_feedback_for_attempt(task_id, attempt_a)
+    assert deleted == 3, f"expected 3 deleted, got {deleted}"
+
+    # Only attempt B remains
+    remaining = store.list_feedback(task_id)
+    assert len(remaining) == 2
+    assert all(r.attempt_id == attempt_b for r in remaining)
+
+    # Discussion for attempt A's record must also be gone
+    discussions = store.list_feedback_discussions(task_id)
+    assert len(discussions) == 0, f"discussions for deleted records should be gone, got {len(discussions)}"
+
+
+def test_clear_feedback_for_attempt_nonexistent_returns_zero(tmp_path):
+    """Clearing a non-existent attempt returns 0 (not an error)."""
+    store = SqliteStore.open(tmp_path)
+    result = store.clear_feedback_for_attempt("t-none", "t-none-attempt-99")
+    assert result == 0

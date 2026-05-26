@@ -648,12 +648,12 @@ def test_transient_rate_limit_bails_never_escalate_to_human_review(tmp_path):
     Regression: previously `total_cap_hit = bails >= TOTAL_BAIL_CAP` applied
     regardless of error type, routing tasks to HR after 10 consecutive 429s.
     """
-    from annotation_pipeline_skill.llm.local_cli import LocalCLIExecutionError
+    from annotation_pipeline_skill.llm.local_cli import ProviderCallError
 
     class RateLimitClient:
         """Raises a 429 wrapped exactly as AnthropicSDKClient does."""
         async def generate(self, request):
-            raise LocalCLIExecutionError(
+            raise ProviderCallError(
                 "local CLI provider failed",
                 {
                     "runtime": "anthropic_sdk",

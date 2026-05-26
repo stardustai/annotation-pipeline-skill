@@ -39,6 +39,7 @@ class ProviderCallError(Exception):
         self.diagnostics: dict[str, Any] = diagnostics or {}
 
 
+
 @dataclass
 class _ApiCallResult:
     """Canonical result from one API call, in OpenAI format."""

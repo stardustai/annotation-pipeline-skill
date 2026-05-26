@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from annotation_pipeline_skill.llm.base_sdk_client import LocalCLIExecutionError
+from annotation_pipeline_skill.llm.base_sdk_client import ProviderCallError
 from annotation_pipeline_skill.llm.client import LLMGenerateRequest
 from annotation_pipeline_skill.llm.openai_sdk import OpenAISDKClient
 from annotation_pipeline_skill.llm.profiles import LLMProfile
@@ -183,7 +183,7 @@ def test_finish_reason_length_flags_truncated(tmp_path, monkeypatch):
 def test_finish_reason_content_filter_raises_refusal(tmp_path, monkeypatch):
     _patch_create(monkeypatch, [_fake_chat_response(finish_reason="content_filter")])
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(LocalCLIExecutionError) as exc:
+    with pytest.raises(ProviderCallError) as exc:
         asyncio.run(OpenAISDKClient(_profile()).generate(
             LLMGenerateRequest(instructions="s", prompt="p", task_id="t-1"),
         ))
@@ -287,7 +287,7 @@ def test_api_error_raises_local_cli_execution_error(tmp_path, monkeypatch):
         chat=MagicMock(completions=MagicMock(create=AsyncMock(side_effect=_fail))),
     ))
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(LocalCLIExecutionError) as exc:
+    with pytest.raises(ProviderCallError) as exc:
         asyncio.run(OpenAISDKClient(_profile()).generate(
             LLMGenerateRequest(instructions="s", prompt="p", task_id="t-1"),
         ))

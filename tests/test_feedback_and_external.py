@@ -91,6 +91,40 @@ def test_feedback_bundle_includes_discussion_and_consensus(tmp_path):
     assert filtered["items"] == []
 
 
+def test_build_feedback_bundle_max_items_caps_to_most_recent(tmp_path):
+    """max_items keeps the N most recent items by created_at."""
+    store = SqliteStore.open(tmp_path)
+    records = []
+    for i in range(5):
+        r = FeedbackRecord.new(
+            task_id="task-cap",
+            attempt_id=f"attempt-{i}",
+            source_stage=FeedbackSource.QC,
+            severity=FeedbackSeverity.ERROR,
+            category="format",
+            message=f"error {i}",
+            target={},
+            suggested_action="batch_code_update",
+            created_by="qc",
+        )
+        store.append_feedback(r)
+        records.append(r)
+
+    # No cap: all 5 returned.
+    bundle = build_feedback_bundle(store, "task-cap")
+    assert len(bundle["items"]) == 5
+
+    # max_items=3: keeps the 3 most recent (records[2], records[3], records[4]).
+    capped = build_feedback_bundle(store, "task-cap", max_items=3)
+    assert len(capped["items"]) == 3
+    messages = [item["message"] for item in capped["items"]]
+    assert messages == ["error 2", "error 3", "error 4"]
+
+    # max_items >= total: no truncation.
+    full = build_feedback_bundle(store, "task-cap", max_items=10)
+    assert len(full["items"]) == 5
+
+
 def test_external_task_pull_is_idempotent_and_creates_status_outbox(tmp_path):
     store = SqliteStore.open(tmp_path)
     service = ExternalTaskService(store)
