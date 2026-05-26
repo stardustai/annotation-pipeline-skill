@@ -3809,7 +3809,13 @@ def _build_qc_instructions(
         "ROUND DISCIPLINE: The feedback_bundle in this prompt contains all prior feedback items for this task. "
         "If feedback_bundle.items is EMPTY, this is round 1 — scan every row exhaustively and report EVERY "
         "defect you detect. This is your only opportunity to flag issues anywhere in the annotation. "
-        "If feedback_bundle.items is NON-EMPTY, this is a retry round. In retry rounds your failures list "
+        "ROUND-1 EXCEPTION: if feedback_bundle.items is NON-EMPTY but every item has "
+        'source_stage=="validation" (none have source_stage=="qc" or source_stage=="human_review"), '
+        "treat this as your round 1 — scan every row exhaustively. Validation flags mechanical rule "
+        "violations before QC runs; a validation-only bundle does NOT mean QC has already scanned "
+        "this annotation. "
+        'If feedback_bundle.items is NON-EMPTY and at least one item has source_stage=="qc" or '
+        'source_stage=="human_review", this is a retry round. In retry rounds your failures list '
         "is STRICTLY RESTRICTED to: "
         "(1) rows or spans explicitly referenced by a prior feedback item where the annotator's fix is still "
         "incorrect or introduced a new defect; and "

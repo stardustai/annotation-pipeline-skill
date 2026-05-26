@@ -2803,6 +2803,67 @@ def test_clear_feedback_for_attempt(tmp_path):
     assert len(discussions) == 0, f"discussions for deleted records should be gone, got {len(discussions)}"
 
 
+def test_qc_instructions_scan_exhaustively_when_feedback_is_validation_only():
+    """Regression for task-000238: when all prior feedback has source_stage=='validation'
+    (none from 'qc'), the QC instructions must tell the model to scan ALL rows
+    exhaustively, not restrict to rows referenced by prior feedback."""
+    from annotation_pipeline_skill.runtime.subagent_cycle import _build_qc_instructions
+    from annotation_pipeline_skill.core.models import Task
+
+    task = Task.new(
+        task_id="t-rd-1",
+        pipeline_id="pipe",
+        source_ref={"kind": "jsonl", "payload": {"text": "hello"}},
+        modality="text",
+        annotation_requirements={"annotation_types": ["entity_span"]},
+    )
+    instructions = _build_qc_instructions(
+        task,
+        resolved_policy={"mode": "all", "sample_ratio": 1.0},
+    )
+    # Must instruct QC to treat validation-only bundles as round 1
+    assert 'source_stage=="validation"' in instructions, (
+        "QC instructions must distinguish validation-only feedback from QC feedback "
+        "so prelabeled tasks get a real full-scan QC pass"
+    )
+    # Must also state the condition under which retry mode applies
+    assert 'source_stage=="qc"' in instructions, (
+        "QC instructions must explicitly state that retry mode requires at least one "
+        "source_stage==\"qc\" item in the feedback bundle"
+    )
+    # ROUND-1 EXCEPTION must appear before "retry round" in the instructions
+    assert instructions.index("ROUND-1 EXCEPTION") < instructions.index("retry round"), (
+        "ROUND-1 EXCEPTION clause must precede the retry-mode clause"
+    )
+    # The exception clause must instruct exhaustive scanning
+    assert "scan every row exhaustively" in instructions
+
+
+def test_qc_instructions_enter_retry_mode_when_qc_feedback_exists():
+    """When at least one feedback item has source_stage=='qc', QC must enter
+    retry mode (STRICTLY RESTRICTED). The ROUND-1 EXCEPTION must not apply."""
+    from annotation_pipeline_skill.runtime.subagent_cycle import _build_qc_instructions
+    from annotation_pipeline_skill.core.models import Task
+
+    task = Task.new(
+        task_id="t-rd-2",
+        pipeline_id="pipe",
+        source_ref={"kind": "jsonl", "payload": {"text": "hello"}},
+        modality="text",
+        annotation_requirements={"annotation_types": ["entity_span"]},
+    )
+    instructions = _build_qc_instructions(
+        task,
+        resolved_policy={"mode": "all", "sample_ratio": 1.0},
+    )
+    # When QC feedback exists, the retry-mode restriction must be present
+    assert "STRICTLY RESTRICTED" in instructions, (
+        "Retry-mode STRICTLY RESTRICTED clause must be present in QC instructions"
+    )
+    # The triggering condition must reference source_stage=="qc"
+    assert 'source_stage=="qc"' in instructions
+
+
 def test_clear_feedback_for_attempt_nonexistent_returns_zero(tmp_path):
     """Clearing a non-existent attempt returns 0 (not an error)."""
     store = SqliteStore.open(tmp_path)
