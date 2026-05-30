@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Offline accuracy evaluation with consensus judging** (`annotation_pipeline_skill.eval`, CLI `eval-accuracy`).
+
+  - New module `annotation_pipeline_skill/eval/consensus_accuracy.py` scores precision/recall/F1 for a sample of accepted tasks by replaying the active annotation rules through an LLM judge. To suppress the judge's stochastic false flags it runs **k passes over the same rows and keeps only errors confirmed by a majority vote** (threshold = `passes // 2 + 1`), filtering both false-positive and false-negative noise. `wrong_type` errors vote against precision and recall. True positives are derived deterministically (`total_spans − false_positives` via `count_spans()`), so the judge only reports the violation list, never tallies correct spans.
+
+  - New CLI command `annotation-pipeline eval-accuracy --pipeline-id <id>` with `--sample-ratio`/`--sample-count`, `--passes`, `--chunk-size`, `--workers`, `--qc-target` (default `qc`), `--version`, `--target-precision` (0.98), `--target-f1` (0.95), and `--output`. The judge LLM is resolved from `llm_profiles.yaml` via the named target's `api_key_env` — no hardcoded keys. Prints a JSON summary (P/R/F1, TP/FP/FN, consensus threshold, `targets_met`) and a one-line verdict.
+
+  - Public API re-exported from `annotation_pipeline_skill.eval`: `ConsensusResult`, `run_consensus`, `run_single_pass`, `evaluate_accuracy`, `build_qc_judge`, `count_spans`, and the `DEFAULT_PASSES`/`DEFAULT_CHUNK_SIZE`/`DEFAULT_WORKERS` constants. Covered by 7 unit tests in `tests/test_consensus_accuracy.py` using a dependency-injected fake judge (no network).
+
+  - **Known limit:** consensus filters noise only among errors the judge already proposes; it is reliable for precision/false-positive filtering but inherits a weak judge's recall blindness. Validate recall with an independent stronger oracle before declaring a gate met.
+
 - **Low-Info Filter & Naming Alignment** (`docs/superpowers/specs/2026-05-19-low-info-filter-design.md`, plan `2026-05-19-low-info-filter.md`).
 
   - **`divergent_entries` rename.** `EntityStatisticsService.contested_spans()` renamed to `divergent_entries()` project-wide (service, API, scripts, TypeScript types). Old name removed.

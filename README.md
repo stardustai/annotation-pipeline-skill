@@ -120,6 +120,7 @@ Implemented in the first backend foundation slice:
 - Idempotent external HTTP task pull with status outbox creation.
 - Local outbox records for status and submit operations.
 - CLI init, doctor, JSONL task creation, subagent cycle, and dashboard serving commands.
+- Offline accuracy evaluation (`eval-accuracy`) with multi-pass majority-vote consensus judging to filter LLM-judge noise (`annotation_pipeline_skill.eval`).
 - Configurable subagent runtime through `llm_profiles.yaml`.
 - OpenAI Responses API, OpenAI-compatible API, Codex CLI, and Claude CLI provider profiles.
 - Backend Kanban snapshot data shape.
@@ -600,6 +601,53 @@ UV_CACHE_DIR=/tmp/uv-cache UV_LINK_MODE=copy uv run \
 ```
 
 The readiness report summarizes accepted, exported, exportable, Human Review, open feedback, validation blocker, and external outbox counts, plus the recommended next action.
+
+Measure annotation accuracy (precision / recall / F1) offline before treating a
+project as training-ready:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache UV_LINK_MODE=copy uv run \
+  annotation-pipeline eval-accuracy \
+  --project-root ./demo-project \
+  --pipeline-id memory-ner-v2 \
+  --sample-ratio 0.05 \
+  --passes 3 \
+  --output ./accuracy.json
+```
+
+`eval-accuracy` samples accepted tasks, replays the active annotation rules
+through an LLM judge, and scores precision/recall/F1 against a deterministic
+span count. To suppress the judge's stochastic false flags it runs **k passes
+over the same rows and keeps only errors confirmed by a majority vote**
+(threshold = `passes // 2 + 1`); both false-positive and false-negative noise is
+filtered, and `wrong_type` errors count against precision and recall. True
+positives are derived deterministically (`total_spans − false_positives`), so
+the judge only ever reports the violation list — it never tallies correct spans.
+
+Options:
+
+- `--sample-ratio` (default `0.05`) or `--sample-count` — how many accepted
+  tasks to sample (mutually exclusive).
+- `--passes` (default `3`) — judge passes per sample for the majority vote.
+- `--qc-target` (default `qc`) — which `llm_profiles.yaml` target to use as the
+  judge; the API key is resolved from that profile's `api_key_env`, never
+  hardcoded.
+- `--target-precision` (default `0.98`) / `--target-f1` (default `0.95`) — the
+  gate thresholds reflected in the `targets_met` field.
+- `--chunk-size`, `--workers` — judging batch size and parallelism.
+- `--version` — guideline version label for the rules (default: latest).
+- `--output` — optional path to write the full result JSON, including per-pass
+  detail and the majority-confirmed failure list.
+
+The command prints a JSON summary (precision/recall/F1, TP/FP/FN, consensus
+threshold, `targets_met`) to stdout and a one-line verdict to stderr.
+
+> **Recall caveat.** Majority-vote consensus only filters noise *among the
+> errors the judge already proposes*; it cannot surface misses a weak judge
+> never raises. It is reliable for precision/false-positive filtering, but a
+> judge that rarely proposes missing-span errors will report an inflated recall.
+> Validate recall with a stronger independent oracle (e.g. a subagent review
+> that re-derives the gold span set) before declaring a gate met.
 
 ## Failure Recovery
 
