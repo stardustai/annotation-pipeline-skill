@@ -22,6 +22,11 @@ from annotation_pipeline_skill.config.loader import (
 from annotation_pipeline_skill.config.models import ProjectConfig
 from annotation_pipeline_skill.core.models import ArtifactRef, Attempt, Task, utc_now
 from annotation_pipeline_skill.core.qc_policy import validate_qc_sample_options
+from annotation_pipeline_skill.eval.consensus_accuracy import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_PASSES,
+    DEFAULT_WORKERS,
+)
 from annotation_pipeline_skill.core.runtime import RuntimeConfig
 from annotation_pipeline_skill.core.states import AttemptStatus, TaskStatus
 from annotation_pipeline_skill.core.transitions import transition_task
@@ -446,6 +451,31 @@ def build_parser() -> argparse.ArgumentParser:
     merge_parser.add_argument("--output", type=Path, default=None, help="Output directory (default: exports/<timestamp>)")
     merge_parser.add_argument("--project-root", type=Path, default=Path.cwd())
     merge_parser.set_defaults(handler=handle_merge)
+
+    eval_parser = subparsers.add_parser(
+        "eval-accuracy",
+        help="Offline accuracy QC (precision/recall/F1) with multi-pass consensus judging",
+    )
+    eval_parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    eval_parser.add_argument("--pipeline-id", required=True)
+    sample_group = eval_parser.add_mutually_exclusive_group()
+    sample_group.add_argument("--sample-ratio", type=float, default=0.05,
+                              help="fraction of accepted tasks to sample (default: 0.05)")
+    sample_group.add_argument("--sample-count", type=int, default=None,
+                              help="absolute number of accepted tasks to sample")
+    eval_parser.add_argument("--passes", type=int, default=DEFAULT_PASSES,
+                             help="judge passes per sample for majority vote (default: 3)")
+    eval_parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    eval_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    eval_parser.add_argument("--qc-target", default="qc",
+                             help="LLM target name to use as the judge (default: qc)")
+    eval_parser.add_argument("--version", default=None,
+                             help="guideline version label for rules (default: latest)")
+    eval_parser.add_argument("--target-precision", type=float, default=0.98)
+    eval_parser.add_argument("--target-f1", type=float, default=0.95)
+    eval_parser.add_argument("--output", type=Path, default=None,
+                             help="optional path to write the full result JSON")
+    eval_parser.set_defaults(handler=handle_eval_accuracy)
 
     _register_db_commands(subparsers)
 
@@ -1481,6 +1511,103 @@ def handle_merge(args: argparse.Namespace) -> int:
         "output_dir": str(output_dir),
         "export_id": manifest.export_id,
     }, indent=2))
+    return 0
+
+
+def handle_eval_accuracy(args: argparse.Namespace) -> int:
+    """Offline accuracy QC: sample accepted tasks and score precision/recall/F1
+    with multi-pass majority-vote consensus to filter judge noise."""
+    import math
+
+    from annotation_pipeline_skill.eval import (
+        build_qc_judge,
+        evaluate_accuracy,
+    )
+
+    project_root = Path(args.project_root)
+    config_root = project_root / ".annotation-pipeline"
+    store = SqliteStore.open(config_root)
+    try:
+        # Resolve the active annotation rules (guideline) text.
+        doc = _find_annotation_rules_doc(store)
+        rules = _resolve_guideline_version(store, doc, args.version).content
+
+        # Resolve the judge LLM profile (default target: "qc").
+        profiles_path = resolve_llm_profiles_path(
+            workspace_root=project_root.parent,
+            project_config_root=config_root,
+        )
+        if profiles_path is None:
+            print("error: no llm_profiles.yaml found in workspace or project",
+                  file=sys.stderr)
+            return 1
+        registry = load_llm_registry(profiles_path)
+        profile = registry.resolve(args.qc_target)
+        judge = build_qc_judge(profile)
+
+        # Determine sample size from ratio (default) or explicit count.
+        accepted_total = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE status='accepted' AND pipeline_id=?",
+            (args.pipeline_id,),
+        ).fetchone()["n"]
+        if accepted_total == 0:
+            print(f"error: no accepted tasks for pipeline {args.pipeline_id!r}",
+                  file=sys.stderr)
+            return 1
+        if args.sample_count is not None:
+            sample_count = min(args.sample_count, accepted_total)
+        else:
+            sample_count = max(1, math.ceil(accepted_total * args.sample_ratio))
+
+        hr_service = HumanReviewService(store)
+        print(f"eval-accuracy: pipeline={args.pipeline_id} judge={profile.model} "
+              f"sample={sample_count}/{accepted_total} accepted tasks × {args.passes} passes",
+              file=sys.stderr)
+        result = evaluate_accuracy(
+            store, hr_service._latest_annotation_payload, rules, judge,
+            pipeline_id=args.pipeline_id,
+            sample_count=sample_count,
+            passes=args.passes,
+            chunk_size=args.chunk_size,
+            workers=args.workers,
+            verbose=True,
+        )
+    finally:
+        store.close()
+
+    meets = result.meets(target_precision=args.target_precision, target_f1=args.target_f1)
+    summary = {
+        "pipeline_id": args.pipeline_id,
+        "judge_model": profile.model,
+        "sample_tasks": sample_count,
+        "accepted_total": accepted_total,
+        "passes": args.passes,
+        "consensus_threshold": result.threshold,
+        **result.to_dict(),
+        "target_precision": args.target_precision,
+        "target_f1": args.target_f1,
+        "targets_met": meets,
+    }
+    # Confirmed failures are verbose; keep them out of stdout summary.
+    summary.pop("confirmed_failures", None)
+    summary.pop("per_pass", None)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    if args.output is not None:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(
+            json.dumps({**summary,
+                        "per_pass": result.per_pass,
+                        "confirmed_failures": result.confirmed_failures},
+                       indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"full result → {args.output}", file=sys.stderr)
+
+    print(f"\n{'✓ TARGETS MET' if meets else '✗ targets not met'}: "
+          f"P={result.precision:.4f} (≥{args.target_precision})  "
+          f"F1={result.f1:.4f} (≥{args.target_f1})  R={result.recall:.4f}",
+          file=sys.stderr)
     return 0
 
 
