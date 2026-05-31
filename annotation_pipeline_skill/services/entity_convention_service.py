@@ -6,9 +6,13 @@ task gets the matching conventions injected into its annotator/QC/arbiter
 prompts so ambiguous spans (Gmail = project, Apple = organization, etc.)
 get consistent classification.
 
-Case-insensitive matching, original-case storage. Conflicting decisions
-on the same span mark the convention 'disputed' — the runtime no longer
-applies it and the operator can settle it manually.
+Case-insensitive matching, original-case storage. Soft dispute model:
+automated (qc_consensus) conflicts on the same span do NOT mark the
+convention 'disputed'; instead the plurality winner across distinct tasks
+becomes the current type and disagreement is tracked numerically as
+dispute_pct (enforced softly at injection time). Only an operator can set
+'disputed' status, and only an operator declaration / clear_dispute can
+change an operator-locked type.
 """
 
 from __future__ import annotations
@@ -258,6 +262,18 @@ class EntityConventionService:
             # A convention disputed by an operator stays disputed until the
             # operator clears it; automated proposals only append evidence.
             new_status = "disputed"
+            new_type = row["entity_type"]
+        elif any(
+            isinstance(p, dict) and _is_operator_source(p.get("source"))
+            for p in proposals
+        ):
+            # An operator has declared a policy for this span at some point in
+            # the chain. The operator's call is the final authority and is NOT
+            # silently overridden by later auto consensus — keep the locked
+            # type (consistent with the operator-declared injection bypass).
+            # Only another operator action (declared:/clear_dispute) can change
+            # it. The proposal is still appended as evidence.
+            new_status = "active"
             new_type = row["entity_type"]
         else:
             # Soft model: automated conflicts NEVER hard-flip to 'disputed'.

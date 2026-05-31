@@ -222,3 +222,22 @@ def test_operator_declared_bypasses_distinct_task_gate(store):
                         source="declared:operator", row_content="Gmail filters")
     matches = svc.find_matches_in_text("p1", "I set up a Gmail filter")
     assert [c.span_original for c in matches] == ["Gmail"]
+
+
+def test_operator_declaration_is_sticky_against_later_consensus(store):
+    svc = EntityConventionService(store)
+    # Operator declares 'product'.
+    svc.record_decision(project_id="p1", span="Apple", entity_type="product",
+                        source="declared:operator")
+    # Three later consensus tasks all say 'organization' — they must NOT
+    # silently override the operator's locked type.
+    for i in range(3):
+        svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                            source="qc_consensus", task_id=f"t{i}")
+    conv = svc.list_for_project("p1")[0]
+    assert conv.status == "active"
+    assert conv.entity_type == "product"  # operator's call sticks
+    # A NEW operator declaration can still change it.
+    conv = svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                              source="declared:operator")
+    assert conv.entity_type == "organization"
