@@ -64,7 +64,7 @@ def test_active_convention_returns_examples(store):
     )
 
 
-def test_disputed_returns_examples_per_type(store):
+def test_conflicting_proposals_track_dispute_soft_model(store):
     svc = EntityConventionService(store)
     _seed(svc, "p1", "Apple", "organization", "qc_consensus",
           "task_a", "row_1", "Apple's customer support helped me yesterday")
@@ -73,8 +73,14 @@ def test_disputed_returns_examples_per_type(store):
     _seed(svc, "p1", "Apple", "product", "qc_consensus",
           "task_c", "row_3", "My Apple iPad keeps crashing on updates")
     result = check_past_experience(store, project_id="p1", entry="Apple")
-    assert result["convention"]["status"] == "disputed"
-    assert result["convention"]["type"] is None
+    # Soft model: stays active, plurality (organization) wins.
+    assert result["convention"]["status"] == "active"
+    assert result["convention"]["type"] == "organization"
+    assert result["convention"]["dominant_type"] == "organization"
+    assert result["convention"]["distinct_task_count"] == 3
+    assert result["convention"]["dispute_count"] == 1
+    assert result["convention"]["dispute_pct"] == pytest.approx(1 / 3)
+    # Distribution still counts every proposal by its declared type.
     assert result["distribution"] == {"organization": 2, "product": 1}
     assert set(result["examples_by_type"].keys()) == {"organization", "product"}
 

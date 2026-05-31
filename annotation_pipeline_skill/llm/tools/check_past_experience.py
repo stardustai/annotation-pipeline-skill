@@ -11,6 +11,9 @@ import json
 from collections import Counter
 from typing import Any
 
+from annotation_pipeline_skill.services.entity_convention_service import (
+    _distinct_task_tally,
+)
 from annotation_pipeline_skill.similarity.diverse import select_diverse_examples
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 from annotation_pipeline_skill.text.wordfreq_utils import wordfreq_score
@@ -48,7 +51,11 @@ def check_past_experience(
     if row is None:
         return {
             "entry": entry,
-            "convention": {"status": "none", "type": None, "evidence_count": 0},
+            "convention": {
+                "status": "none", "type": None, "evidence_count": 0,
+                "dominant_type": None, "distinct_task_count": 0,
+                "dispute_count": 0, "dispute_pct": 0.0,
+            },
             "distribution": {},
             "examples_by_type": {},
             "meta": {
@@ -58,6 +65,9 @@ def check_past_experience(
         }
 
     proposals = json.loads(row["proposals_json"] or "[]")
+    dominant_type, distinct_tasks, dispute_count, dispute_pct = (
+        _distinct_task_tally(proposals)
+    )
 
     # Distribution counts every proposal by its declared type.
     distribution = Counter(
@@ -91,6 +101,10 @@ def check_past_experience(
             "status": row["status"],
             "type": row["entity_type"],
             "evidence_count": evidence_count,
+            "dominant_type": dominant_type,
+            "distinct_task_count": distinct_tasks,
+            "dispute_count": dispute_count,
+            "dispute_pct": dispute_pct,
         },
         "distribution": dict(distribution),
         "examples_by_type": examples_by_type,
