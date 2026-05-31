@@ -138,3 +138,39 @@ def test_different_task_same_source_type_is_recorded(store):
     assert len(proposals) == 2
     conv = svc.list_for_project("p1")[0]
     assert conv.distinct_task_count == 2
+
+
+def test_conflict_does_not_flip_to_disputed_soft_model(store):
+    svc = EntityConventionService(store)
+    # Two tasks say organization, one says product → dominant=organization.
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t1")
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t2")
+    conv = svc.record_decision(project_id="p1", span="Apple", entity_type="product",
+                              source="qc_consensus", task_id="t3")
+    # Soft model: stays active, entity_type tracks the plurality winner.
+    assert conv.status == "active"
+    assert conv.entity_type == "organization"
+    assert conv.dominant_type == "organization"
+    assert conv.dispute_count == 1
+
+
+def test_evidence_count_tracks_total_proposals(store):
+    svc = EntityConventionService(store)
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t1")
+    conv = svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                              source="qc_consensus", task_id="t2")
+    assert conv.evidence_count == 2  # two recorded proposals
+
+
+def test_operator_declaration_still_wins(store):
+    svc = EntityConventionService(store)
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t1")
+    conv = svc.record_decision(project_id="p1", span="Apple", entity_type="product",
+                              source="declared:operator")
+    # Operator declaration is final authority: type locks to declared value.
+    assert conv.status == "active"
+    assert conv.entity_type == "product"

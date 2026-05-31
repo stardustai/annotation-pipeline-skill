@@ -179,9 +179,14 @@ class EntityConventionService:
     ) -> EntityConvention:
         """Upsert a convention. Rules:
         - first time → insert as 'active'
-        - same type re-affirmed → bump evidence_count, append proposal
-        - different type → mark 'disputed', append proposal
-        - already 'disputed' → just append proposal (do not silently re-activate)
+        - automated proposals (qc_consensus etc.) → append a proposal and set
+          entity_type to the plurality winner across distinct tasks. Conflicts
+          do NOT flip the convention to 'disputed' (soft model); disagreement
+          is tracked numerically (dispute_pct) and enforced at injection time.
+        - explicit operator declaration ("declared:...") → wins, locks the
+          chosen type, clears any prior dispute.
+        - already operator-'disputed' → append the proposal but leave the
+          status alone until an operator clears it.
         """
         if not span or not entity_type:
             raise ValueError("span and entity_type are required")
@@ -239,27 +244,28 @@ class EntityConventionService:
         ):
             return self._load_row(row)
         proposals.append(proposal)
-        new_status = row["status"]
-        new_type = row["entity_type"]
-        new_count = row["evidence_count"]
-        # An explicit operator declaration ("declared:operator") is the
-        # final authority: it always wins, resets any prior dispute, and
-        # locks in the chosen type. Automated annotator/QC/arbiter proposals
-        # follow the old dispute-on-conflict rules below.
+        dominant_type, _distinct, _dispute, _pct = _distinct_task_tally(proposals)
+        # evidence_count is now a plain display counter: the total number of
+        # recorded proposals. The injection gate uses distinct_task_count /
+        # dispute_pct (derived in _load_row), NOT this field.
+        new_count = len(proposals)
         if source.startswith("declared:"):
+            # Explicit operator declaration is the final authority: it always
+            # wins, clears any prior dispute, and locks in the chosen type.
             new_status = "active"
             new_type = entity_type
-            new_count = row["evidence_count"] + 1
         elif row["status"] == "disputed":
-            # Stay disputed — don't reactivate on automated contributions;
-            # only an explicit operator declaration can clear it.
-            pass
-        elif row["entity_type"] == entity_type:
-            new_count = row["evidence_count"] + 1
-        else:
-            # New type disagrees with existing active convention → dispute.
+            # A convention disputed by an operator stays disputed until the
+            # operator clears it; automated proposals only append evidence.
             new_status = "disputed"
-            new_type = None
+            new_type = row["entity_type"]
+        else:
+            # Soft model: automated conflicts NEVER hard-flip to 'disputed'.
+            # The plurality winner (one vote per distinct task) becomes the
+            # convention's current type; disagreement is tracked numerically
+            # via dispute_pct and enforced softly at injection time.
+            new_status = "active"
+            new_type = dominant_type if dominant_type is not None else row["entity_type"]
         conn.execute(
             """
             UPDATE entity_conventions
