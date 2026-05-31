@@ -213,18 +213,21 @@ class EntityConventionService:
         ).fetchone()
         if row is None:
             conv_id = f"conv-{uuid4().hex[:16]}"
+            dom0, dist0, disp0, pct0 = _distinct_task_tally([proposal])
             conn.execute(
                 """
                 INSERT INTO entity_conventions
                 (convention_id, project_id, span_lower, span_original, entity_type,
                  status, evidence_count, proposals_json, created_at, updated_at,
-                 created_by, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_by, notes,
+                 distinct_task_count, dispute_count, dispute_pct, dominant_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conv_id, project_id, span_lower, span.strip(), entity_type,
                     "active", 1, json.dumps([proposal]),
                     now.isoformat(), now.isoformat(), source, notes,
+                    dist0, disp0, pct0, dom0,
                 ),
             )
             return self._load_row(conn.execute(
@@ -249,7 +252,7 @@ class EntityConventionService:
         ):
             return self._load_row(row)
         proposals.append(proposal)
-        dominant_type, _distinct, _dispute, _pct = _distinct_task_tally(proposals)
+        dominant_type, distinct_ct, dispute_ct, dispute_pct = _distinct_task_tally(proposals)
         # evidence_count is now a plain display counter: the total number of
         # recorded proposals. The injection gate uses distinct_task_count /
         # dispute_pct (derived in _load_row), NOT this field.
@@ -296,11 +299,14 @@ class EntityConventionService:
             """
             UPDATE entity_conventions
             SET entity_type=?, status=?, evidence_count=?, proposals_json=?,
-                created_by=?, updated_at=?
+                created_by=?, updated_at=?,
+                distinct_task_count=?, dispute_count=?, dispute_pct=?, dominant_type=?
             WHERE convention_id=?
             """,
             (new_type, new_status, new_count, json.dumps(proposals),
-             new_created_by, now.isoformat(), row["convention_id"]),
+             new_created_by, now.isoformat(),
+             distinct_ct, dispute_ct, dispute_pct, dominant_type,
+             row["convention_id"]),
         )
         return self._load_row(conn.execute(
             "SELECT * FROM entity_conventions WHERE convention_id=?",
@@ -343,18 +349,22 @@ class EntityConventionService:
             "notes": notes,
             "at": now.isoformat(),
         })
+        dominant_type, distinct_ct, dispute_ct, dispute_pct = _distinct_task_tally(proposals)
         # Dispute resolution is an operator action — stamp created_by so the
-        # injection prefilter recognises this convention as operator-declared
+        # injection gate recognises this convention as operator-declared
         # without scanning proposals_json.
         conn.execute(
             """
             UPDATE entity_conventions
             SET entity_type=?, status='active', proposals_json=?,
-                created_by=?, updated_at=?
+                created_by=?, updated_at=?,
+                distinct_task_count=?, dispute_count=?, dispute_pct=?, dominant_type=?
             WHERE convention_id=?
             """,
             (resolved_type, json.dumps(proposals), f"dispute_resolved_by:{actor}",
-             now.isoformat(), convention_id),
+             now.isoformat(),
+             distinct_ct, dispute_ct, dispute_pct, dominant_type,
+             convention_id),
         )
         return self._load_row(conn.execute(
             "SELECT * FROM entity_conventions WHERE convention_id=?",
@@ -460,46 +470,74 @@ class EntityConventionService:
     # is by design generic and shouldn't override the LLM's judgment.
     EXCLUDED_TYPES_FOR_INJECTION: tuple[str, ...] = ("entity",)
 
+    # Columns needed to evaluate injection — deliberately EXCLUDES the large
+    # proposals_json blob so the hot path never deserializes it.
+    _INJECT_COLUMNS = (
+        "convention_id, project_id, span_lower, span_original, entity_type, "
+        "status, evidence_count, created_at, updated_at, created_by, notes, "
+        "distinct_task_count, dispute_count, dispute_pct, dominant_type"
+    )
+
     def _iter_injection_candidates(
         self, project_id: str
     ) -> list["EntityConvention"]:
-        """Return active conventions that COULD pass the injection gate.
+        """Return active conventions that pass the injection gate's metric
+        thresholds, evaluated entirely in SQL against materialized columns.
 
-        Cheap SQL prefilter that drops the long tail of single-task
-        conventions WITHOUT parsing their proposals in Python. After a rebuild
-        from task history a project can hold tens of thousands of single-task
-        conventions, of which only a few percent can ever inject; loading them
-        all into Python on every injection is the bottleneck.
+        After a rebuild from task history a project can hold tens of thousands
+        of single-task conventions, of which only a few percent can ever
+        inject. Rather than load and JSON-parse every row's ``proposals_json``
+        in Python (the old bottleneck), the distinct-task / dispute aggregates
+        are stored as columns (maintained on write by ``record_decision`` /
+        ``clear_dispute``) so the gate is a plain indexed predicate:
 
-        This narrows the candidate set using only the small stored columns
-        ``evidence_count`` and ``created_by`` (never the large
-        ``proposals_json`` blob, scanning which would cost as much as the
-        full load it replaces):
-          - consensus path needs >= ``INJECT_MIN_DISTINCT_TASKS`` distinct
-            task votes, which requires at least that many proposals →
-            ``evidence_count >= INJECT_MIN_DISTINCT_TASKS``; OR
-          - operator bypass → ``created_by`` carries an operator prefix. Every
-            operator action stamps ``created_by`` with its source (see
-            ``record_decision`` / ``clear_dispute``), so a convention that is
-            operator-declared is always caught here.
+          - consensus path: ``distinct_task_count >= INJECT_MIN_DISTINCT_TASKS
+            AND dispute_pct < INJECT_MAX_DISPUTE_PCT`` (uses idx_conv_inject);
+            OR
+          - operator bypass: ``created_by`` carries an operator prefix (every
+            operator action stamps ``created_by`` with its source).
 
-        It is a provable SUPERSET of what the gate accepts — the caller still
-        applies the exact gate (distinct-task count, dispute_pct,
-        operator-declared, span length, type exclusion). Any false positives
-        are harmless: the Python gate filters them out. There are no false
-        negatives, so the injection decision is unchanged.
+        proposals_json is never read here. The caller applies the remaining
+        non-metric gate parts (span length, excluded types, word-boundary
+        match). Returned conventions carry ``proposals=[]`` — the injection
+        path doesn't need the audit trail.
         """
         prefixes = self.OPERATOR_DECLARATION_SOURCE_PREFIXES
-        like_clause = " OR ".join("created_by LIKE ?" for _ in prefixes)
-        params: list[Any] = [project_id, self.INJECT_MIN_DISTINCT_TASKS]
+        op_clause = " OR ".join("created_by LIKE ?" for _ in prefixes)
+        params: list[Any] = [
+            project_id, self.INJECT_MIN_DISTINCT_TASKS, self.INJECT_MAX_DISPUTE_PCT
+        ]
         params += [f"{p}%" for p in prefixes]
         rows = self.store._conn.execute(
-            "SELECT * FROM entity_conventions "
+            f"SELECT {self._INJECT_COLUMNS} FROM entity_conventions "
             "WHERE project_id=? AND status='active' "
-            f"AND (evidence_count >= ? OR {like_clause})",
+            f"AND ((distinct_task_count >= ? AND dispute_pct < ?) OR ({op_clause}))",
             params,
         ).fetchall()
-        return [self._load_row(r) for r in rows]
+        return [self._load_row_light(r) for r in rows]
+
+    def _load_row_light(self, row: sqlite3.Row) -> EntityConvention:
+        """Build an EntityConvention from the injection column set WITHOUT
+        parsing proposals_json. Aggregates come from the materialized columns;
+        ``proposals`` is empty (the injection path doesn't use it)."""
+        return EntityConvention(
+            convention_id=row["convention_id"],
+            project_id=row["project_id"],
+            span_lower=row["span_lower"],
+            span_original=row["span_original"],
+            entity_type=row["entity_type"],
+            status=row["status"],
+            evidence_count=row["evidence_count"],
+            proposals=[],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            created_by=row["created_by"],
+            notes=row["notes"],
+            distinct_task_count=row["distinct_task_count"],
+            dispute_count=row["dispute_count"],
+            dispute_pct=row["dispute_pct"],
+            dominant_type=row["dominant_type"],
+        )
 
     @classmethod
     def _is_operator_declared(cls, conv: "EntityConvention") -> bool:
@@ -545,16 +583,14 @@ class EntityConventionService:
             return []
         text_lower = text.lower()
         out: list[EntityConvention] = []
+        # The distinct-task / dispute_pct / operator-bypass gate is enforced in
+        # SQL by _iter_injection_candidates (against materialized columns), so
+        # here we only apply the non-metric rules.
         for conv in self._iter_injection_candidates(project_id):
             if not conv.span_lower:
                 continue
             if len(conv.span_lower) < self.MIN_INJECTION_SPAN_LEN:
                 continue
-            if not self._is_operator_declared(conv):
-                if conv.distinct_task_count < self.INJECT_MIN_DISTINCT_TASKS:
-                    continue
-                if conv.dispute_pct >= self.INJECT_MAX_DISPUTE_PCT:
-                    continue
             if conv.entity_type in self.EXCLUDED_TYPES_FOR_INJECTION:
                 continue
             if not _span_in_text_at_word_boundary(conv.span_lower, text_lower):

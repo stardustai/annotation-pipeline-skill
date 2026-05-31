@@ -29,6 +29,34 @@ from annotation_pipeline_skill.core.states import TaskStatus
 
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+
+def _migrate_convention_aggregate_columns(conn: "sqlite3.Connection") -> None:
+    """Idempotently add the materialized aggregate columns to an existing
+    entity_conventions table.
+
+    SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``, so we inspect
+    ``PRAGMA table_info`` and only add columns that are missing. Fresh DBs get
+    the columns straight from the CREATE TABLE above, so this is a no-op for
+    them. Existing rows keep the column DEFAULTs (0 / NULL) until a write
+    refreshes them or a rebuild replays their proposals.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(entity_conventions)")}
+    if not existing:
+        return  # table not created yet (shouldn't happen post-migrations)
+    additions = (
+        ("distinct_task_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("dispute_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("dispute_pct", "REAL NOT NULL DEFAULT 0.0"),
+        ("dominant_type", "TEXT"),
+    )
+    for name, decl in additions:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE entity_conventions ADD COLUMN {name} {decl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_inject "
+        "ON entity_conventions(project_id, status, distinct_task_count)"
+    )
+
 # Additive migrations: CREATE TABLE IF NOT EXISTS only, applied on every open
 # of an existing DB. Keeps the door open for adding tables without a formal
 # migration system. Drop additions here once a year by promoting them into
@@ -46,10 +74,23 @@ CREATE TABLE IF NOT EXISTS entity_conventions (
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     created_by     TEXT NOT NULL,
-    notes          TEXT
+    notes          TEXT,
+    -- Materialized aggregates of proposals_json, maintained on every write
+    -- (record_decision / clear_dispute) so the injection gate can be
+    -- evaluated in SQL without parsing the JSON blob per row. proposals_json
+    -- stays the source of truth; these are a write-maintained cache.
+    distinct_task_count INTEGER NOT NULL DEFAULT 0,
+    dispute_count       INTEGER NOT NULL DEFAULT 0,
+    dispute_pct         REAL NOT NULL DEFAULT 0.0,
+    dominant_type       TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_project_span ON entity_conventions(project_id, span_lower);
 CREATE INDEX IF NOT EXISTS idx_conv_project_status ON entity_conventions(project_id, status);
+-- NOTE: idx_conv_inject references distinct_task_count, which on a pre-existing
+-- DB is added by _migrate_convention_aggregate_columns *after* this script
+-- runs. Creating it here would fail (no such column) before the ALTER lands,
+-- so that index is created inside the migration instead, once the column
+-- exists. Fresh DBs get it from schema.sql.
 
 CREATE TABLE IF NOT EXISTS entity_statistics (
     project_id   TEXT NOT NULL,
@@ -206,6 +247,7 @@ class SqliteStore:
         # yet promoted into schema.sql; existing DBs need them for the same
         # tables that were added after their initial creation.
         conn.executescript(_ADDITIVE_MIGRATIONS_SQL)
+        _migrate_convention_aggregate_columns(conn)
         return store
 
     @property

@@ -203,7 +203,14 @@ CREATE TABLE IF NOT EXISTS entity_conventions (
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     created_by     TEXT NOT NULL,        -- first source: 'hr_correction'/'declared'/'arbiter_consensus'
-    notes          TEXT
+    notes          TEXT,
+    -- Materialized aggregates of proposals_json, maintained on every write so
+    -- the injection gate is a plain indexed SQL predicate (no JSON parse).
+    distinct_task_count INTEGER NOT NULL DEFAULT 0,
+    dispute_count       INTEGER NOT NULL DEFAULT 0,
+    dispute_pct         REAL NOT NULL DEFAULT 0.0,
+    dominant_type       TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_project_span ON entity_conventions(project_id, span_lower);
 CREATE INDEX IF NOT EXISTS idx_conv_project_status ON entity_conventions(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_conv_inject ON entity_conventions(project_id, status, distinct_task_count);
