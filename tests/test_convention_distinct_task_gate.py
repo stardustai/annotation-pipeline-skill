@@ -85,3 +85,29 @@ def test_tally_empty_is_neutral():
     assert distinct == 0
     assert dispute == 0
     assert pct == 0.0
+
+
+def test_load_row_attaches_derived_fields(store):
+    svc = EntityConventionService(store)
+    svc.record_decision(
+        project_id="p1", span="Apple", entity_type="organization",
+        source="qc_consensus:a", task_id="t1",
+    )
+    svc.record_decision(
+        project_id="p1", span="Apple", entity_type="organization",
+        source="qc_consensus:b", task_id="t2",
+    )
+    svc.record_decision(
+        project_id="p1", span="Apple", entity_type="product",
+        source="qc_consensus:c", task_id="t3",
+    )
+    conv = svc.list_for_project("p1")[0]
+    assert conv.distinct_task_count == 3
+    assert conv.dominant_type == "organization"
+    assert conv.dispute_count == 1
+    assert conv.dispute_pct == pytest.approx(1 / 3)
+    d = conv.to_dict()
+    assert d["distinct_task_count"] == 3
+    assert d["dominant_type"] == "organization"
+    assert d["dispute_count"] == 1
+    assert d["dispute_pct"] == pytest.approx(1 / 3)

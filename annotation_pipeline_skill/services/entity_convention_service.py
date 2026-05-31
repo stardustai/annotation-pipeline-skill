@@ -133,6 +133,13 @@ class EntityConvention:
     updated_at: datetime
     created_by: str
     notes: str | None = None
+    # Derived from ``proposals`` (one vote per distinct task). Not stored as
+    # columns — computed in ``_load_row`` so ``proposals_json`` stays the
+    # single source of truth.
+    distinct_task_count: int = 0
+    dispute_count: int = 0
+    dispute_pct: float = 0.0
+    dominant_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +154,10 @@ class EntityConvention:
             "updated_at": self.updated_at.isoformat(),
             "created_by": self.created_by,
             "notes": self.notes,
+            "distinct_task_count": self.distinct_task_count,
+            "dispute_count": self.dispute_count,
+            "dispute_pct": self.dispute_pct,
+            "dominant_type": self.dominant_type,
         }
 
 
@@ -407,6 +418,10 @@ class EntityConventionService:
         return out
 
     def _load_row(self, row: sqlite3.Row) -> EntityConvention:
+        proposals = json.loads(row["proposals_json"] or "[]")
+        dominant_type, distinct_tasks, dispute_count, dispute_pct = (
+            _distinct_task_tally(proposals)
+        )
         return EntityConvention(
             convention_id=row["convention_id"],
             project_id=row["project_id"],
@@ -415,11 +430,15 @@ class EntityConventionService:
             entity_type=row["entity_type"],
             status=row["status"],
             evidence_count=row["evidence_count"],
-            proposals=json.loads(row["proposals_json"] or "[]"),
+            proposals=proposals,
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             created_by=row["created_by"],
             notes=row["notes"],
+            distinct_task_count=distinct_tasks,
+            dispute_count=dispute_count,
+            dispute_pct=dispute_pct,
+            dominant_type=dominant_type,
         )
 
 
