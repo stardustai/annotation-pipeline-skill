@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -47,6 +48,75 @@ def _build_context_snippet(span: str, row_content: str | None) -> str | None:
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(row_content) else ""
     return f"{prefix}{snippet}{suffix}"
+
+
+# Source prefixes that indicate a human override (operator / HR), NOT a
+# three-party LLM consensus. These are EXCLUDED from the distinct-task tally
+# (they don't count as "三方一致" consensus votes) and instead take effect via
+# the operator-declared injection bypass.
+_OPERATOR_DECLARATION_SOURCE_PREFIXES: tuple[str, ...] = (
+    "declared:", "hr_correction:", "posterior_audit_operator",
+    "batch_operator_resolve", "batch_operator_correction",
+    "dispute_resolved_by:",
+)
+
+
+def _is_operator_source(source: Any) -> bool:
+    return isinstance(source, str) and any(
+        source.startswith(p) for p in _OPERATOR_DECLARATION_SOURCE_PREFIXES
+    )
+
+
+def _distinct_task_tally(
+    proposals: list[dict[str, Any]],
+) -> tuple[str | None, int, int, float]:
+    """Aggregate three-party-consensus proposals into a one-vote-per-task tally.
+
+    A "distinct task" is a unique ``task_id`` whose proposal came from the
+    three-party consensus path (``source="qc_consensus"``: annotator + QC +
+    prior verifier agree). Each such task contributes a SINGLE vote; that
+    task's vote is the type of its MOST RECENT consensus proposal (later
+    proposals overwrite earlier ones, so a task that changed its mind votes
+    for its final answer).
+
+    EXCLUDED from the tally:
+      - proposals with no ``task_id`` (operator declarations, dispute
+        resolutions), and
+      - proposals from operator/HR sources (see
+        ``_OPERATOR_DECLARATION_SOURCE_PREFIXES``) — those are human
+        overrides, not three-party consensus, and take effect via the
+        operator-declared injection bypass instead.
+
+    Returns ``(dominant_type, distinct_task_count, dispute_count,
+    dispute_pct)`` where:
+      - ``dominant_type`` is the plurality winner across task votes (ties
+        broken deterministically by the larger type string), or ``None``
+        when there are no consensus task votes.
+      - ``dispute_count`` is the number of consensus tasks whose vote !=
+        dominant.
+      - ``dispute_pct`` is ``dispute_count / distinct_task_count`` (0.0 when
+        there are no consensus task votes).
+    """
+    votes: dict[str, str] = {}  # task_id -> most-recent consensus type
+    for p in proposals:
+        if not isinstance(p, dict):
+            continue
+        task_id = p.get("task_id")
+        ptype = p.get("type")
+        if not task_id or not isinstance(ptype, str):
+            continue
+        if _is_operator_source(p.get("source")):
+            continue  # human override, not a three-party consensus vote
+        votes[task_id] = ptype  # later proposals overwrite → most-recent wins
+    distinct = len(votes)
+    if distinct == 0:
+        return (None, 0, 0, 0.0)
+    tally = Counter(votes.values())
+    # Plurality; deterministic tiebreak on (count, type) so equal counts
+    # resolve consistently regardless of insertion order.
+    dominant_type = max(tally.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    dispute_count = distinct - tally[dominant_type]
+    return (dominant_type, distinct, dispute_count, dispute_count / distinct)
 
 
 @dataclass(frozen=True)
