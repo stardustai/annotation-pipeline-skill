@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -357,6 +358,73 @@ class EntityConventionService:
         rows = conn.execute(q, params).fetchall()
         return [self._load_row(r) for r in rows]
 
+    def rebuild_from_accepted_tasks(
+        self,
+        *,
+        project_id: str,
+        task_ids: Iterable[str],
+        annotation_loader: Callable[[str], "dict | None"],
+    ) -> dict[str, int]:
+        """Rebuild this project's conventions from accepted task annotations.
+
+        The live ``proposals_json`` is lossy — the old ``(type, source)`` dedup
+        key suppressed cross-task votes, so the convention table cannot be
+        re-derived from itself. The recoverable source of truth is each
+        accepted task's final annotation: under the three-party (prelabel +
+        QC + arbiter) consensus model, an accepted task is a confirmed
+        datapoint for EVERY span it labels.
+
+        This method:
+          1. DELETEs all existing conventions for ``project_id``.
+          2. Replays every (span, type) decision from each task's annotation
+             as a ``qc_consensus`` proposal keyed by that task's id.
+
+        Because the dedup key is ``(source, type, task_id)``, each task
+        contributes at most one vote per (span, type), so
+        ``distinct_task_count`` accumulates exactly one vote per task.
+
+        ``annotation_loader`` maps a task_id to its parsed annotation payload
+        (pass ``HumanReviewService._latest_annotation_payload``); it returns
+        ``None`` for tasks with no loadable annotation, which are skipped.
+        The whole rebuild runs in a single transaction so a crash leaves the
+        prior table intact.
+
+        Returns a summary dict with ``tasks_seen``, ``tasks_with_spans`` and
+        ``decisions_recorded`` counts.
+        """
+        conn = self.store._conn
+        tasks_seen = 0
+        tasks_with_spans = 0
+        decisions_recorded = 0
+        with conn:
+            conn.execute(
+                "DELETE FROM entity_conventions WHERE project_id=?", (project_id,)
+            )
+            for tid in task_ids:
+                tasks_seen += 1
+                payload = annotation_loader(tid)
+                if not isinstance(payload, dict):
+                    continue
+                pairs = extract_all_span_decisions_with_row(payload)
+                if pairs:
+                    tasks_with_spans += 1
+                for span, entity_type, row_id, row_content in pairs:
+                    self.record_decision(
+                        project_id=project_id,
+                        span=span,
+                        entity_type=entity_type,
+                        source="qc_consensus",
+                        task_id=tid,
+                        row_id=row_id,
+                        row_content=row_content,
+                    )
+                    decisions_recorded += 1
+        return {
+            "tasks_seen": tasks_seen,
+            "tasks_with_spans": tasks_with_spans,
+            "decisions_recorded": decisions_recorded,
+        }
+
     # Skip conventions whose span is shorter than this (digits, single
     # letters, "CA" etc). They substring-match almost any input and pollute
     # the prompt with noise like "'1' → entities.number".
@@ -461,6 +529,61 @@ class EntityConventionService:
             dispute_pct=dispute_pct,
             dominant_type=dominant_type,
         )
+
+
+def extract_all_span_decisions_with_row(
+    payload: Any,
+) -> list[tuple[str, str, str | None, str | None]]:
+    """Return every (span, type, row_id, row_content) decision in an
+    annotation payload, deduped per ``(span_lower, type)``.
+
+    Unlike ``extract_entity_type_decisions_with_row`` (which diffs against a
+    prior annotation and emits only spans whose type CHANGED), this emits ALL
+    span/type decisions present in the annotation. It is the "full
+    derivation" extractor used by ``rebuild_from_accepted_tasks``: under the
+    three-party consensus model, an accepted task is a confirmed datapoint for
+    every span it labels, not just the ones that differed from the prelabel.
+
+    Walks BOTH ``entities`` and ``json_structures`` (the same union
+    ``iter_span_decisions`` uses). For each ``(span_lower, type)`` pair the
+    carried ``row_id``/``row_content`` is from the FIRST row where it appears,
+    used to build a context snippet. ``row_content`` falls back from the
+    row's ``"content"`` to its ``"text"`` field; ``None`` if neither is a
+    string.
+    """
+    out: list[tuple[str, str, str | None, str | None]] = []
+    if not isinstance(payload, dict):
+        return out
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return out
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = row.get("row_id") if isinstance(row.get("row_id"), str) else None
+        content = row.get("content") or row.get("text")
+        if not isinstance(content, str):
+            content = None
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        for field_key in ("entities", "json_structures"):
+            field_val = output.get(field_key)
+            if not isinstance(field_val, dict):
+                continue
+            for typ, items in field_val.items():
+                if not isinstance(items, list):
+                    continue
+                for span in items:
+                    if not (isinstance(span, str) and span.strip()):
+                        continue
+                    key = (span.strip().lower(), typ)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append((span.strip(), typ, row_id, content))
+    return out
 
 
 def extract_entity_type_decisions(
