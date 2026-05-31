@@ -235,6 +235,7 @@ class EntityConventionService:
             isinstance(last, dict)
             and last.get("type") == entity_type
             and last.get("source") == source
+            and last.get("task_id") == task_id
         ):
             return self._load_row(row)
         proposals.append(proposal)

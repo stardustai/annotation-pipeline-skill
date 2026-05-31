@@ -111,3 +111,30 @@ def test_load_row_attaches_derived_fields(store):
     assert d["dominant_type"] == "organization"
     assert d["dispute_count"] == 1
     assert d["dispute_pct"] == pytest.approx(1 / 3)
+
+
+def _proposals(store):
+    import json
+    rows = list(store._conn.execute("SELECT proposals_json FROM entity_conventions"))
+    return json.loads(rows[0][0])
+
+
+def test_same_task_same_source_type_is_noop(store):
+    svc = EntityConventionService(store)
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t1")
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t1")  # exact repeat → no-op
+    assert len(_proposals(store)) == 1
+
+
+def test_different_task_same_source_type_is_recorded(store):
+    svc = EntityConventionService(store)
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t1")
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="t2")  # new task → new vote
+    proposals = _proposals(store)
+    assert len(proposals) == 2
+    conv = svc.list_for_project("p1")[0]
+    assert conv.distinct_task_count == 2
