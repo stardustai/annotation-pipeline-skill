@@ -283,14 +283,24 @@ class EntityConventionService:
             # via dispute_pct and enforced softly at injection time.
             new_status = "active"
             new_type = dominant_type if dominant_type is not None else row["entity_type"]
+        # Stamp created_by whenever an operator/HR source acts on the
+        # convention, so operator authority is cheaply queryable from the
+        # small created_by column (the injection prefilter relies on this to
+        # avoid scanning proposals_json). Automated sources never overwrite an
+        # existing operator stamp.
+        if _is_operator_source(source):
+            new_created_by = source
+        else:
+            new_created_by = row["created_by"]
         conn.execute(
             """
             UPDATE entity_conventions
-            SET entity_type=?, status=?, evidence_count=?, proposals_json=?, updated_at=?
+            SET entity_type=?, status=?, evidence_count=?, proposals_json=?,
+                created_by=?, updated_at=?
             WHERE convention_id=?
             """,
             (new_type, new_status, new_count, json.dumps(proposals),
-             now.isoformat(), row["convention_id"]),
+             new_created_by, now.isoformat(), row["convention_id"]),
         )
         return self._load_row(conn.execute(
             "SELECT * FROM entity_conventions WHERE convention_id=?",
@@ -333,13 +343,18 @@ class EntityConventionService:
             "notes": notes,
             "at": now.isoformat(),
         })
+        # Dispute resolution is an operator action — stamp created_by so the
+        # injection prefilter recognises this convention as operator-declared
+        # without scanning proposals_json.
         conn.execute(
             """
             UPDATE entity_conventions
-            SET entity_type=?, status='active', proposals_json=?, updated_at=?
+            SET entity_type=?, status='active', proposals_json=?,
+                created_by=?, updated_at=?
             WHERE convention_id=?
             """,
-            (resolved_type, json.dumps(proposals), now.isoformat(), convention_id),
+            (resolved_type, json.dumps(proposals), f"dispute_resolved_by:{actor}",
+             now.isoformat(), convention_id),
         )
         return self._load_row(conn.execute(
             "SELECT * FROM entity_conventions WHERE convention_id=?",
@@ -445,6 +460,47 @@ class EntityConventionService:
     # is by design generic and shouldn't override the LLM's judgment.
     EXCLUDED_TYPES_FOR_INJECTION: tuple[str, ...] = ("entity",)
 
+    def _iter_injection_candidates(
+        self, project_id: str
+    ) -> list["EntityConvention"]:
+        """Return active conventions that COULD pass the injection gate.
+
+        Cheap SQL prefilter that drops the long tail of single-task
+        conventions WITHOUT parsing their proposals in Python. After a rebuild
+        from task history a project can hold tens of thousands of single-task
+        conventions, of which only a few percent can ever inject; loading them
+        all into Python on every injection is the bottleneck.
+
+        This narrows the candidate set using only the small stored columns
+        ``evidence_count`` and ``created_by`` (never the large
+        ``proposals_json`` blob, scanning which would cost as much as the
+        full load it replaces):
+          - consensus path needs >= ``INJECT_MIN_DISTINCT_TASKS`` distinct
+            task votes, which requires at least that many proposals →
+            ``evidence_count >= INJECT_MIN_DISTINCT_TASKS``; OR
+          - operator bypass → ``created_by`` carries an operator prefix. Every
+            operator action stamps ``created_by`` with its source (see
+            ``record_decision`` / ``clear_dispute``), so a convention that is
+            operator-declared is always caught here.
+
+        It is a provable SUPERSET of what the gate accepts — the caller still
+        applies the exact gate (distinct-task count, dispute_pct,
+        operator-declared, span length, type exclusion). Any false positives
+        are harmless: the Python gate filters them out. There are no false
+        negatives, so the injection decision is unchanged.
+        """
+        prefixes = self.OPERATOR_DECLARATION_SOURCE_PREFIXES
+        like_clause = " OR ".join("created_by LIKE ?" for _ in prefixes)
+        params: list[Any] = [project_id, self.INJECT_MIN_DISTINCT_TASKS]
+        params += [f"{p}%" for p in prefixes]
+        rows = self.store._conn.execute(
+            "SELECT * FROM entity_conventions "
+            "WHERE project_id=? AND status='active' "
+            f"AND (evidence_count >= ? OR {like_clause})",
+            params,
+        ).fetchall()
+        return [self._load_row(r) for r in rows]
+
     @classmethod
     def _is_operator_declared(cls, conv: "EntityConvention") -> bool:
         """True if any proposal in the convention's history came from an
@@ -489,7 +545,7 @@ class EntityConventionService:
             return []
         text_lower = text.lower()
         out: list[EntityConvention] = []
-        for conv in self.list_for_project(project_id, include_disputed=False):
+        for conv in self._iter_injection_candidates(project_id):
             if not conv.span_lower:
                 continue
             if len(conv.span_lower) < self.MIN_INJECTION_SPAN_LEN:
