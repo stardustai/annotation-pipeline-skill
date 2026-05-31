@@ -345,19 +345,17 @@ class EntityConventionService:
     # letters, "CA" etc). They substring-match almost any input and pollute
     # the prompt with noise like "'1' → entities.number".
     MIN_INJECTION_SPAN_LEN = 4
-    # Require at least this many evidence rows before injecting an
-    # auto-accumulated convention (qc_consensus only). Filters out one-off
-    # LLM choices that haven't accumulated as a pattern. Operator-declared
-    # conventions BYPASS this threshold — they're explicit policy calls,
-    # not statistical samples, and one operator click counts as the same
-    # authority as N qc_consensus events.
-    MIN_INJECTION_EVIDENCE = 5
+    # Injection gate (replaces the old evidence_count threshold). An
+    # auto-accumulated convention is injected only once enough DISTINCT tasks
+    # have voted for it AND the cross-task disagreement is low.
+    # One task = one vote (see _distinct_task_tally). Operator-declared
+    # conventions bypass both thresholds.
+    INJECT_MIN_DISTINCT_TASKS = 5
+    INJECT_MAX_DISPUTE_PCT = 0.20
     # Prefixes of ``created_by`` (or proposal source) that indicate an
-    # explicit operator/HR declaration — these bypass MIN_INJECTION_EVIDENCE.
+    # explicit operator/HR declaration — these bypass the injection gate.
     OPERATOR_DECLARATION_SOURCE_PREFIXES: tuple[str, ...] = (
-        "declared:", "hr_correction:", "posterior_audit_operator",
-        "batch_operator_resolve", "batch_operator_correction",
-        "dispute_resolved_by:",
+        _OPERATOR_DECLARATION_SOURCE_PREFIXES
     )
     # Entity types whose conventions we never inject — the catch-all type
     # is by design generic and shouldn't override the LLM's judgment.
@@ -398,10 +396,10 @@ class EntityConventionService:
             For pure-ASCII spans we use ``\\b``; for spans containing CJK
             or other non-word characters we fall back to plain substring
             since ``\\b`` doesn't apply there.
-          - The convention must have ``evidence_count >=
-            MIN_INJECTION_EVIDENCE`` so we don't inject single
-            observations — UNLESS it was operator-declared, in which case
-            one click counts as policy.
+          - The convention must have at least
+            ``INJECT_MIN_DISTINCT_TASKS`` distinct tasks voting for it AND a
+            cross-task ``dispute_pct < INJECT_MAX_DISPUTE_PCT`` — UNLESS it was
+            operator-declared, in which case one declaration counts as policy.
         """
         if not text:
             return []
@@ -412,11 +410,11 @@ class EntityConventionService:
                 continue
             if len(conv.span_lower) < self.MIN_INJECTION_SPAN_LEN:
                 continue
-            if (
-                conv.evidence_count < self.MIN_INJECTION_EVIDENCE
-                and not self._is_operator_declared(conv)
-            ):
-                continue
+            if not self._is_operator_declared(conv):
+                if conv.distinct_task_count < self.INJECT_MIN_DISTINCT_TASKS:
+                    continue
+                if conv.dispute_pct >= self.INJECT_MAX_DISPUTE_PCT:
+                    continue
             if conv.entity_type in self.EXCLUDED_TYPES_FOR_INJECTION:
                 continue
             if not _span_in_text_at_word_boundary(conv.span_lower, text_lower):

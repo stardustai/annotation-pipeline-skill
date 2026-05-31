@@ -174,3 +174,51 @@ def test_operator_declaration_still_wins(store):
     # Operator declaration is final authority: type locks to declared value.
     assert conv.status == "active"
     assert conv.entity_type == "product"
+
+
+def _seed_votes(svc, span, etype, n, project="p1", start=0):
+    for i in range(start, start + n):
+        svc.record_decision(project_id=project, span=span, entity_type=etype,
+                            source="qc_consensus", task_id=f"t{i}",
+                            row_content=f"{span} appears here {i}")
+
+
+def test_injection_requires_five_distinct_tasks(store):
+    svc = EntityConventionService(store)
+    _seed_votes(svc, "Salesforce", "organization", 4)  # 4 < 5 distinct tasks
+    assert svc.find_matches_in_text("p1", "We use Salesforce daily") == []
+    _seed_votes(svc, "Salesforce", "organization", 1, start=4)  # now 5
+    matches = svc.find_matches_in_text("p1", "We use Salesforce daily")
+    assert [c.span_original for c in matches] == ["Salesforce"]
+
+
+def test_injection_blocked_when_dispute_pct_too_high(store):
+    svc = EntityConventionService(store)
+    # 6 distinct tasks, 2 dissent → dispute_pct = 2/6 = 0.333 >= 0.20 → blocked.
+    _seed_votes(svc, "Mercury", "organization", 4)
+    _seed_votes(svc, "Mercury", "product", 2, start=4)
+    conv = svc.list_for_project("p1")[0]
+    assert conv.distinct_task_count == 6
+    assert conv.dispute_pct >= 0.20
+    assert svc.find_matches_in_text("p1", "Mercury launched a probe") == []
+
+
+def test_injection_allowed_when_dispute_pct_under_threshold(store):
+    svc = EntityConventionService(store)
+    # 10 distinct tasks, 1 dissent → dispute_pct = 0.10 < 0.20 → injected.
+    _seed_votes(svc, "Mercury", "organization", 9)
+    _seed_votes(svc, "Mercury", "product", 1, start=9)
+    conv = svc.list_for_project("p1")[0]
+    assert conv.distinct_task_count == 10
+    assert conv.dispute_pct < 0.20
+    matches = svc.find_matches_in_text("p1", "Mercury launched a probe")
+    assert [c.span_original for c in matches] == ["Mercury"]
+
+
+def test_operator_declared_bypasses_distinct_task_gate(store):
+    svc = EntityConventionService(store)
+    # One operator declaration, zero distinct task votes → still injected.
+    svc.record_decision(project_id="p1", span="Gmail", entity_type="project",
+                        source="declared:operator", row_content="Gmail filters")
+    matches = svc.find_matches_in_text("p1", "I set up a Gmail filter")
+    assert [c.span_original for c in matches] == ["Gmail"]
