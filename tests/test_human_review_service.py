@@ -382,7 +382,12 @@ def test_submit_correction_with_force_bypasses_verifier(tmp_path):
     assert svc.distribution(project_id="p", span="Apple") == {"organization": 12}
 
 
-def test_submit_correction_force_does_not_mutate_stats(tmp_path):
+def test_submit_correction_default_path_does_not_mutate_stats(tmp_path):
+    """The default (non-force) correction path is the one that previously
+    carried the now-removed stat_bumps dispatch. With an answer that AGREES
+    with the prior (so the READ gate passes without force), the correction
+    ACCEPTS the task but must NOT mutate entity_statistics — the distribution
+    only changes when an operator runs Re-check (recount)."""
     from annotation_pipeline_skill.core.models import Task
     from annotation_pipeline_skill.core.states import TaskStatus
     from annotation_pipeline_skill.services.entity_statistics_service import (
@@ -410,9 +415,11 @@ def test_submit_correction_force_does_not_mutate_stats(tmp_path):
     store.save_task(task)
 
     hr = HumanReviewService(store)
-    answer = {"rows": [{"row_index": 0, "output": {"entities": {"technology": ["Apple"]}}}]}
-    hr.submit_correction(task_id="hr-3", answer=answer, actor="op", note=None, force=True)
+    # AGREEING answer (organization matches the dominant prior) -> READ gate
+    # passes without force, so this exercises the default correction path.
+    answer = {"rows": [{"row_index": 0, "output": {"entities": {"organization": ["Apple"]}}}]}
+    result = hr.submit_correction(task_id="hr-3", answer=answer, actor="op", note=None)
 
-    # HR no longer bumps stats by HR_WEIGHT; distribution is unchanged until
-    # an operator runs Re-check (recount).
+    assert result.task.status is TaskStatus.ACCEPTED
+    # Default path no longer bumps stats; distribution unchanged until recount.
     assert svc.distribution(project_id="p", span="Apple") == {"organization": 12}
