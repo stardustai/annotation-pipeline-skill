@@ -24,6 +24,38 @@ MIN_CONTESTED_SAMPLES = 10
 MIN_RUNNER_UP_SHARE = 0.20
 
 
+def _load_latest_annotation(store, task_id: str) -> dict | None:
+    """Load a task's effective annotation payload: prefer the human-review
+    answer, else the latest annotation_result (with <think> stripped).
+    Shared by recount_span and recount_project."""
+    import json as _json
+    import re as _re
+
+    arts = store.list_artifacts(task_id)
+    hr = [a for a in arts if a.kind == "human_review_answer"]
+    if hr:
+        try:
+            outer = _json.loads((store.root / hr[-1].path).read_text(encoding="utf-8"))
+            return outer.get("answer") if isinstance(outer, dict) else None
+        except (OSError, _json.JSONDecodeError):
+            return None
+    anns = [a for a in arts if a.kind == "annotation_result"]
+    if not anns:
+        return None
+    try:
+        outer = _json.loads((store.root / anns[-1].path).read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return None
+    text = outer.get("text") if isinstance(outer, dict) else None
+    if not isinstance(text, str):
+        return None
+    text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL | _re.IGNORECASE).strip()
+    try:
+        return _json.loads(text)
+    except (ValueError, _json.JSONDecodeError):
+        return None
+
+
 @dataclass(frozen=True)
 class VerifierResult:
     """Outcome of one PriorVerifier.check() call.
@@ -106,37 +138,9 @@ class EntityStatisticsService:
             (project_id, f"%{span_lower}%", f"%{span_lower_json}%"),
         ).fetchall()
 
-        # Reuse the same "prefer human_review_answer, fall back to
-        # annotation_result" load semantics that build_posterior_audit
-        # and find_typical_text_for_span use.
-        def _load_latest(task_id: str) -> dict | None:
-            arts = self.store.list_artifacts(task_id)
-            hr = [a for a in arts if a.kind == "human_review_answer"]
-            if hr:
-                try:
-                    outer = _json.loads((self.store.root / hr[-1].path).read_text(encoding="utf-8"))
-                    return outer.get("answer") if isinstance(outer, dict) else None
-                except (OSError, _json.JSONDecodeError):
-                    return None
-            anns = [a for a in arts if a.kind == "annotation_result"]
-            if not anns:
-                return None
-            try:
-                outer = _json.loads((self.store.root / anns[-1].path).read_text(encoding="utf-8"))
-            except (OSError, _json.JSONDecodeError):
-                return None
-            text = outer.get("text") if isinstance(outer, dict) else None
-            if not isinstance(text, str):
-                return None
-            text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL | _re.IGNORECASE).strip()
-            try:
-                return _json.loads(text)
-            except (ValueError, _json.JSONDecodeError):
-                return None
-
         new_counts: dict[str, int] = {}
         for row in rows:
-            payload = _load_latest(row["task_id"])
+            payload = _load_latest_annotation(self.store, row["task_id"])
             if not isinstance(payload, dict):
                 continue
             # Find every (Instagram, type) occurrence in this task's
@@ -167,6 +171,51 @@ class EntityStatisticsService:
                     (project_id, span_lower, entity_type, count, now),
                 )
         return new_counts
+
+    def recount_project(self, *, project_id: str) -> dict[str, dict[str, int]]:
+        """Rebuild entity_statistics for the WHOLE project from ground truth.
+
+        Distinct-task semantics: each ACCEPTED task contributes +1 to
+        (span_lower, entity_type) for every DISTINCT type it tags that span
+        as (deduped within the task). No HR weighting, no lifetime
+        accumulation — the table becomes an honest projection of current
+        accepted state. Replaces ALL rows for the project atomically.
+
+        Returns {span_lower: {entity_type: count}}.
+        """
+        from annotation_pipeline_skill.core.states import TaskStatus
+
+        counts: dict[str, dict[str, int]] = {}
+        for task in self.store.list_tasks_by_pipeline(project_id):
+            if task.status is not TaskStatus.ACCEPTED:
+                continue
+            payload = _load_latest_annotation(self.store, task.task_id)
+            if not isinstance(payload, dict):
+                continue
+            seen: set[tuple[str, str]] = set()
+            for span, entity_type in iter_span_decisions(payload):
+                span_lower = span.strip().lower()
+                if not span_lower or not entity_type:
+                    continue
+                seen.add((span_lower, entity_type))
+            for span_lower, entity_type in seen:
+                counts.setdefault(span_lower, {})
+                counts[span_lower][entity_type] = counts[span_lower].get(entity_type, 0) + 1
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self.store._conn:
+            self.store._conn.execute(
+                "DELETE FROM entity_statistics WHERE project_id=?", (project_id,)
+            )
+            for span_lower, dist in counts.items():
+                for entity_type, count in dist.items():
+                    self.store._conn.execute(
+                        "INSERT INTO entity_statistics "
+                        "(project_id, span_lower, entity_type, count, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (project_id, span_lower, entity_type, count, now),
+                    )
+        return counts
 
     def distribution(self, *, project_id: str, span: str) -> dict[str, int]:
         """Return {entity_type: count} for the given span. Empty if unseen."""
