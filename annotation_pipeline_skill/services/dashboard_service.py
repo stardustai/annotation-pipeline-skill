@@ -2,7 +2,6 @@ from datetime import datetime, timedelta, timezone
 
 from annotation_pipeline_skill.core.models import Task
 from annotation_pipeline_skill.core.states import TaskStatus
-from annotation_pipeline_skill.services.feedback_service import build_feedback_consensus_summary
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 
@@ -94,14 +93,12 @@ def build_dashboard_stats(
     tasks = store.list_tasks() if project_id is None else store.list_tasks_by_pipeline(project_id)
 
     status_counts: dict[str, int] = {}
-    open_feedback_count = 0
     for task in tasks:
         status_counts[task.status.value] = status_counts.get(task.status.value, 0) + 1
-        open_feedback_count += len(
-            build_feedback_consensus_summary(store, task.task_id)["open_feedback"]
-        )
 
     task_id_set = {t.task_id for t in tasks}
+    # One grouped query instead of a per-task consensus-summary N+1.
+    open_feedback_count = store.open_feedback_count_for_tasks(list(task_id_set))
     outbox_pending_count = sum(
         1 for record in store.list_outbox()
         if record.status.value == "pending" and record.task_id in task_id_set

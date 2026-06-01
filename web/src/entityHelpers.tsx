@@ -403,6 +403,12 @@ export function OriginalTextCell({
   const [exclude, setExclude] = React.useState<string[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
+  // Each cell's example costs a ~200ms full-table LIKE scan + artifact read
+  // server-side. A 100-row table mounting them all at once fired 100 such
+  // requests and saturated the browser's connection pool (~10s to settle).
+  // Defer the fetch until the row actually scrolls into view.
+  const [visible, setVisible] = React.useState(false);
+  const ref = React.useRef<HTMLSpanElement | null>(null);
 
   function load(excludeNow: string[]) {
     setLoading(true);
@@ -437,13 +443,38 @@ export function OriginalTextCell({
       });
   }
 
+  // Reset when the cell's identity changes (row reused across pages).
   React.useEffect(() => {
     setExample(null);
     setExclude([]);
     setLoaded(false);
-    load([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setVisible(false);
   }, [projectId, storeKey, span, taskId]);
+
+  // Observe visibility; flip `visible` once (then stop observing). The 200px
+  // rootMargin pre-loads cells just before they scroll into view.
+  React.useEffect(() => {
+    if (visible) return;
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true);
+          obs.disconnect();
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [visible, projectId, storeKey, span, taskId]);
+
+  // Fetch the example the first time the cell becomes visible.
+  React.useEffect(() => {
+    if (visible && !loaded && !loading) load([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
 
   function handleRefresh() {
     const nextKey = example
@@ -456,7 +487,16 @@ export function OriginalTextCell({
     load(nextExclude);
   }
 
-  if (!loaded && loading) return <span className="runtime-muted">…</span>;
+  // Until the cell has loaded (off-screen, or fetch in flight) show a muted
+  // placeholder that carries the IntersectionObserver ref so the page renders
+  // instantly and only visible rows trigger a request.
+  if (!loaded) {
+    return (
+      <span ref={ref} className="runtime-muted" style={{ fontSize: "0.8rem" }}>
+        …
+      </span>
+    );
+  }
   if (!example) {
     // No example found this round. Could be: empty stats / transient
     // load failure / cycled past examples and reset. Surface a click-

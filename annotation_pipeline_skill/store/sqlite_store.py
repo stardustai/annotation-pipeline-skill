@@ -824,6 +824,40 @@ class SqliteStore:
                 result[r["task_id"]] = r["n"]
         return result
 
+    def open_feedback_count_for_tasks(self, task_ids) -> int:
+        """Count feedback records (across the given tasks) NOT yet covered by a
+        consensus discussion entry.
+
+        Mirrors summing ``build_feedback_consensus_summary(...)["open_feedback"]``
+        over every task, but in two task_id-indexed bulk queries per chunk
+        instead of the per-task list_feedback + list_feedback_discussions N+1
+        that made the dashboard stats bar take ~2s. A feedback row is "open"
+        when no feedback_discussions row references its feedback_id with
+        consensus=1.
+
+        Done as a set difference in Python (not a correlated NOT EXISTS):
+        feedback_discussions has no index on feedback_id, so a correlated
+        subquery degrades to an O(feedback × discussions) scan. Both queries
+        here filter by task_id, which is indexed.
+        """
+        open_count = 0
+        for chunk in _id_chunks(task_ids):
+            placeholders = ",".join("?" * len(chunk))
+            consensus_ids = {
+                r[0]
+                for r in self._conn.execute(
+                    f"SELECT DISTINCT feedback_id FROM feedback_discussions "
+                    f"WHERE consensus = 1 AND task_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            }
+            rows = self._conn.execute(
+                f"SELECT feedback_id FROM feedback_records WHERE task_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            open_count += sum(1 for r in rows if r[0] not in consensus_ids)
+        return open_count
+
     def append_feedback(self, feedback) -> None:
         d = feedback.to_dict()
         self._conn.execute(

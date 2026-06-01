@@ -1,7 +1,51 @@
-from annotation_pipeline_skill.core.models import Attempt, FeedbackRecord, OutboxRecord, Task
+from annotation_pipeline_skill.core.models import (
+    Attempt,
+    FeedbackDiscussionEntry,
+    FeedbackRecord,
+    OutboxRecord,
+    Task,
+)
 from annotation_pipeline_skill.core.states import AttemptStatus, FeedbackSeverity, FeedbackSource, OutboxKind, TaskStatus
-from annotation_pipeline_skill.services.dashboard_service import build_kanban_snapshot, build_project_summaries
+from annotation_pipeline_skill.services.dashboard_service import (
+    build_dashboard_stats,
+    build_kanban_snapshot,
+    build_project_summaries,
+)
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+
+def _feedback(task_id, feedback_id):
+    fb = FeedbackRecord.new(
+        task_id=task_id, attempt_id="a", source_stage=FeedbackSource.QC,
+        severity=FeedbackSeverity.WARNING, category="q", message="m",
+        target={}, suggested_action="annotator_rerun", created_by="qc")
+    fb.feedback_id = feedback_id
+    return fb
+
+
+def test_open_feedback_count_excludes_consensus_resolved(tmp_path):
+    # build_dashboard_stats sums per-task "open" feedback (records without a
+    # consensus discussion) via one grouped query. Pin that a consensus
+    # discussion removes its record from the open count, across two tasks.
+    store = SqliteStore.open(tmp_path)
+    for tid in ("t1", "t2"):
+        task = Task.new(task_id=tid, pipeline_id="pipe", source_ref={"kind": "jsonl"})
+        task.status = TaskStatus.HUMAN_REVIEW
+        store.save_task(task)
+    store.append_feedback(_feedback("t1", "f1"))  # open
+    store.append_feedback(_feedback("t1", "f2"))  # resolved by consensus below
+    store.append_feedback(_feedback("t2", "f3"))  # open
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t1", feedback_id="f2", role="qc", stance="agree",
+        message="ok", created_by="qc", consensus=True))
+    # A non-consensus discussion must NOT resolve its feedback.
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t2", feedback_id="f3", role="qc", stance="dispute",
+        message="no", created_by="qc", consensus=False))
+
+    assert store.open_feedback_count_for_tasks(["t1", "t2"]) == 2  # f1, f3
+    assert store.open_feedback_count_for_tasks([]) == 0
+    assert build_dashboard_stats(store, project_id="pipe")["open_feedback_count"] == 2
 
 
 def test_dashboard_snapshot_groups_tasks_into_operational_columns(tmp_path):
