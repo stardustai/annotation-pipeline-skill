@@ -8,41 +8,48 @@ from annotation_pipeline_skill.services.entity_statistics_service import (
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 
 
-def test_posterior_audit_returns_task_deviations_and_divergent_entries(tmp_path):
-    store = SqliteStore.open(tmp_path)
-    svc = EntityStatisticsService(store)
-
-    # Build prior: 12 Apple → organization (dominant, eligible)
-    for _ in range(12):
-        svc.increment(project_id="p", span="Apple", entity_type="organization")
-    # Divergent: Microsoft has 13/12/5
-    for _ in range(13):
-        svc.increment(project_id="p", span="Microsoft", entity_type="organization")
-    for _ in range(12):
-        svc.increment(project_id="p", span="Microsoft", entity_type="project")
-    for _ in range(5):
-        svc.increment(project_id="p", span="Microsoft", entity_type="technology")
-
-    # Create an accepted task whose annotation tags Apple as technology (diverges from prior).
+def _add_accepted_task(store, project_id, task_id, entities_by_type):
+    """Create one ACCEPTED task whose annotation tags the given
+    {entity_type: [spans]} in a single row. Backs entity_statistics under
+    the recount model: this task contributes +1 per distinct (span, type).
+    """
     task = Task.new(
-        task_id="t-dev", pipeline_id="p",
+        task_id=task_id, pipeline_id=project_id,
         source_ref={"kind": "jsonl", "payload": {
-            "rows": [{"row_index": 0, "input": "Apple"}],
-        }},
+            "rows": [{"row_index": 0, "input": "x"}]}},
     )
     task.status = TaskStatus.ACCEPTED
     store.save_task(task)
-    rel = "artifact_payloads/t-dev/final.json"
+    rel = f"artifact_payloads/{task_id}/final.json"
     abs_path = store.root / rel
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(json.dumps({"text": json.dumps({
-        "rows": [{"row_index": 0,
-                  "output": {"entities": {"technology": ["Apple"]}}}]
+        "rows": [{"row_index": 0, "output": {"entities": entities_by_type}}]
     })}))
     store.append_artifact(ArtifactRef.new(
-        task_id="t-dev", kind="annotation_result", path=rel,
+        task_id=task_id, kind="annotation_result", path=rel,
         content_type="application/json",
     ))
+
+
+def test_posterior_audit_returns_task_deviations_and_divergent_entries(tmp_path):
+    store = SqliteStore.open(tmp_path)
+
+    # build_posterior_audit now recounts entity_statistics from accepted
+    # tasks first, so the prior MUST be backed by real accepted tasks
+    # (bare increment seeds would be wiped by the recount).
+    # Apple: 10 accepted tasks tag it organization -> dominant org prior.
+    for i in range(10):
+        _add_accepted_task(store, "p", f"apple-org-{i}", {"organization": ["Apple"]})
+    # Microsoft: 5 org + 5 project accepted tasks -> divergent (total 10,
+    # no dominant >= 0.80, two types each >= 0.20).
+    for i in range(5):
+        _add_accepted_task(store, "p", f"ms-org-{i}", {"organization": ["Microsoft"]})
+    for i in range(5):
+        _add_accepted_task(store, "p", f"ms-proj-{i}", {"project": ["Microsoft"]})
+    # One accepted task tags Apple as technology -> diverges from the org
+    # prior (after recount: Apple = organization:10, technology:1).
+    _add_accepted_task(store, "p", "t-dev", {"technology": ["Apple"]})
 
     from annotation_pipeline_skill.interfaces.api import build_posterior_audit
     payload = build_posterior_audit(store, project_id="p")

@@ -130,6 +130,10 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
     of every ACCEPTED task (distinct-task semantics), then compare each
     task's (span, type) decisions to the freshly-recounted stats. Return
     task-level deviations and project-level contested spans.
+
+    SIDE EFFECT: this persists a full rebuild of entity_statistics for the
+    project (DELETE + INSERT via recount_project) — it is NOT a pure read.
+    Safe because the sole caller is the manual/background "Re-check" job.
     """
     from annotation_pipeline_skill.core.states import TaskStatus
     from annotation_pipeline_skill.services.entity_statistics_service import (
@@ -165,6 +169,9 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
     # auditing. This replaces the old lifetime vote-accumulator reading,
     # so divergent/low-info/deviation flags reflect current reality rather
     # than inflated historical counts.
+    # NOTE: the deviations loop below re-reads accepted-task artifacts that
+    # recount_project just scanned; the double-scan is an accepted YAGNI
+    # tradeoff for a manual/background op (not worth folding into one pass).
     svc.recount_project(project_id=project_id)
 
     # Build the operator-declared convention index. Active conventions
