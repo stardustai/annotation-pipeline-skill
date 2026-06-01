@@ -470,7 +470,6 @@ def main(argv: list[str]) -> int:
                 note=note,
                 force=True,
                 record_conventions=False,  # mechanical fix — don't pollute conventions
-                stat_bumps=[],  # don't bulk-bump stats for every span
             )
 
             print(
