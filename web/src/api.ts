@@ -31,6 +31,34 @@ function withStore(base: string, storeKey: string | null): string {
   return base.includes("?") ? `${base}&${sp}` : `${base}?${sp}`;
 }
 
+export interface KnowledgeSignal {
+  count: number;
+  latest_updated_at: string | null;
+}
+
+export interface KnowledgeSummary {
+  conventions: KnowledgeSignal;
+  statistics: KnowledgeSignal;
+}
+
+/**
+ * Cheap change-signal for the Entity Knowledge panel: a (count, latest
+ * updated_at) fingerprint per subtab. The panel polls this instead of
+ * auto-refetching the heavy paginated tables, and shows a "Refresh" hint
+ * when the fingerprint moves past the snapshot taken at load time.
+ */
+export async function fetchKnowledgeSummary(
+  projectId: string,
+  storeKey: string | null = null,
+): Promise<KnowledgeSummary> {
+  const base = `/api/knowledge-summary?project=${encodeURIComponent(projectId)}`;
+  const response = await fetch(withStore(base, storeKey));
+  if (!response.ok) {
+    throw new Error(`Knowledge summary API returned ${response.status}`);
+  }
+  return response.json() as Promise<KnowledgeSummary>;
+}
+
 export async function fetchStores(): Promise<StoresSnapshot> {
   const response = await fetch("/api/stores");
   if (!response.ok) {

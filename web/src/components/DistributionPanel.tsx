@@ -6,6 +6,7 @@ import React, { lazy, Suspense, useEffect, useMemo, useState } from "react";
 // switches to the Scatter plot sub-tab.
 const ScatterSubTab = lazy(() => import("./ScatterSubTab"));
 import { TypeStatisticsPanel } from "./TypeStatisticsPanel";
+import { RangeStepper } from "./RangeStepper";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -973,14 +974,14 @@ function RowDuplicatesSubTab({
                   ) : null}
                 </span>
               </span>
-              <input
-                type="range"
+              <RangeStepper
                 min={0.01}
                 max={0.99}
                 step={0.01}
+                decimals={2}
                 value={jaccardThreshold}
-                onChange={(e) => setJaccardThreshold(parseFloat(e.target.value))}
-                style={{ width: "120px" }}
+                onChange={setJaccardThreshold}
+                width="120px"
                 disabled={loading}
                 title={helpText}
               />

@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
 import type { EntityConvention, EntityStatsItem } from "../types";
 import { DistributionBar, OriginalTextCell, Pagination, TypePill } from "../entityHelpers";
-import { clearConvention } from "../api";
+import { clearConvention, fetchKnowledgeSummary, type KnowledgeSignal } from "../api";
+import { RangeStepper } from "./RangeStepper";
 
 const PAGE_SIZE = 100;
 
@@ -65,6 +66,18 @@ export function EntityKnowledgePanel({
   const [query, setQuery] = useState({ filter: "", minCount: 0 });
   const [page, setPage] = useState(0);
   const [unsetting, setUnsetting] = useState<string | null>(null);
+  // Spans cleared via Unset this session. We keep the row in place (greyed +
+  // struck through) instead of removing it, so the table never reflows under
+  // the operator. The marks reset on the next data (re)load.
+  const [cleared, setCleared] = useState<Set<string>>(new Set());
+  // Change-signal: `baseline` is the (count, latest_updated_at) fingerprint
+  // captured when each subtab was last loaded; `live` is the latest polled
+  // value. When they diverge for the active subtab, the background pipeline
+  // has written new conventions/stats since you loaded, so we light up the
+  // Refresh button — without auto-refetching the heavy paginated table.
+  type SigPair = { conventions: KnowledgeSignal | null; statistics: KnowledgeSignal | null };
+  const [baseline, setBaseline] = useState<SigPair>({ conventions: null, statistics: null });
+  const [live, setLive] = useState<SigPair>({ conventions: null, statistics: null });
 
   async function handleUnset(span: string | null) {
     if (!projectId || !span) return;
@@ -75,9 +88,14 @@ export function EntityKnowledgePanel({
     setError(null);
     try {
       await clearConvention(projectId, span, storeKey);
-      // The page is server-paginated, so re-fetch to backfill the row that
-      // shifts up from the next page rather than leaving a short page.
-      fetchData("conventions");
+      // Don't re-fetch and don't remove the row: either one moves the table
+      // the operator is reading. Just mark this span cleared in place; the
+      // row stays put, greyed and struck through, until the next Refresh.
+      setCleared((prev) => {
+        const next = new Set(prev);
+        next.add(span);
+        return next;
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -113,11 +131,23 @@ export function EntityKnowledgePanel({
           setConventions(d.conventions ?? []);
           setConvTotal(d.total ?? 0);
           setConvMax(Math.max(1, d.max_count ?? 0));
+          // Fresh page: cleared spans are gone server-side, drop the marks.
+          setCleared(new Set());
         } else {
           setStats(d.items ?? []);
           setStatsTotal(d.total ?? 0);
         }
         setLoadedAt((prev) => ({ ...prev, [which]: new Date() }));
+        // Snapshot the project-level fingerprint at load time so the staleness
+        // delta is filter-independent (it counts what the project gained since
+        // you loaded, regardless of the active search/min_count). Reset both
+        // baseline and live for this subtab so it reads "fresh" right away.
+        fetchKnowledgeSummary(projectId, storeKey)
+          .then((sig) => {
+            setBaseline((prev) => ({ ...prev, [which]: sig[which] }));
+            setLive((prev) => ({ ...prev, [which]: sig[which] }));
+          })
+          .catch(() => {});
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
@@ -139,6 +169,21 @@ export function EntityKnowledgePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, storeKey, subtab, page, query]);
 
+  // Poll only the cheap change-signal (NOT the heavy paginated tables) every
+  // 15s, so an operator who keeps the panel open learns the pipeline wrote new
+  // data without us re-sorting/re-paginating the table under them.
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    const poll = () => {
+      fetchKnowledgeSummary(projectId, storeKey)
+        .then((sig) => { if (!cancelled) setLive(sig); })
+        .catch(() => {});
+    };
+    const timer = setInterval(poll, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [projectId, storeKey]);
+
   if (!projectId) {
     return (
       <section className="runtime-panel" aria-label="Entity Knowledge">
@@ -153,6 +198,18 @@ export function EntityKnowledgePanel({
   // the API.
   const activeLoadedAt =
     subtab === "conventions" ? loadedAt.conventions : loadedAt.statistics;
+
+  // Stale = the live fingerprint has moved past the snapshot taken when this
+  // subtab last loaded (new rows inserted → count up; in-place edits → newer
+  // updated_at). `newCount` is the positive count delta, shown as "+N new".
+  const activeBaseline = subtab === "conventions" ? baseline.conventions : baseline.statistics;
+  const activeLive = subtab === "conventions" ? live.conventions : live.statistics;
+  const stale =
+    !!activeBaseline &&
+    !!activeLive &&
+    (activeLive.count !== activeBaseline.count ||
+      activeLive.latest_updated_at !== activeBaseline.latest_updated_at);
+  const newCount = stale && activeLive && activeBaseline ? activeLive.count - activeBaseline.count : 0;
 
   return (
     <section className="runtime-panel" aria-label="Entity Knowledge">
@@ -178,8 +235,24 @@ export function EntityKnowledgePanel({
           type="button"
           onClick={() => fetchData(subtab)}
           disabled={loading}
+          title={
+            stale
+              ? "后台已写入新数据,点击加载最新(自动每 15s 检测,不会打乱当前表格)"
+              : undefined
+          }
+          style={
+            stale
+              ? { boxShadow: "0 0 0 2px var(--accent, #2563eb)", fontWeight: 600 }
+              : undefined
+          }
         >
-          {loading ? "Loading…" : "Refresh"}
+          {loading
+            ? "Loading…"
+            : stale
+              ? newCount > 0
+                ? `Refresh · +${newCount} new`
+                : "Refresh · updated"
+              : "Refresh"}
         </button>
       </div>
 
@@ -254,14 +327,13 @@ export function EntityKnowledgePanel({
             title="Hide conventions with fewer than this many distinct accepted-task votes. The injection gate requires ≥ 5."
           >
             <span className="runtime-muted">Min tasks</span>
-            <input
-              type="range"
+            <RangeStepper
               min={0}
               max={convMax}
               step={1}
               value={Math.min(minCount, convMax)}
-              onChange={(e) => setMinCount(parseInt(e.target.value, 10))}
-              style={{ width: "160px" }}
+              onChange={setMinCount}
+              width="160px"
               disabled={!conventions}
             />
             <code style={{ fontFamily: "monospace", minWidth: "2.5rem" }}>
@@ -311,8 +383,18 @@ export function EntityKnowledgePanel({
               </tr>
             </thead>
             <tbody>
-              {conventions.map((c) => (
-                <tr key={c.convention_id} style={TR}>
+              {conventions.map((c) => {
+                const isCleared = c.span ? cleared.has(c.span) : false;
+                return (
+                <tr
+                  key={c.convention_id}
+                  style={{
+                    ...TR,
+                    ...(isCleared
+                      ? { opacity: 0.45, textDecoration: "line-through" }
+                      : null),
+                  }}
+                >
                   <td
                     style={{
                       padding: "0.4rem 0.75rem 0.4rem 0",
@@ -362,28 +444,38 @@ export function EntityKnowledgePanel({
                   >
                     {c.updated_at.replace("T", " ").slice(0, 19)}
                   </td>
-                  <td style={{ padding: "0.4rem 0.75rem" }}>
+                  <td style={{ padding: "0.4rem 0.75rem", textDecoration: "none" }}>
                     <button
                       type="button"
-                      disabled={!c.span || unsetting === c.span}
+                      disabled={!c.span || unsetting === c.span || isCleared}
                       onClick={() => handleUnset(c.span)}
-                      title="Remove this convention from the project. Future tasks won't see this rule injected. Already-modified task annotations are NOT reverted."
+                      title={
+                        isCleared
+                          ? "Cleared. It will disappear on the next Refresh."
+                          : "Remove this convention from the project. Future tasks won't see this rule injected. Already-modified task annotations are NOT reverted."
+                      }
                       style={{
                         fontSize: "0.75rem",
-                        color: c.span ? "var(--danger, #b91c1c)" : undefined,
+                        color: isCleared
+                          ? "var(--muted, #6b7280)"
+                          : c.span
+                            ? "var(--danger, #b91c1c)"
+                            : undefined,
                         background: "transparent",
                         border: "1px solid var(--border, #d1d5db)",
                         padding: "2px 8px",
                         borderRadius: "3px",
-                        cursor: c.span ? "pointer" : "not-allowed",
+                        cursor: c.span && !isCleared ? "pointer" : "not-allowed",
                         opacity: unsetting === c.span ? 0.6 : 1,
+                        textDecoration: "none",
                       }}
                     >
-                      {unsetting === c.span ? "…" : "Unset"}
+                      {unsetting === c.span ? "…" : isCleared ? "Cleared" : "Unset"}
                     </button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -1068,6 +1068,33 @@ class DashboardApi:
                 "offset": offset,
                 "max_count": max_count,
             })
+        if route == "/api/knowledge-summary":
+            # Cheap change-signal for the Entity Knowledge panel. The panel
+            # loads a paginated snapshot once and does NOT auto-poll (re-running
+            # the heavy paginated queries every few seconds would undo the
+            # pagination win and yank the table out from under an operator who's
+            # auditing it). Instead the panel polls this endpoint and, when the
+            # fingerprint moves, shows a "click Refresh" badge without touching
+            # the table. The fingerprint is (count, MAX(updated_at)) per subtab:
+            # any insert moves count, any in-place update moves the timestamp.
+            # Both queries are covered by (project_id, span_lower) indexes.
+            if not project_id:
+                return self._json_response(400, {"error": "project_required"})
+            conn = store._conn
+            conv = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(updated_at) AS latest "
+                "FROM entity_conventions WHERE project_id = ?",
+                [project_id],
+            ).fetchone()
+            stats = conn.execute(
+                "SELECT COUNT(DISTINCT span_lower) AS n, MAX(updated_at) AS latest "
+                "FROM entity_statistics WHERE project_id = ?",
+                [project_id],
+            ).fetchone()
+            return self._json_response(200, {
+                "conventions": {"count": conv["n"] or 0, "latest_updated_at": conv["latest"]},
+                "statistics": {"count": stats["n"] or 0, "latest_updated_at": stats["latest"]},
+            })
         if route == "/api/posterior-audit":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})

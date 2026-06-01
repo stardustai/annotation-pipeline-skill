@@ -8,6 +8,7 @@ import {
   NOT_ENTITY,
 } from "../entityHelpers";
 import { clearConvention } from "../api";
+import { RangeStepper } from "./RangeStepper";
 
 const PAGE_SIZE = 100;
 // Each Contested-spans row fires an OriginalTextCell fetch for its
@@ -142,6 +143,20 @@ export function PosteriorAuditPanel({
       .then((d) => { if (d) setCache(d); })
       .catch(() => {});
   }
+
+  // Poll the cheap GET every 15s so the "Re-check (stale)" badge lights up on
+  // its own while the panel is open. GET only reads the cached scan + recomputes
+  // the accepted-hash (a single indexed query, no artifact reads) — it does NOT
+  // re-run the expensive scan, which stays behind the manual Re-check button.
+  // Skip while a scan is in flight; handleCheck refreshes the cache when done.
+  useEffect(() => {
+    if (!projectId) return;
+    const timer = setInterval(() => {
+      if (!loading) reloadCache();
+    }, 15000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, storeKey, loading]);
 
   async function handleCheck() {
     if (!projectId) {
@@ -409,18 +424,15 @@ export function PosteriorAuditPanel({
               {/* Threshold slider — always visible so the operator can lower it when no rows show */}
               <div style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "0.82rem", color: "var(--muted, #6b7280)", margin: "0.3rem 0 0.5rem" }}>
                 <span>Wordfreq ≥</span>
-                <input
+                <RangeStepper
                   id="low-info-threshold"
-                  type="range"
                   min={0}
                   max={7}
                   step={0.1}
+                  decimals={1}
                   value={lowInfoThreshold}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (!isNaN(v)) setLowInfoThreshold(Math.max(0, Math.min(7, v)));
-                  }}
-                  style={{ width: "90px", cursor: "pointer", verticalAlign: "middle", accentColor: "var(--accent, #2563eb)" }}
+                  onChange={setLowInfoThreshold}
+                  width="90px"
                 />
                 <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2.2ch" }}>{lowInfoThreshold.toFixed(1)}</span>
                 {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
