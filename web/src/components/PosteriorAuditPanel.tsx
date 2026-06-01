@@ -111,7 +111,7 @@ export function PosteriorAuditPanel({
   const [saveAsConvention, setSaveAsConvention] = useState(false);
   // Low-info threshold — client-side filter over the backend's pre-scored list.
   // Backend floor is 4.0; raising this narrows the list. Lowering below 4.0
-  // requires a full Re-check (backend won't have scored those entries).
+  // requires a full Re-count (backend won't have scored those entries).
   const LOW_INFO_BACKEND_FLOOR = 4.0;
   const [lowInfoThreshold, setLowInfoThreshold] = useState(4.0);
   // Lifted from LowInfoTable so the nav bar can show count + trigger bulk
@@ -144,10 +144,10 @@ export function PosteriorAuditPanel({
       .catch(() => {});
   }
 
-  // Poll the cheap GET every 15s so the "Re-check (stale)" badge lights up on
+  // Poll the cheap GET every 15s so the "Re-count (stale)" badge lights up on
   // its own while the panel is open. GET only reads the cached scan + recomputes
   // the accepted-hash (a single indexed query, no artifact reads) — it does NOT
-  // re-run the expensive scan, which stays behind the manual Re-check button.
+  // re-run the expensive recount, which stays behind the manual Re-count button.
   // Skip while a scan is in flight; handleCheck refreshes the cache when done.
   useEffect(() => {
     if (!projectId) return;
@@ -227,11 +227,11 @@ export function PosteriorAuditPanel({
         <div>
           <h2 style={{ marginBottom: "0.25rem" }}>Posterior Audit</h2>
           <p style={{ marginTop: 0, fontSize: "0.85rem" }}>
-            Scan accepted tasks against current project statistics.
+            Recount entity statistics from accepted tasks, then scan for divergences.
             {cachedExists ? (
               <>
                 {" · "}
-                <strong>Last checked:</strong> {fmtTime(generatedAt)}
+                <strong>Last counted:</strong> {fmtTime(generatedAt)}
                 {" — "}
                 {stale ? (
                   <span style={{ color: "var(--warning, #d97706)", fontWeight: 600 }}>
@@ -260,7 +260,7 @@ export function PosteriorAuditPanel({
               : undefined
           }
         >
-          {loading ? "Checking…" : stale ? "Re-check (stale)" : cachedExists ? "Re-check" : "Check"}
+          {loading ? "Recounting…" : stale ? "Re-count (stale)" : cachedExists ? "Re-count" : "Count"}
         </button>
       </div>
 
@@ -268,7 +268,7 @@ export function PosteriorAuditPanel({
 
       {!cachedExists && !loading ? (
         <p className="runtime-muted">
-          No cached scan yet. Click <strong>Check</strong> to run the first scan.
+          No cached scan yet. Click <strong>Count</strong> to run the first recount.
         </p>
       ) : null}
 
@@ -436,7 +436,7 @@ export function PosteriorAuditPanel({
                 />
                 <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "2.2ch" }}>{lowInfoThreshold.toFixed(1)}</span>
                 {lowInfoThreshold < LOW_INFO_BACKEND_FLOOR ? (
-                  <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${LOW_INFO_BACKEND_FLOOR}. Re-check to see entries below it.`}>⚠</span>
+                  <span style={{ color: "var(--warning, #d97706)", fontSize: "0.75rem" }} title={`Backend floor is ${LOW_INFO_BACKEND_FLOOR}. Re-count to see entries below it.`}>⚠</span>
                 ) : null}
               </div>
               {(() => {
