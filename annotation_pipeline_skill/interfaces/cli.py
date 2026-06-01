@@ -1867,6 +1867,66 @@ def discover_project_stores(workspace: Path) -> dict[str, Path]:
     return result
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the given PID is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _auto_resume_schedulers(stores: dict, workspace_root: Path) -> None:
+    """On server start/reload, restart any scheduler whose owner file exists but PID is dead.
+
+    Schedulers run in their own session (start_new_session=True) so they survive
+    server --reload.  This function handles the case where the server was fully
+    stopped and restarted, or where a scheduler crashed unexpectedly.
+    """
+    import shutil
+    import subprocess
+
+    binary = shutil.which("annotation-pipeline")
+    if not binary:
+        return
+
+    for store in stores.values():
+        owner_path = store.root / "runtime" / "scheduler_owner.json"
+        if not owner_path.exists():
+            continue
+        try:
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+            pid = owner.get("pid")
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if pid and _pid_alive(pid):
+            continue  # already running, nothing to do
+
+        # Owner file exists but process is gone — restart it
+        project_root = store.root.parent
+        project_name = project_root.name
+        owner_path.unlink(missing_ok=True)  # stale — scheduler will rewrite it
+        log_path = workspace_root / f"{project_name}_runtime.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(log_path, "a") as log_f:
+                proc = subprocess.Popen(
+                    [binary, "runtime", "run", "--project-root", str(project_root)],
+                    stdout=log_f,
+                    stderr=log_f,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            print(
+                f"[serve] auto-resumed scheduler for {project_name}"
+                f" (was PID {pid}, new PID {proc.pid})",
+                flush=True,
+            )
+        except OSError as exc:
+            print(f"[serve] failed to auto-resume scheduler for {project_name}: {exc}", flush=True)
+
+
 def _start_reload_watcher(watch_dir: Path, interval: float = 1.0) -> None:
     """Background thread: restart the process when any .py file mtime changes."""
     mtimes: dict[Path, float] = {}
@@ -1906,6 +1966,7 @@ def handle_serve(args: argparse.Namespace) -> int:
     runtime_once = None
     runtime_config = None
     workspace_root = Path(args.workspace).resolve()
+    _auto_resume_schedulers(stores, workspace_root)
     try:
         profiles_path = resolve_llm_profiles_path(
             workspace_root=workspace_root,

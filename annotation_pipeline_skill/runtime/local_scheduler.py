@@ -771,6 +771,12 @@ class LocalRuntimeScheduler:
                     await self._probe_providers()
                 except Exception:  # noqa: BLE001 — never let probe failure tank observer
                     pass
+                # Skip the snapshot/heartbeat write on a shutdown tick so the
+                # heartbeat file is not re-created right before the process
+                # exits (which would leave a fresh heartbeat behind and make
+                # the health check show "healthy" for the staleness window).
+                if stop.is_set():
+                    break
                 self._write_snapshot()
                 if owns_singleton:
                     self._refresh_singleton()
@@ -894,6 +900,10 @@ class LocalRuntimeScheduler:
         finally:
             if owns_singleton:
                 self._release_singleton()
+            # Always clear the heartbeat on exit so the health check
+            # immediately shows unhealthy rather than waiting for the
+            # staleness window to expire.
+            self.store.clear_runtime_heartbeat()
         return completed
 
     def run_until_idle(self, stage_target: str = "annotation", *, max_tasks: int | None = None) -> RuntimeSnapshot:

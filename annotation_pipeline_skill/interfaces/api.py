@@ -1725,17 +1725,43 @@ class DashboardApi:
         return result
 
     def _runtime_snapshot(self, store: SqliteStore) -> RuntimeSnapshot:
+        from datetime import datetime, timezone
+
         snapshot = store.load_runtime_snapshot()
-        if snapshot is not None:
-            return snapshot
-        rebuilt = build_runtime_snapshot(store, self.runtime_config)
-        status = replace(
-            rebuilt.runtime_status,
-            healthy=False,
-            active=False,
-            errors=sorted(set([*rebuilt.runtime_status.errors, "runtime_snapshot_missing"])),
+        if snapshot is None:
+            rebuilt = build_runtime_snapshot(store, self.runtime_config)
+            status = replace(
+                rebuilt.runtime_status,
+                healthy=False,
+                active=False,
+                errors=sorted(set([*rebuilt.runtime_status.errors, "runtime_snapshot_missing"])),
+            )
+            return replace(rebuilt, runtime_status=status)
+
+        # The stored snapshot's heartbeat_at/age are frozen at write time.
+        # Re-read the live heartbeat file so a stopped scheduler (which clears
+        # the file on exit) is immediately reflected as unhealthy.
+        now = datetime.now(timezone.utc)
+        old = snapshot.runtime_status
+        errors: list[str] = []
+        heartbeat_age_seconds: int | None = None
+        live_heartbeat_at = store.load_runtime_heartbeat()  # None if file deleted
+        if live_heartbeat_at is None:
+            errors.append("heartbeat_missing")
+        else:
+            heartbeat_age_seconds = int((now - live_heartbeat_at).total_seconds())
+            stale_after = max(self.runtime_config.snapshot_interval_seconds * 2, 120)
+            if heartbeat_age_seconds > stale_after:
+                errors.append("heartbeat_stale")
+
+        fresh_status = replace(
+            old,
+            healthy=not errors,
+            heartbeat_at=live_heartbeat_at,
+            heartbeat_age_seconds=heartbeat_age_seconds,
+            errors=errors,
         )
-        return replace(rebuilt, runtime_status=status)
+        return replace(snapshot, runtime_status=fresh_status)
 
     def _runtime_run_once_response(self) -> tuple[int, dict[str, str], bytes]:
         if self.runtime_once is None:
@@ -1783,6 +1809,7 @@ class DashboardApi:
         })
 
     def _runtime_stop_response(self, store: SqliteStore) -> tuple[int, dict[str, str], bytes]:
+        import os
         import signal
 
         owner_path = store.root / "runtime" / "scheduler_owner.json"
@@ -1803,6 +1830,10 @@ class DashboardApi:
             return self._json_response(404, {"error": "process_not_found"})
         except PermissionError:
             return self._json_response(403, {"error": "permission_denied"})
+        # Clear owner file and heartbeat immediately so the next health check
+        # reflects the stopped state without waiting for the staleness window.
+        owner_path.unlink(missing_ok=True)
+        store.clear_runtime_heartbeat()
         return self._json_response(200, {"ok": True, "pid": pid})
 
     def _provider_config_response(self, store: SqliteStore) -> tuple[int, dict[str, str], bytes]:

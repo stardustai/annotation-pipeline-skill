@@ -1136,6 +1136,14 @@ class SqliteStore:
     def _runtime_snapshot_path(self) -> Path:
         return self._runtime_dir / "runtime_snapshot.json"
 
+    def clear_runtime_heartbeat(self) -> None:
+        """Delete the heartbeat file so the next health check reports unhealthy.
+
+        Called by the stop API immediately after sending SIGTERM so the UI
+        transitions to "Start" without waiting for the staleness window.
+        """
+        self._runtime_heartbeat_path.unlink(missing_ok=True)
+
     def save_runtime_heartbeat(self, heartbeat_at) -> None:
         self._runtime_heartbeat_path.write_text(
             json.dumps({"heartbeat_at": heartbeat_at.isoformat()}, sort_keys=True) + "\n",

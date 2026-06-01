@@ -148,9 +148,9 @@ export default function App() {
     setRuntimeStopping(true);
     try {
       await stopRuntime(selectedStoreKey);
-      await new Promise((r) => setTimeout(r, 1500));
-      const snap = await fetchRuntimeSnapshot(selectedStoreKey);
-      setRuntimeHealthy(snap.runtime_status.healthy);
+      // Optimistically flip to stopped immediately — the API already cleared
+      // the heartbeat file so the next poll will confirm healthy=false.
+      setRuntimeHealthy(false);
     } catch { /* ignore */ } finally {
       setRuntimeStopping(false);
     }
