@@ -122,7 +122,6 @@ class EntityStatisticsService:
         can preview the effect.
         """
         import json as _json
-        import re as _re
 
         span_strip = span.strip()
         if not span_strip:
