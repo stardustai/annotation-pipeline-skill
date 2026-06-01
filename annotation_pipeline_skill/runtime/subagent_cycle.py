@@ -932,7 +932,6 @@ class SubagentRuntime:
             # Stats++ on both paths (broad verifier-source signal).
             if self._verifier_confirmed_all_spans(task, annotation_artifact):
                 self._record_conventions_from_qc_consensus(task, annotation_artifact)
-            self._increment_entity_statistics_for_task(task, annotation_artifact, weight=1)
             self._transition(
                 task,
                 TaskStatus.ACCEPTED,
@@ -1196,35 +1195,6 @@ class SubagentRuntime:
             if r.status == "agree":
                 any_agree = True
         return any_agree
-
-    def _increment_entity_statistics_for_task(
-        self,
-        task: Task,
-        annotation_artifact: ArtifactRef,
-        *,
-        weight: int,
-    ) -> None:
-        """Increment entity_statistics for every (span, type) in the task's
-        final annotation. Best-effort — never raise to the caller.
-        """
-        from annotation_pipeline_skill.services.entity_statistics_service import (
-            EntityStatisticsService,
-            iter_span_decisions,
-        )
-        payload = self._load_annotation_payload(annotation_artifact)
-        if payload is None:
-            return
-        svc = EntityStatisticsService(self.store)
-        for span, entity_type in iter_span_decisions(payload):
-            try:
-                svc.increment(
-                    project_id=task.pipeline_id,
-                    span=span,
-                    entity_type=entity_type,
-                    weight=weight,
-                )
-            except Exception:  # noqa: BLE001
-                continue
 
     def _record_feedback_resolution(
         self,
@@ -1901,9 +1871,6 @@ class SubagentRuntime:
                                 _payload = prior_payload
                 except (KeyError, TypeError):
                     pass
-            self._increment_entity_statistics_for_task(
-                task, annotation_artifact, weight=1
-            )
             self._mark_first_arbiter_divergence_if_any(task, annotation_artifact)
             if task.metadata.get("prior_verifier_first_arbiter_divergent"):
                 # Annotator-wins ruling but still diverges from the project
@@ -2094,8 +2061,7 @@ class SubagentRuntime:
             metadata={"source": "arbiter_correction", "attempt_id": attempt_id},
         )
         self.store.append_artifact(artifact)
-        # Stats + verifier post-check on the corrected annotation that was just persisted.
-        self._increment_entity_statistics_for_task(task, artifact, weight=1)
+        # Verifier post-check on the corrected annotation that was just persisted.
         self._mark_first_arbiter_divergence_if_any(task, artifact)
         if task.metadata.get("prior_verifier_first_arbiter_divergent"):
             # Corrected annotation still diverges from the project prior.
@@ -2446,7 +2412,6 @@ class SubagentRuntime:
         if second_type == first_type:
             task.metadata["prior_verifier_action"] = "resolved_to_first"
             self._clear_divergence_flag(task)
-            self._increment_entity_statistics_for_task(task, annotation_artifact, weight=1)
             self._transition(
                 task,
                 TaskStatus.ACCEPTED,
@@ -2466,7 +2431,6 @@ class SubagentRuntime:
             )
             task.metadata["prior_verifier_action"] = "resolved_to_prior"
             self._clear_divergence_flag(task)
-            self._increment_entity_statistics_for_task(task, new_artifact, weight=1)
             self._transition(
                 task,
                 TaskStatus.ACCEPTED,

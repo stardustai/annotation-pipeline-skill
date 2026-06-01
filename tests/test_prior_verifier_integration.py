@@ -58,7 +58,7 @@ class _RecorderClient:
         )
 
 
-def test_qc_pass_with_prior_agree_accepts_and_increments_stats(tmp_path):
+def test_qc_pass_with_prior_agree_accepts_without_mutating_stats(tmp_path):
     store = SqliteStore.open(tmp_path)
     project = "p"
     _seed_prior(store, project_id=project, span="Apple",
@@ -83,9 +83,10 @@ def test_qc_pass_with_prior_agree_accepts_and_increments_stats(tmp_path):
     after = store.load_task("t-agree")
     assert after.status is TaskStatus.ACCEPTED
     svc = EntityStatisticsService(store)
-    # Original 9+1 from seed plus 1 increment from this acceptance.
+    # Acceptance no longer mutates entity_statistics — stats are a recount
+    # projection now, refreshed only via build_posterior_audit / Re-check.
     assert svc.distribution(project_id=project, span="Apple") == {
-        "organization": 10, "project": 1,
+        "organization": 9, "project": 1,
     }
 
 
@@ -147,14 +148,15 @@ def test_qc_pass_with_cold_start_accepts(tmp_path):
     assert after.status is TaskStatus.ACCEPTED
     svc = EntityStatisticsService(store)
     assert svc.distribution(project_id=project, span="Apple") == {
-        "organization": 5, "technology": 1,
+        "organization": 5,
     }
 
 
-def test_arbiter_acceptance_increments_stats(tmp_path):
+def test_arbiter_acceptance_does_not_mutate_stats(tmp_path):
     """When arbiter rules annotator-wins on a task that was QC-rejected,
-    the resulting ACCEPTED transition still increments stats so they
-    reflect every accepted decision in the project."""
+    the resulting ACCEPTED transition no longer mutates entity_statistics —
+    stats are a recount projection now, refreshed only via
+    build_posterior_audit / Re-check (recount-only model)."""
     store = SqliteStore.open(tmp_path)
     project = "p"
     # Seed a clear prior agreeing with the annotation under test.
@@ -199,8 +201,8 @@ def test_arbiter_acceptance_increments_stats(tmp_path):
     )
 
     svc = EntityStatisticsService(store)
-    # 12 from seed + 1 from the arbiter-driven acceptance.
-    assert svc.distribution(project_id=project, span="Acme") == {"organization": 13}
+    # Arbiter-driven acceptance no longer mutates stats — seed value unchanged.
+    assert svc.distribution(project_id=project, span="Acme") == {"organization": 12}
 
 
 def test_arbiter_correction_records_divergent_payload(tmp_path):
