@@ -29,6 +29,19 @@ from annotation_pipeline_skill.core.states import TaskStatus
 
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+# SQLite caps the number of host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER,
+# historically 999). Chunk large IN (...) lists to stay safely under it.
+_ID_CHUNK_SIZE = 900
+
+
+def _id_chunks(ids, size: int = _ID_CHUNK_SIZE):
+    """Yield non-empty chunks of ``ids`` (a list/iterable) for IN (...) queries."""
+    items = list(ids)
+    for start in range(0, len(items), size):
+        chunk = items[start : start + size]
+        if chunk:
+            yield chunk
+
 
 def _migrate_convention_aggregate_columns(conn: "sqlite3.Connection") -> None:
     """Idempotently add the materialized aggregate columns to an existing
@@ -773,6 +786,43 @@ class SqliteStore:
             })
             for r in rows
         ]
+
+    def attempt_cards_by_task(self, task_ids) -> dict[str, list[dict]]:
+        """Lightweight attempts for the kanban card, grouped by task_id and
+        ordered by seq. Selects only the columns the card needs (stage,
+        status, model, provider_id) and skips full Attempt hydration, so the
+        whole board loads in a couple of bulk queries instead of one
+        list_attempts() round-trip per task (the N+1 that made the board slow).
+        """
+        result: dict[str, list[dict]] = {}
+        for chunk in _id_chunks(task_ids):
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT task_id, stage, status, model, provider_id FROM attempts "
+                f"WHERE task_id IN ({placeholders}) ORDER BY task_id, seq",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                result.setdefault(r["task_id"], []).append({
+                    "stage": r["stage"], "status": r["status"],
+                    "model": r["model"], "provider_id": r["provider_id"],
+                })
+        return result
+
+    def feedback_counts_by_task(self, task_ids) -> dict[str, int]:
+        """Feedback counts grouped by task_id (only tasks with ≥1 record
+        appear). Replaces the per-task list_feedback() N+1 on the kanban."""
+        result: dict[str, int] = {}
+        for chunk in _id_chunks(task_ids):
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT task_id, COUNT(*) AS n FROM feedback_records "
+                f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                result[r["task_id"]] = r["n"]
+        return result
 
     def append_feedback(self, feedback) -> None:
         d = feedback.to_dict()

@@ -168,7 +168,13 @@ export async function fetchConventions(
   projectId: string,
   storeKey: string | null = null,
 ): Promise<EntityConvention[]> {
-  const url = withStore(`/api/conventions?project=${encodeURIComponent(projectId)}`, storeKey);
+  // full=1: the whole-project load with the proposals audit trail. The
+  // dashboard Conventions table is server-paginated via a separate path;
+  // this caller (TaskDrawer) needs every row + proposals for span lookups.
+  const url = withStore(
+    `/api/conventions?project=${encodeURIComponent(projectId)}&full=1`,
+    storeKey,
+  );
   const response = await fetch(url);
   if (!response.ok) return [];
   const data = (await response.json()) as { conventions?: EntityConvention[] };

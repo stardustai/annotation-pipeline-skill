@@ -97,6 +97,37 @@ def test_dashboard_snapshot_indexes_attempts_feedback_and_outbox_once(tmp_path):
     assert card["attempt_count"] == 3
 
 
+def test_bulk_index_methods_group_by_task_and_skip_empty(tmp_path):
+    # The kanban index is built from two grouped bulk queries instead of a
+    # per-task N+1. Pin their contract: attempts grouped + ordered by seq with
+    # only the card columns; feedback counts only for tasks that have records.
+    store = SqliteStore.open(tmp_path)
+    a = Task.new(task_id="a", pipeline_id="pipe", source_ref={"kind": "jsonl"})
+    b = Task.new(task_id="b", pipeline_id="pipe", source_ref={"kind": "jsonl"})
+    store.save_task(a)
+    store.save_task(b)
+    store.append_attempt(Attempt(attempt_id="a1", task_id="a", index=1, stage="annotation",
+                                 status=AttemptStatus.SUCCEEDED, provider_id="deepseek", model="m1"))
+    store.append_attempt(Attempt(attempt_id="a2", task_id="a", index=2, stage="qc",
+                                 status=AttemptStatus.FAILED, provider_id="glm", model="m2"))
+    store.append_feedback(FeedbackRecord.new(
+        task_id="a", attempt_id="a2", source_stage=FeedbackSource.QC,
+        severity=FeedbackSeverity.WARNING, category="q", message="m",
+        target={}, suggested_action="annotator_rerun", created_by="qc"))
+
+    attempts = store.attempt_cards_by_task(["a", "b"])
+    assert list(attempts.keys()) == ["a"]                 # b has no attempts
+    assert [x["stage"] for x in attempts["a"]] == ["annotation", "qc"]  # ordered by seq
+    assert attempts["a"][1] == {"stage": "qc", "status": "failed", "model": "m2", "provider_id": "glm"}
+
+    counts = store.feedback_counts_by_task(["a", "b"])
+    assert counts == {"a": 1}                              # b omitted (no feedback)
+
+    # Empty input must not build a degenerate "IN ()" query.
+    assert store.attempt_cards_by_task([]) == {}
+    assert store.feedback_counts_by_task([]) == {}
+
+
 def test_dashboard_snapshot_card_row_count_is_none_when_absent(tmp_path):
     store = SqliteStore.open(tmp_path)
     task = Task.new(task_id="task-no-rows", pipeline_id="pipe", source_ref={"kind": "jsonl"})

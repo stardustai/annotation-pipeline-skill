@@ -42,14 +42,27 @@ export function EntityKnowledgePanel({
   storeKey,
 }: EntityKnowledgePanelProps): React.ReactElement {
   const [subtab, setSubtab] = useState<Subtab>("conventions");
+  // For conventions, `conventions` holds only the CURRENT page of rows
+  // (the server paginates); `convTotal` is the count matching the active
+  // filter and `convMax` the project-wide max distinct_task_count (slider
+  // bound). Statistics stays fully client-side.
   const [conventions, setConventions] = useState<EntityConvention[] | null>(null);
+  const [convTotal, setConvTotal] = useState<number | null>(null);
+  const [convMax, setConvMax] = useState(1);
   const [stats, setStats] = useState<EntityStatsItem[] | null>(null);
+  const [statsTotal, setStatsTotal] = useState<number | null>(null);
   const [loadedAt, setLoadedAt] = useState<{ conventions: Date | null; statistics: Date | null }>(
     { conventions: null, statistics: null },
   );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  // Minimum distinct-task vote count for the conventions table. Drops the
+  // long tail of low-evidence rows so the table mirrors the injection gate.
+  const [minCount, setMinCount] = useState(0);
+  // Debounced copy of (filter, minCount) that actually drives server queries,
+  // so dragging the slider / typing doesn't fire a request per keystroke.
+  const [query, setQuery] = useState({ filter: "", minCount: 0 });
   const [page, setPage] = useState(0);
   const [unsetting, setUnsetting] = useState<string | null>(null);
 
@@ -62,9 +75,9 @@ export function EntityKnowledgePanel({
     setError(null);
     try {
       await clearConvention(projectId, span, storeKey);
-      setConventions((prev) =>
-        prev ? prev.filter((c) => (c.span ?? "").toLowerCase() !== span.toLowerCase()) : prev,
-      );
+      // The page is server-paginated, so re-fetch to backfill the row that
+      // shifts up from the next page rather than leaving a short page.
+      fetchData("conventions");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -76,32 +89,55 @@ export function EntityKnowledgePanel({
     if (!projectId) return;
     setLoading(true);
     setError(null);
-    const storeQ = storeKey ? `&store=${encodeURIComponent(storeKey)}` : "";
-    const url =
-      which === "conventions"
-        ? `/api/conventions?project=${encodeURIComponent(projectId)}${storeQ}`
-        : `/api/entity-statistics?project=${encodeURIComponent(projectId)}${storeQ}`;
+    const params = new URLSearchParams();
+    params.set("project", projectId);
+    if (storeKey) params.set("store", storeKey);
+    // Both subtabs are server-paginated: push limit/offset/search into SQL.
+    params.set("limit", String(PAGE_SIZE));
+    params.set("offset", String(page * PAGE_SIZE));
+    if (query.filter.trim()) params.set("q", query.filter.trim());
+    let url: string;
+    if (which === "conventions") {
+      if (query.minCount > 0) params.set("min_count", String(query.minCount));
+      url = `/api/conventions?${params.toString()}`;
+    } else {
+      url = `/api/entity-statistics?${params.toString()}`;
+    }
     fetch(url)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
       .then((d) => {
-        if (which === "conventions") setConventions(d.conventions ?? []);
-        else setStats(d.items ?? []);
+        if (which === "conventions") {
+          setConventions(d.conventions ?? []);
+          setConvTotal(d.total ?? 0);
+          setConvMax(Math.max(1, d.max_count ?? 0));
+        } else {
+          setStats(d.items ?? []);
+          setStatsTotal(d.total ?? 0);
+        }
         setLoadedAt((prev) => ({ ...prev, [which]: new Date() }));
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   }
 
+  // Debounce filter / slider into the server `query` (300ms).
+  useEffect(() => {
+    const t = setTimeout(() => setQuery({ filter, minCount }), 300);
+    return () => clearTimeout(t);
+  }, [filter, minCount]);
+
+  // Reset to first page whenever the server query or active tab changes.
+  useEffect(() => { setPage(0); }, [query, subtab]);
+
+  // Both subtabs are server-paginated: re-fetch the active one on
+  // project/store/page/query change.
   useEffect(() => {
     fetchData(subtab);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, storeKey, subtab]);
-
-  // Reset to first page whenever the filter or active tab changes.
-  useEffect(() => { setPage(0); }, [filter, subtab]);
+  }, [projectId, storeKey, subtab, page, query]);
 
   if (!projectId) {
     return (
@@ -111,24 +147,10 @@ export function EntityKnowledgePanel({
     );
   }
 
-  const filterLower = filter.trim().toLowerCase();
-  const filteredConvs = conventions
-    ? conventions.filter(
-        (c) =>
-          !filterLower ||
-          (c.span ?? "").toLowerCase().includes(filterLower) ||
-          (c.entity_type ?? "").toLowerCase().includes(filterLower),
-      )
-    : null;
-  const filteredStats = stats
-    ? stats.filter(
-        (s) =>
-          !filterLower ||
-          s.span.includes(filterLower) ||
-          Object.keys(s.distribution).some((t) => t.toLowerCase().includes(filterLower)),
-      )
-    : null;
-
+  // Both tables are filtered + paginated server-side, so `conventions` and
+  // `stats` already hold just the current page. The slider's upper bound
+  // (`convMax`) and the pager totals (`convTotal` / `statsTotal`) come from
+  // the API.
   const activeLoadedAt =
     subtab === "conventions" ? loadedAt.conventions : loadedAt.statistics;
 
@@ -169,7 +191,7 @@ export function EntityKnowledgePanel({
           type="button"
           onClick={() => setSubtab("conventions")}
         >
-          Conventions ({conventions?.length ?? "…"})
+          Conventions ({convTotal ?? "…"})
         </button>
         <button
           className={subtab === "statistics" ? "sub-tab selected" : "sub-tab"}
@@ -178,7 +200,7 @@ export function EntityKnowledgePanel({
           type="button"
           onClick={() => setSubtab("statistics")}
         >
-          Statistics ({stats?.length ?? "…"})
+          Statistics ({statsTotal ?? "…"})
         </button>
       </nav>
 
@@ -189,8 +211,9 @@ export function EntityKnowledgePanel({
           annotator+QC consensus that agreed with project statistics, plus
           HR-authored decisions. <em>Excludes arbiter-only decisions</em> to
           avoid the cascade where one LLM error reinforces itself.{" "}
-          <strong>Injection criteria</strong>: <code>evidence_count ≥ 5</code>{" "}
-          and span length <code>≥ 4</code> chars. Use the{" "}
+          <strong>Injection criteria</strong>: <code>distinct tasks ≥ 5</code>{" "}
+          (the <strong>Tasks</strong> column) and span length{" "}
+          <code>≥ 4</code> chars. Use the{" "}
           <strong>🚫 not entity</strong> type for spans that should{" "}
           <em>never</em> be tagged (stop-word style, e.g. placeholders like{" "}
           "XXX").
@@ -205,7 +228,15 @@ export function EntityKnowledgePanel({
         </div>
       )}
 
-      <div style={{ margin: "0.4rem 0" }}>
+      <div
+        style={{
+          margin: "0.4rem 0",
+          display: "flex",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: "0.75rem",
+        }}
+      >
         <input
           type="search"
           placeholder={
@@ -217,14 +248,35 @@ export function EntityKnowledgePanel({
           onChange={(e) => setFilter(e.target.value)}
           style={{ width: "min(360px, 60%)" }}
         />
-        {filter && filteredConvs && subtab === "conventions" ? (
-          <span className="runtime-muted" style={{ marginLeft: "0.75rem", fontSize: "0.85rem" }}>
-            {filteredConvs.length} of {conventions?.length ?? 0}
+        {subtab === "conventions" ? (
+          <label
+            style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.85rem" }}
+            title="Hide conventions with fewer than this many distinct accepted-task votes. The injection gate requires ≥ 5."
+          >
+            <span className="runtime-muted">Min tasks</span>
+            <input
+              type="range"
+              min={0}
+              max={convMax}
+              step={1}
+              value={Math.min(minCount, convMax)}
+              onChange={(e) => setMinCount(parseInt(e.target.value, 10))}
+              style={{ width: "160px" }}
+              disabled={!conventions}
+            />
+            <code style={{ fontFamily: "monospace", minWidth: "2.5rem" }}>
+              ≥ {minCount}
+            </code>
+          </label>
+        ) : null}
+        {(filter || minCount > 0) && convTotal != null && subtab === "conventions" ? (
+          <span className="runtime-muted" style={{ fontSize: "0.85rem" }}>
+            {convTotal} match{convTotal === 1 ? "" : "es"}
           </span>
         ) : null}
-        {filter && filteredStats && subtab === "statistics" ? (
-          <span className="runtime-muted" style={{ marginLeft: "0.75rem", fontSize: "0.85rem" }}>
-            {filteredStats.length} of {stats?.length ?? 0}
+        {filter && statsTotal != null && subtab === "statistics" ? (
+          <span className="runtime-muted" style={{ fontSize: "0.85rem" }}>
+            {statsTotal} match{statsTotal === 1 ? "" : "es"}
           </span>
         ) : null}
       </div>
@@ -232,10 +284,10 @@ export function EntityKnowledgePanel({
       {error ? <div className="notice compact">{error}</div> : null}
       {loading ? <p className="runtime-muted">Loading…</p> : null}
 
-      {!loading && subtab === "conventions" && filteredConvs ? (
+      {!loading && subtab === "conventions" && conventions ? (
         <>
         <Pagination
-          total={filteredConvs.length}
+          total={convTotal ?? 0}
           page={page}
           pageSize={PAGE_SIZE}
           onPageChange={setPage}
@@ -250,13 +302,16 @@ export function EntityKnowledgePanel({
                   Typical text
                 </th>
                 <th style={{ padding: "0.4rem 0.75rem" }}>Status</th>
+                <th style={{ padding: "0.4rem 0.75rem" }} title="Distinct accepted tasks voting for this type (injection gate keys off this)">
+                  Tasks
+                </th>
                 <th style={{ padding: "0.4rem 0.75rem" }}>Evidence</th>
                 <th style={{ padding: "0.4rem 0.75rem" }}>Updated</th>
                 <th style={{ padding: "0.4rem 0.75rem" }}>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {filteredConvs.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((c) => (
+              {conventions.map((c) => (
                 <tr key={c.convention_id} style={TR}>
                   <td
                     style={{
@@ -295,6 +350,7 @@ export function EntityKnowledgePanel({
                       {c.status}
                     </span>
                   </td>
+                  <td style={{ padding: "0.4rem 0.75rem" }}>{c.distinct_task_count ?? 0}</td>
                   <td style={{ padding: "0.4rem 0.75rem" }}>{c.evidence_count}</td>
                   <td
                     style={{
@@ -332,7 +388,7 @@ export function EntityKnowledgePanel({
           </table>
         </div>
         <Pagination
-          total={filteredConvs.length}
+          total={convTotal ?? 0}
           page={page}
           pageSize={PAGE_SIZE}
           onPageChange={setPage}
@@ -340,10 +396,10 @@ export function EntityKnowledgePanel({
         </>
       ) : null}
 
-      {!loading && subtab === "statistics" && filteredStats ? (
+      {!loading && subtab === "statistics" && stats ? (
         <>
         <Pagination
-          total={filteredStats.length}
+          total={statsTotal ?? 0}
           page={page}
           pageSize={PAGE_SIZE}
           onPageChange={setPage}
@@ -359,7 +415,7 @@ export function EntityKnowledgePanel({
               </tr>
             </thead>
             <tbody>
-              {filteredStats.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((s) => (
+              {stats.map((s) => (
                 <tr key={s.span} style={TR}>
                   <td
                     style={{
@@ -391,7 +447,7 @@ export function EntityKnowledgePanel({
           </table>
         </div>
         <Pagination
-          total={filteredStats.length}
+          total={statsTotal ?? 0}
           page={page}
           pageSize={PAGE_SIZE}
           onPageChange={setPage}

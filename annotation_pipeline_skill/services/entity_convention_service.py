@@ -383,6 +383,68 @@ class EntityConventionService:
         rows = conn.execute(q, params).fetchall()
         return [self._load_row(r) for r in rows]
 
+    def list_for_project_page(
+        self,
+        project_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        min_count: int = 0,
+        search: str | None = None,
+        include_disputed: bool = True,
+    ) -> tuple[list["EntityConvention"], int, int]:
+        """Paginated, proposals-free listing for the dashboard table.
+
+        Unlike ``list_for_project`` (which loads every row and parses each
+        row's ``proposals_json`` to derive aggregates — ~55k json.loads and a
+        ~45MB payload for a rebuilt project), this reads only the materialized
+        columns via ``_load_row_light`` and pushes pagination + filtering into
+        SQL. The table never renders the proposals audit trail, so dropping it
+        keeps the payload to a single page.
+
+        Returns ``(rows, total_matching, max_distinct_task_count)``:
+          - ``total_matching`` counts all rows passing the same filters (drives
+            the pager);
+          - ``max_distinct_task_count`` is the project-wide maximum, computed
+            independently of the active filter so the slider's upper bound is
+            stable.
+        """
+        conn = self.store._conn
+        where = ["project_id=?"]
+        params: list[Any] = [project_id]
+        if not include_disputed:
+            where.append("status='active'")
+        if min_count > 0:
+            where.append("distinct_task_count >= ?")
+            params.append(min_count)
+        term = (search or "").strip().lower()
+        if term:
+            # Escape LIKE metacharacters so a user typing % or _ filters
+            # literally rather than as wildcards.
+            esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{esc}%"
+            where.append(
+                "(span_lower LIKE ? ESCAPE '\\' OR lower(entity_type) LIKE ? ESCAPE '\\')"
+            )
+            params.extend([like, like])
+        where_sql = " AND ".join(where)
+
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM entity_conventions WHERE {where_sql}", params
+        ).fetchone()[0]
+        max_count = conn.execute(
+            "SELECT COALESCE(MAX(distinct_task_count), 0) "
+            "FROM entity_conventions WHERE project_id=?",
+            (project_id,),
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT {self._INJECT_COLUMNS} FROM entity_conventions WHERE {where_sql} "
+            "ORDER BY distinct_task_count DESC, evidence_count DESC, updated_at DESC "
+            "LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+        return [self._load_row_light(r) for r in rows], total, max_count
+
     def rebuild_from_accepted_tasks(
         self,
         *,

@@ -1025,8 +1025,49 @@ class DashboardApi:
             from annotation_pipeline_skill.services.entity_convention_service import (
                 EntityConventionService,
             )
-            convs = EntityConventionService(store).list_for_project(project_id)
-            return self._json_response(200, {"conventions": [c.to_dict() for c in convs]})
+            # full=1 restores the legacy whole-project load (parses
+            # proposals_json, ships every row). The TaskDrawer needs the
+            # proposals audit trail and looks up conventions for the current
+            # task's spans, so it opts into this heavier path. The dashboard
+            # table (default) must NOT use it.
+            if query.get("full", [""])[0] in ("1", "true"):
+                convs = EntityConventionService(store).list_for_project(project_id)
+                return self._json_response(200, {
+                    "conventions": [c.to_dict() for c in convs],
+                })
+            # Server-side pagination + filtering: a rebuilt project holds tens
+            # of thousands of conventions, so returning them all (with the full
+            # proposals audit trail) is a multi-second, ~45MB response. The
+            # table only ever shows one page and never the proposals, so push
+            # limit/offset/min_count/search into SQL and read materialized
+            # columns only (no proposals_json parse).
+            try:
+                limit = max(1, min(500, int(query.get("limit", ["100"])[0])))
+            except ValueError:
+                limit = 100
+            try:
+                offset = max(0, int(query.get("offset", ["0"])[0]))
+            except ValueError:
+                offset = 0
+            try:
+                min_count = max(0, int(query.get("min_count", ["0"])[0]))
+            except ValueError:
+                min_count = 0
+            search = query.get("q", [None])[0]
+            convs, total, max_count = EntityConventionService(store).list_for_project_page(
+                project_id,
+                limit=limit,
+                offset=offset,
+                min_count=min_count,
+                search=search,
+            )
+            return self._json_response(200, {
+                "conventions": [c.to_dict() for c in convs],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "max_count": max_count,
+            })
         if route == "/api/posterior-audit":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
@@ -1129,23 +1170,73 @@ class DashboardApi:
         if route == "/api/entity-statistics":
             if not project_id:
                 return self._json_response(400, {"error": "project_required"})
-            rows = store._conn.execute(
-                """
-                SELECT span_lower, entity_type, count, updated_at
-                FROM entity_statistics
-                WHERE project_id = ?
-                ORDER BY span_lower, count DESC
-                """,
-                (project_id,),
+            # Server-side pagination, mirroring /api/conventions. A rebuilt
+            # project holds tens of thousands of distinct spans (~6MB if shipped
+            # whole), but the table shows one page. The natural unit is the
+            # span (one row per span, aggregating its per-type counts), so we
+            # paginate at the span level: pick the page of spans first, then
+            # load only those spans' distribution rows.
+            conn = store._conn
+            try:
+                limit = max(1, min(500, int(query.get("limit", ["100"])[0])))
+            except ValueError:
+                limit = 100
+            try:
+                offset = max(0, int(query.get("offset", ["0"])[0]))
+            except ValueError:
+                offset = 0
+            term = (query.get("q", [""])[0] or "").strip().lower()
+            # Optional search: restrict to spans whose text OR any of their
+            # entity types match. Resolve the matching span set first so a
+            # type match (e.g. "organization") keeps the span's FULL
+            # distribution rather than dropping its other-type rows.
+            filter_sql = ""
+            filter_params: list = []
+            if term:
+                esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                like = f"%{esc}%"
+                filter_sql = (
+                    " AND span_lower IN (SELECT span_lower FROM entity_statistics "
+                    "WHERE project_id = ? AND (span_lower LIKE ? ESCAPE '\\' "
+                    "OR lower(entity_type) LIKE ? ESCAPE '\\'))"
+                )
+                filter_params = [project_id, like, like]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM (SELECT span_lower FROM entity_statistics "
+                f"WHERE project_id = ?{filter_sql} GROUP BY span_lower)",
+                [project_id, *filter_params],
+            ).fetchone()[0]
+            page_spans = conn.execute(
+                f"SELECT span_lower, SUM(count) AS total FROM entity_statistics "
+                f"WHERE project_id = ?{filter_sql} GROUP BY span_lower "
+                f"ORDER BY total DESC, span_lower ASC LIMIT ? OFFSET ?",
+                [project_id, *filter_params, limit, offset],
             ).fetchall()
-            spans: dict[str, dict] = {}
-            for r in rows:
-                span = r["span_lower"]
-                entry = spans.setdefault(span, {"span": span, "distribution": {}, "total": 0})
-                entry["distribution"][r["entity_type"]] = r["count"]
-                entry["total"] += r["count"]
-            items = sorted(spans.values(), key=lambda e: (-e["total"], e["span"]))
-            return self._json_response(200, {"items": items, "span_count": len(items)})
+            items: list[dict] = []
+            if page_spans:
+                names = [r["span_lower"] for r in page_spans]
+                placeholders = ",".join("?" for _ in names)
+                dist_rows = conn.execute(
+                    f"SELECT span_lower, entity_type, count FROM entity_statistics "
+                    f"WHERE project_id = ? AND span_lower IN ({placeholders})",
+                    [project_id, *names],
+                ).fetchall()
+                by_span: dict[str, dict] = {}
+                for r in dist_rows:
+                    entry = by_span.setdefault(
+                        r["span_lower"], {"span": r["span_lower"], "distribution": {}, "total": 0}
+                    )
+                    entry["distribution"][r["entity_type"]] = r["count"]
+                    entry["total"] += r["count"]
+                # Preserve the page's (total DESC, span ASC) ordering.
+                items = [by_span[name] for name in names if name in by_span]
+            return self._json_response(200, {
+                "items": items,
+                "total": total,
+                "span_count": total,
+                "limit": limit,
+                "offset": offset,
+            })
         if route == "/api/runtime":
             return self._json_response(200, self._runtime_snapshot(store).to_dict())
         if route == "/api/runtime/monitor":

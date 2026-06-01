@@ -47,7 +47,7 @@ def build_kanban_snapshot(store: SqliteStore, project_id: str | None = None, sta
     tasks = sorted(store.list_tasks(), key=lambda task: task.created_at)
     if project_id is not None:
         tasks = [task for task in tasks if task.pipeline_id == project_id]
-    index = _dashboard_index(store)
+    index = _dashboard_index(store, tasks)
     if stage_view == "operator":
         return {
             "project_id": project_id,
@@ -158,16 +158,14 @@ def build_project_summaries(store: SqliteStore) -> dict:
     }
 
 
-def _dashboard_index(store: SqliteStore) -> dict:
-    attempts_by_task: dict[str, list[dict]] = {}
-    feedback_counts: dict[str, int] = {}
-    for task in store.list_tasks():
-        attempts = store.list_attempts(task.task_id)
-        if attempts:
-            attempts_by_task[task.task_id] = [attempt.to_dict() for attempt in attempts]
-        feedback = store.list_feedback(task.task_id)
-        if feedback:
-            feedback_counts[task.task_id] = len(feedback)
+def _dashboard_index(store: SqliteStore, tasks: list[Task]) -> dict:
+    # Bulk-load only what the visible cards need, scoped to ``tasks`` (the
+    # project's tasks when a project is selected). The previous version walked
+    # the entire store calling list_attempts()/list_feedback() per task — an
+    # N+1 that made a 3.6k-task board take ~3s. Two grouped queries instead.
+    task_ids = [task.task_id for task in tasks]
+    attempts_by_task = store.attempt_cards_by_task(task_ids)
+    feedback_counts = store.feedback_counts_by_task(task_ids)
     pending_outbox_task_ids = {
         record.task_id
         for record in store.list_outbox()

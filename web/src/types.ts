@@ -333,6 +333,13 @@ export type EntityConvention = {
   entity_type: string | null;
   status: string;
   evidence_count: number;
+  // Distinct accepted tasks that voted for this convention's type (one vote
+  // per task). This is the count the injection gate keys off, not the raw
+  // evidence_count. May be absent on legacy API responses → treat as 0.
+  distinct_task_count?: number;
+  dispute_count?: number;
+  dispute_pct?: number;
+  dominant_type?: string | null;
   created_by: string;
   notes?: string | null;
   proposals?: { entity_type: string; evidence_count: number }[];
