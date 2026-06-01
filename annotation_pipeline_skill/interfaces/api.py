@@ -126,9 +126,10 @@ def _read_background_job(job_id: str) -> dict[str, Any] | None:
 
 
 def build_posterior_audit(store, *, project_id: str) -> dict:
-    """Scan every ACCEPTED task and compare its (span, type) decisions to
-    entity_statistics. Return task-level deviations and project-level
-    contested spans.
+    """Recount entity_statistics for the project from the current annotation
+    of every ACCEPTED task (distinct-task semantics), then compare each
+    task's (span, type) decisions to the freshly-recounted stats. Return
+    task-level deviations and project-level contested spans.
     """
     from annotation_pipeline_skill.core.states import TaskStatus
     from annotation_pipeline_skill.services.entity_statistics_service import (
@@ -159,6 +160,12 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
             return None
 
     svc = EntityStatisticsService(store)
+    # Re-check == re-count: rebuild entity_statistics from the current
+    # annotation of every accepted task (distinct-task semantics) BEFORE
+    # auditing. This replaces the old lifetime vote-accumulator reading,
+    # so divergent/low-info/deviation flags reflect current reality rather
+    # than inflated historical counts.
+    svc.recount_project(project_id=project_id)
 
     # Build the operator-declared convention index. Active conventions
     # (i.e., the operator has made an explicit policy call for this span)
