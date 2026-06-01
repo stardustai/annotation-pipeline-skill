@@ -929,7 +929,6 @@ class SubagentRuntime:
                 return
             # Agree or cold_start. Only the agree path contributes to
             # conventions (spec §3.2); cold_start has no prior to confirm.
-            # Stats++ on both paths (broad verifier-source signal).
             if self._verifier_confirmed_all_spans(task, annotation_artifact):
                 self._record_conventions_from_qc_consensus(task, annotation_artifact)
             self._transition(
