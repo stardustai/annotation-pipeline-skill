@@ -1,10 +1,11 @@
 """Per-project span/type frequency table used as external verifier.
 
 Distinct from ``entity_conventions`` (which holds the high-trust subset
-of decisions injected into prompts). ``entity_statistics`` accumulates
-ALL ACCEPTED decisions — annotator+QC, arbiter, HR — without filtering.
-HR decisions count with extra weight because they are the only
-ground-truth source.
+of decisions injected into prompts). ``entity_statistics`` is an honest
+distinct-task projection of ACCEPTED decisions, rebuilt on demand by
+``recount_project`` — no live per-accept accumulation. The legacy
+``scripts/bootstrap_entity_statistics.py`` backfill still applies
+``HR_WEIGHT`` when seeding from historical tasks.
 """
 from __future__ import annotations
 
@@ -19,6 +20,9 @@ from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 # them in tests and operators can override via project workflow.yaml later.
 MIN_PRIOR_SAMPLES = 10
 DOMINANCE_THRESHOLD = 0.80
+# Retained for the legacy scripts/bootstrap_entity_statistics.py backfill,
+# which still weights HR-authored historical answers. The live HR flow no
+# longer accumulates — entity_statistics is recount-only.
 HR_WEIGHT = 5
 MIN_CONTESTED_SAMPLES = 10
 MIN_RUNNER_UP_SHARE = 0.20

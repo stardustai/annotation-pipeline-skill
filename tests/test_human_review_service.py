@@ -377,7 +377,42 @@ def test_submit_correction_with_force_bypasses_verifier(tmp_path):
         task_id="hr-2", answer=answer, actor="op", note=None, force=True,
     )
     assert result.task.status is TaskStatus.ACCEPTED
-    # HR-overridden decision still updates stats with HR weight (5x).
-    assert svc.distribution(project_id="p", span="Apple") == {
-        "organization": 12, "technology": 5,
-    }
+    # HR no longer bumps stats; the prior-disagreement READ gate was bypassed
+    # by force, but the WRITE path is recount-only now. Distribution unchanged.
+    assert svc.distribution(project_id="p", span="Apple") == {"organization": 12}
+
+
+def test_submit_correction_force_does_not_mutate_stats(tmp_path):
+    from annotation_pipeline_skill.core.models import Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+    from annotation_pipeline_skill.services.entity_statistics_service import (
+        EntityStatisticsService,
+    )
+    from annotation_pipeline_skill.services.human_review_service import (
+        HumanReviewService,
+    )
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+    store = SqliteStore.open(tmp_path)
+    svc = EntityStatisticsService(store)
+    for _ in range(12):
+        svc.increment(project_id="p", span="Apple", entity_type="organization")
+
+    schema = {"type": "object", "additionalProperties": False, "required": ["rows"],
+              "properties": {"rows": {"type": "array"}}}
+    task = Task.new(
+        task_id="hr-3", pipeline_id="p",
+        source_ref={"kind": "jsonl", "payload": {
+            "rows": [{"row_index": 0, "input": "Apple is mentioned"}],
+            "annotation_guidance": {"output_schema": schema}}},
+    )
+    task.status = TaskStatus.HUMAN_REVIEW
+    store.save_task(task)
+
+    hr = HumanReviewService(store)
+    answer = {"rows": [{"row_index": 0, "output": {"entities": {"technology": ["Apple"]}}}]}
+    hr.submit_correction(task_id="hr-3", answer=answer, actor="op", note=None, force=True)
+
+    # HR no longer bumps stats by HR_WEIGHT; distribution is unchanged until
+    # an operator runs Re-check (recount).
+    assert svc.distribution(project_id="p", span="Apple") == {"organization": 12}
