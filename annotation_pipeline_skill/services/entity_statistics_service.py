@@ -114,13 +114,13 @@ class EntityStatisticsService:
         the current annotation of every ACCEPTED task in the project
         that mentions the span.
 
-        Why this exists: entity_statistics is a vote-accumulator (every
-        ACCEPTED decision +1, every HR commit +5). Over a project's
-        lifetime it accumulates inflated historical counts that don't
-        match current task state — especially after bulk Apply-to-all
-        sweeps. Recounting after a sweep gives an honest "how many
-        ACCEPTED tasks currently tag this span as what" distribution,
-        so contested-span classification reflects reality.
+        Why this exists: entity_statistics is a distinct-task projection
+        that must mirror current ACCEPTED state, but legacy data (and
+        bulk Apply-to-all sweeps that rewrite task annotations) can leave
+        a single span's rows out of sync. Recounting a span gives an
+        honest "how many ACCEPTED tasks currently tag this span as what"
+        distribution, so contested-span classification reflects reality.
+        (Use recount_project to rebuild the whole project at once.)
 
         Returns the new distribution (entity_type → count) so callers
         can preview the effect.
