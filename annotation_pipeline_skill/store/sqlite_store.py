@@ -88,10 +88,12 @@ CREATE TABLE IF NOT EXISTS entity_conventions (
     updated_at     TEXT NOT NULL,
     created_by     TEXT NOT NULL,
     notes          TEXT,
-    -- Materialized aggregates of proposals_json, maintained on every write
-    -- (record_decision / clear_dispute) so the injection gate can be
-    -- evaluated in SQL without parsing the JSON blob per row. proposals_json
-    -- stays the source of truth; these are a write-maintained cache.
+    -- Materialized distinct-task aggregates so the injection gate can be
+    -- evaluated in SQL without parsing the JSON blob per row. Recount-only:
+    -- maintained by EntityConventionService.recount_project (from current
+    -- accepted-task annotations), NOT by record_decision / clear_dispute.
+    -- After a recount they intentionally diverge from proposals_json, which
+    -- is kept only as a historical audit trail.
     distinct_task_count INTEGER NOT NULL DEFAULT 0,
     dispute_count       INTEGER NOT NULL DEFAULT 0,
     dispute_pct         REAL NOT NULL DEFAULT 0.0,

@@ -13,6 +13,16 @@ becomes the current type and disagreement is tracked numerically as
 dispute_pct (enforced softly at injection time). Only an operator can set
 'disputed' status, and only an operator declaration / clear_dispute can
 change an operator-locked type.
+
+Recount-only model: the empirical columns (entity_type for auto conventions,
+distinct_task_count, dispute_count, dispute_pct, dominant_type) are maintained
+SOLELY by ``recount_project`` — recomputed from the current annotation of every
+agreement-accepted task (arbiter overrides excluded). ``record_decision`` and
+``clear_dispute`` only append proposals (audit trail), bump evidence_count, and
+apply OPERATOR declarations (which take effect immediately via the created_by
+injection bypass). So an auto convention first seen mid-run does not inject
+until the next recount; operator declarations are unaffected. proposals_json is
+a historical trail that intentionally diverges from the columns after a recount.
 """
 
 from __future__ import annotations
@@ -697,8 +707,9 @@ class EntityConventionService:
         of single-task conventions, of which only a few percent can ever
         inject. Rather than load and JSON-parse every row's ``proposals_json``
         in Python (the old bottleneck), the distinct-task / dispute aggregates
-        are stored as columns (maintained on write by ``record_decision`` /
-        ``clear_dispute``) so the gate is a plain indexed predicate:
+        are stored as columns (recount-only: maintained by ``recount_project``,
+        NOT by ``record_decision`` / ``clear_dispute``) so the gate is a plain
+        indexed predicate:
 
           - consensus path: ``distinct_task_count >= INJECT_MIN_DISTINCT_TASKS
             AND dispute_pct < INJECT_MAX_DISPUTE_PCT`` (uses idx_conv_inject);
@@ -810,10 +821,10 @@ class EntityConventionService:
     def _load_row(self, row: sqlite3.Row) -> EntityConvention:
         # Aggregates come from the materialized columns (the same source
         # ``_load_row_light`` reads), NOT recomputed from ``proposals_json``.
-        # ``record_decision``/``clear_dispute`` keep the columns in sync with
-        # the proposals tally, so this is behavior-preserving for those paths;
-        # ``recount_project`` deliberately diverges (it writes columns without
-        # rebuilding proposals_json), and that recount must surface here.
+        # Recount-only: the columns are maintained by ``recount_project``;
+        # ``record_decision``/``clear_dispute`` no longer touch them (they only
+        # append proposals + apply operator declarations). So the columns track
+        # the last recount, and ``proposals_json`` is just a historical trail.
         proposals = json.loads(row["proposals_json"] or "[]")
         return EntityConvention(
             convention_id=row["convention_id"],
