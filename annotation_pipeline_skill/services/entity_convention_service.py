@@ -512,6 +512,120 @@ class EntityConventionService:
             "decisions_recorded": decisions_recorded,
         }
 
+    def recount_project(self, *, project_id: str) -> dict[str, int]:
+        """Recompute each convention's empirical fields from the CURRENT
+        annotation of every ACCEPTED task — the convention analog of
+        ``EntityStatisticsService.recount_project``.
+
+        Vote model: all ACCEPTED tasks (arbiter included), ONE vote per task
+        per span. A task tagging a span under multiple types contributes a
+        single deterministic vote (``max(types)``) so intra-task multi-typing
+        does not inflate ``dispute_pct`` (the 0.20 injection threshold).
+
+        Operator/HR-locked conventions (``created_by`` carries an operator
+        prefix, or ``status='disputed'``) keep their ``entity_type`` and their
+        injection bypass — only their descriptive stats are refreshed so the
+        dashboard can surface operator-vs-data conflicts. All other
+        conventions get ``entity_type`` set to the empirical dominant.
+
+        Writes ONLY the materialized columns that drive injection
+        (``entity_type``, ``dominant_type``, ``distinct_task_count``,
+        ``dispute_count``, ``dispute_pct``). ``proposals_json`` is left as a
+        historical audit trail (no behavioral path reads its recomputed
+        aggregates; rebuilding it would be O(votes^2)). No rows are created
+        or deleted — saturation cleanup is out of scope.
+
+        Returns a summary dict with ``conventions_seen``, ``recomputed``,
+        ``operator_preserved`` and ``zeroed`` counts.
+
+        NOTE: the live ``record_decision`` path also maintains these columns,
+        but from a DIFFERENT population — its ``_distinct_task_tally`` counts
+        only ``qc_consensus`` proposals in ``proposals_json``, whereas this
+        recount counts ALL accepted tasks (arbiter included), one vote per
+        task. A later ``record_decision`` on a span therefore re-derives that
+        span's columns from proposals and can overwrite a recount result;
+        treat recount as a periodic correction, not a permanent lock.
+
+        Summary keys: ``recomputed`` + ``operator_preserved`` partition every
+        convention seen; ``zeroed`` is an OVERLAPPING subset (rows whose span
+        has no current accepted votes, regardless of operator lock).
+        """
+        from annotation_pipeline_skill.core.states import TaskStatus
+        from annotation_pipeline_skill.services.entity_statistics_service import (
+            _load_latest_annotation,
+            iter_span_decisions,
+        )
+
+        # Pass 1: one vote per task per span from current accepted annotations.
+        votes: dict[str, dict[str, str]] = {}  # span_lower -> {task_id: type}
+        for task in self.store.list_tasks_by_pipeline(project_id):
+            if task.status is not TaskStatus.ACCEPTED:
+                continue
+            payload = _load_latest_annotation(self.store, task.task_id)
+            if not isinstance(payload, dict):
+                continue
+            per_span: dict[str, set[str]] = {}
+            for span, entity_type in iter_span_decisions(payload):
+                span_lower = span.strip().lower()
+                if not span_lower or not entity_type:
+                    continue
+                per_span.setdefault(span_lower, set()).add(entity_type)
+            for span_lower, types in per_span.items():
+                votes.setdefault(span_lower, {})[task.task_id] = max(types)
+
+        prefixes = self.OPERATOR_DECLARATION_SOURCE_PREFIXES
+        now = datetime.now(timezone.utc).isoformat()
+        conventions_seen = recomputed = operator_preserved = zeroed = 0
+        conn = self.store._conn
+        rows = conn.execute(
+            "SELECT convention_id, span_lower, entity_type, created_by, status "
+            "FROM entity_conventions WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for row in rows:
+                conventions_seen += 1
+                task_votes = votes.get(row["span_lower"], {})
+                distinct = len(task_votes)
+                if distinct:
+                    tally = Counter(task_votes.values())
+                    dominant = max(tally.items(), key=lambda kv: (kv[1], kv[0]))[0]
+                    dispute_ct = distinct - tally[dominant]
+                    dispute_pct = dispute_ct / distinct
+                else:
+                    dominant, dispute_ct, dispute_pct = None, 0, 0.0
+                    zeroed += 1
+                created_by = row["created_by"] or ""
+                operator_locked = (
+                    any(created_by.startswith(p) for p in prefixes)
+                    or row["status"] == "disputed"
+                )
+                if operator_locked:
+                    new_type = row["entity_type"]
+                    operator_preserved += 1
+                else:
+                    new_type = dominant if dominant is not None else row["entity_type"]
+                    recomputed += 1
+                conn.execute(
+                    "UPDATE entity_conventions "
+                    "SET entity_type=?, dominant_type=?, distinct_task_count=?, "
+                    "    dispute_count=?, dispute_pct=?, updated_at=? "
+                    "WHERE convention_id=?",
+                    (new_type, dominant, distinct, dispute_ct, dispute_pct, now,
+                     row["convention_id"]),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return {
+            "conventions_seen": conventions_seen,
+            "recomputed": recomputed,
+            "operator_preserved": operator_preserved,
+            "zeroed": zeroed,
+        }
+
     # Skip conventions whose span is shorter than this (digits, single
     # letters, "CA" etc). They substring-match almost any input and pollute
     # the prompt with noise like "'1' → entities.number".
@@ -661,10 +775,13 @@ class EntityConventionService:
         return out
 
     def _load_row(self, row: sqlite3.Row) -> EntityConvention:
+        # Aggregates come from the materialized columns (the same source
+        # ``_load_row_light`` reads), NOT recomputed from ``proposals_json``.
+        # ``record_decision``/``clear_dispute`` keep the columns in sync with
+        # the proposals tally, so this is behavior-preserving for those paths;
+        # ``recount_project`` deliberately diverges (it writes columns without
+        # rebuilding proposals_json), and that recount must surface here.
         proposals = json.loads(row["proposals_json"] or "[]")
-        dominant_type, distinct_tasks, dispute_count, dispute_pct = (
-            _distinct_task_tally(proposals)
-        )
         return EntityConvention(
             convention_id=row["convention_id"],
             project_id=row["project_id"],
@@ -678,10 +795,10 @@ class EntityConventionService:
             updated_at=datetime.fromisoformat(row["updated_at"]),
             created_by=row["created_by"],
             notes=row["notes"],
-            distinct_task_count=distinct_tasks,
-            dispute_count=dispute_count,
-            dispute_pct=dispute_pct,
-            dominant_type=dominant_type,
+            distinct_task_count=row["distinct_task_count"],
+            dispute_count=row["dispute_count"],
+            dispute_pct=row["dispute_pct"],
+            dominant_type=row["dominant_type"],
         )
 
 
