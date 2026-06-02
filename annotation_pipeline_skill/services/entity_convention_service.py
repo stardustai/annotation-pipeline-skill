@@ -138,9 +138,12 @@ class EntityConvention:
     updated_at: datetime
     created_by: str
     notes: str | None = None
-    # Derived from ``proposals`` (one vote per distinct task). Not stored as
-    # columns — computed in ``_load_row`` so ``proposals_json`` stays the
-    # single source of truth.
+    # Materialized columns (one vote per distinct task). Maintained on write by
+    # ``record_decision``/``clear_dispute`` (derived from ``proposals_json``)
+    # and rewritten in bulk by ``recount_project`` (derived from current
+    # accepted annotations). ``_load_row`` reads them straight from the columns
+    # — after a recount they intentionally diverge from ``proposals_json``,
+    # which is kept only as a historical audit trail.
     distinct_task_count: int = 0
     dispute_count: int = 0
     dispute_pct: float = 0.0
