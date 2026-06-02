@@ -117,3 +117,35 @@ def test_build_posterior_audit_recounts_before_auditing(tmp_path):
     # reads the fresh distribution): with all 10 tasks tagging Apple as
     # organization, none deviates from the now-honest consensus.
     assert all(d["span"].lower() != "apple" for d in result["task_deviations"])
+
+
+def test_build_posterior_audit_recounts_conventions(tmp_path):
+    """build_posterior_audit recounts conventions before auditing: a
+    convention frozen at the wrong type is corrected from current accepted
+    annotations, while an operator lock is preserved."""
+    from annotation_pipeline_skill.interfaces.api import build_posterior_audit
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        EntityConventionService,
+    )
+
+    store = SqliteStore.open(tmp_path)
+    convs = EntityConventionService(store)
+    # Frozen-wrong auto convention: says 'project'.
+    for i in range(3):
+        convs.record_decision(project_id="p", span="vue", entity_type="project",
+                             source="qc_consensus", task_id=f"old-{i}")
+    # Operator-locked convention: says 'product'.
+    convs.record_decision(project_id="p", span="edge", entity_type="product",
+                        source="declared:op-1", task_id=None)
+    # Current reality.
+    for i in range(11):
+        _add_accepted_task(store, "p", f"vue-{i}", {"technology": ["vue"]})
+    for i in range(8):
+        _add_accepted_task(store, "p", f"edge-{i}", {"technology": ["edge"]})
+
+    build_posterior_audit(store, project_id="p")
+
+    by_span = {c.span_lower: c for c in convs.list_for_project("p")}
+    assert by_span["vue"].entity_type == "technology"   # corrected
+    assert by_span["edge"].entity_type == "product"     # lock preserved
+    assert by_span["edge"].dominant_type == "technology"  # stats refreshed

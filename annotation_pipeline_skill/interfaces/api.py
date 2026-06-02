@@ -174,6 +174,17 @@ def build_posterior_audit(store, *, project_id: str) -> dict:
     # tradeoff for a manual/background op (not worth folding into one pass).
     svc.recount_project(project_id=project_id)
 
+    # Conventions are recount-only too: rebuild each convention's empirical
+    # fields from the same current accepted annotations BEFORE we read the
+    # convention_index below, so a frozen-wrong convention (e.g. vue->project
+    # while every accepted task now tags it technology) is corrected and the
+    # audit reflects current policy. Operator/HR locks are preserved inside
+    # recount_project. SIDE EFFECT: persists column updates to entity_conventions.
+    from annotation_pipeline_skill.services.entity_convention_service import (
+        EntityConventionService,
+    )
+    EntityConventionService(store).recount_project(project_id=project_id)
+
     # Build the operator-declared convention index. Active conventions
     # (i.e., the operator has made an explicit policy call for this span)
     # override the empirical prior — they should suppress deviation /
