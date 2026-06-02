@@ -372,22 +372,19 @@ class EntityConventionService:
             "notes": notes,
             "at": now.isoformat(),
         })
-        dominant_type, distinct_ct, dispute_ct, dispute_pct = _distinct_task_tally(proposals)
-        # Dispute resolution is an operator action — stamp created_by so the
-        # injection gate recognises this convention as operator-declared
-        # without scanning proposals_json.
+        # Recount-only: clear_dispute resolves the operator dispute (type +
+        # status + created_by stamp so the injection gate recognises this as
+        # operator-declared) but does NOT recompute the empirical columns —
+        # recount_project owns those.
         conn.execute(
             """
             UPDATE entity_conventions
             SET entity_type=?, status='active', proposals_json=?,
-                created_by=?, updated_at=?,
-                distinct_task_count=?, dispute_count=?, dispute_pct=?, dominant_type=?
+                created_by=?, updated_at=?
             WHERE convention_id=?
             """,
             (resolved_type, json.dumps(proposals), f"dispute_resolved_by:{actor}",
-             now.isoformat(),
-             distinct_ct, dispute_ct, dispute_pct, dominant_type,
-             convention_id),
+             now.isoformat(), convention_id),
         )
         return self._load_row(conn.execute(
             "SELECT * FROM entity_conventions WHERE convention_id=?",

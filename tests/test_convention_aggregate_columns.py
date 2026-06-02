@@ -95,18 +95,24 @@ def test_recount_populates_columns_to_match_tally(store):
     assert row["dominant_type"] == dom == "technology"
 
 
-def test_clear_dispute_refreshes_columns(store):
+def test_clear_dispute_sets_type_without_maintaining_columns(store):
+    """Recount-only: clear_dispute resolves the operator dispute (type + status
+    + created_by stamp) but does NOT recompute the empirical columns — those
+    stay at their pre-call value until recount_project runs."""
     svc = EntityConventionService(store)
     conv = svc.record_decision(project_id="p", span="Stripe", entity_type="technology",
                               source="qc_consensus", task_id="t1")
-    svc.clear_dispute(convention_id=conv.convention_id, resolved_type="organization",
-                     actor="alice")
-    row = _columns(store, "stripe")
-    proposals = json.loads(row["proposals_json"])
-    dom, dist, disp, pct = _distinct_task_tally(proposals)
-    assert row["distinct_task_count"] == dist
-    assert row["dispute_count"] == disp
-    assert row["dominant_type"] == dom
+    svc.store._conn.execute(
+        "UPDATE entity_conventions SET status='disputed' WHERE convention_id=?",
+        (conv.convention_id,))
+    resolved = svc.clear_dispute(convention_id=conv.convention_id,
+                                 resolved_type="organization", actor="alice")
+    assert resolved.status == "active"
+    assert resolved.entity_type == "organization"
+    assert resolved.created_by.startswith("dispute_resolved_by:")
+    # Empirical columns unchanged (still the insert's zeroed values).
+    assert resolved.distinct_task_count == 0
+    assert resolved.dominant_type is None
 
 
 def test_migration_is_idempotent(tmp_path):
