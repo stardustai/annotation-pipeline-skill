@@ -21,12 +21,38 @@ def store(tmp_path):
     yield SqliteStore.open(tmp_path)
 
 
+def _accept(store, task_id, span, etype, project):
+    """ACCEPTED task tagging ``span`` as ``etype`` — recount-only backing."""
+    import json
+
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    task = Task.new(task_id=task_id, pipeline_id=project,
+                    source_ref={"kind": "jsonl", "payload": {
+                        "rows": [{"row_index": 0, "input": span}]}})
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    rel = f"artifact_payloads/{task_id}/final.json"
+    ap = store.root / rel
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    ap.write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": {etype: [span]}}}]})}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel,
+        content_type="application/json"))
+
+
 def _seed_eligible(svc, project_id, span, entity_type, n_tasks):
+    """Record qc_consensus proposals AND back each with an ACCEPTED task; the
+    caller runs svc.recount_project(project_id) to populate the columns
+    (recount-only model)."""
     for i in range(n_tasks):
         svc.record_decision(
             project_id=project_id, span=span, entity_type=entity_type,
             source="qc_consensus", task_id=f"{span}_t{i}",
         )
+        _accept(svc.store, f"{span}_t{i}", span, entity_type, project_id)
 
 
 def test_prefilter_drops_singletons_but_keeps_eligible(store):
@@ -39,6 +65,7 @@ def test_prefilter_drops_singletons_but_keeps_eligible(store):
             project_id="p", span=f"longtail{i}", entity_type="technology",
             source="qc_consensus", task_id=f"solo_{i}",
         )
+    svc.recount_project(project_id="p")
     candidates = svc._iter_injection_candidates("p")
     spans = {c.span_lower for c in candidates}
     assert "android" in spans
@@ -102,6 +129,7 @@ def test_prefilter_matches_full_scan_injection_result(store):
             project_id="p", span=f"noise{i}word", entity_type="technology",
             source="qc_consensus", task_id=f"n_{i}",
         )
+    svc.recount_project(project_id="p")
     text = "Android and Google and Equifax and noise3word appear here"
 
     # Brute-force expected: apply the same gate over the FULL list.

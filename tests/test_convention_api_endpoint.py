@@ -22,11 +22,36 @@ def api(tmp_path):
     yield DashboardApi(SqliteStore.open(tmp_path))
 
 
+def _accept(store, task_id, span, etype, project):
+    """ACCEPTED task tagging ``span`` as ``etype`` — recount-only backing."""
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    task = Task.new(task_id=task_id, pipeline_id=project,
+                    source_ref={"kind": "jsonl", "payload": {
+                        "rows": [{"row_index": 0, "input": span}]}})
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    rel = f"artifact_payloads/{task_id}/final.json"
+    ap = store.root / rel
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    ap.write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": {etype: [span]}}}]})}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel,
+        content_type="application/json"))
+
+
 def _seed(api, span, n, project_id="p"):
     svc = EntityConventionService(api.store)
     for i in range(n):
         svc.record_decision(project_id=project_id, span=span, entity_type="technology",
                              source="qc_consensus", task_id=f"{span}_t{i}")
+        _accept(api.store, f"{span}_t{i}", span, "technology", project_id)
+
+
+def _recount(api, project_id="p"):
+    EntityConventionService(api.store).recount_project(project_id=project_id)
 
 
 def _get(api, qs):
@@ -56,6 +81,7 @@ def test_default_mode_is_paginated_and_proposals_free(api):
 def test_default_mode_min_count_and_search(api):
     _seed(api, "Android", 6)
     _seed(api, "Solo", 1)
+    _recount(api)
     _, by_min = _get(api, "project=p&min_count=5")
     assert by_min["total"] == 1 and by_min["conventions"][0]["span"] == "Android"
     _, by_q = _get(api, "project=p&q=sol")
@@ -66,6 +92,7 @@ def test_full_mode_returns_all_rows_with_proposals(api):
     for i in range(25):
         _seed(api, f"span{i:02d}", 1)
     _seed(api, "Android", 6)
+    _recount(api)
     status, payload = _get(api, "project=p&full=1")
     assert status == 200
     # No pagination metadata, no truncation: every convention is returned.
