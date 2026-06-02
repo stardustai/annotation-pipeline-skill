@@ -191,3 +191,47 @@ def test_recount_includes_hr_final_even_if_arbiter_touched(tmp_path):
     conv = [c for c in svc.list_for_project("p") if c.span_lower == "spark"][0]
     assert conv.distinct_task_count == 1
     assert conv.dominant_type == "technology"   # HR-final answer counted
+
+
+def test_record_decision_does_not_maintain_empirical_columns(tmp_path):
+    """Recount-only: an AUTO (qc_consensus) record_decision appends a proposal
+    and bumps evidence_count, but does NOT write the empirical columns or
+    auto-derive entity_type. Those stay zeroed until recount_project runs."""
+    store = SqliteStore.open(tmp_path)
+    svc = EntityConventionService(store)
+
+    c = svc.record_decision(project_id="p", span="kafka", entity_type="technology",
+                            source="qc_consensus", task_id="t1")
+    assert c.evidence_count == 1
+    assert c.distinct_task_count == 0
+    assert c.dominant_type is None
+    assert c.dispute_pct == 0.0
+
+    c = svc.record_decision(project_id="p", span="kafka", entity_type="project",
+                            source="qc_consensus", task_id="t2")
+    assert c.evidence_count == 2            # proposals still tracked
+    assert c.entity_type == "technology"    # unchanged (NOT re-derived to plurality)
+    assert c.distinct_task_count == 0       # still not maintained here
+    assert c.dominant_type is None
+
+    c = svc.record_decision(project_id="p", span="kafka", entity_type="product",
+                            source="declared:op-9", task_id=None)
+    assert c.entity_type == "product"       # operator declaration takes effect
+    assert c.created_by.startswith("declared:")
+
+
+def test_record_decision_then_recount_populates_columns(tmp_path):
+    """After auto proposals (which don't maintain columns), recount_project is
+    what makes the convention injectable."""
+    store = SqliteStore.open(tmp_path)
+    svc = EntityConventionService(store)
+    for i in range(5):
+        svc.record_decision(project_id="p", span="kafka", entity_type="technology",
+                            source="qc_consensus", task_id=f"seed-{i}")
+        _add_accepted_task(store, "p", f"kafka-{i}", {"technology": ["kafka"]})
+    # Before recount: not injectable (columns zeroed).
+    assert svc.find_matches_in_text("p", "we run kafka here") == []
+    # After recount: injectable.
+    svc.recount_project(project_id="p")
+    matches = svc.find_matches_in_text("p", "we run kafka here")
+    assert any(m.span_lower == "kafka" and m.entity_type == "technology" for m in matches)

@@ -16,6 +16,30 @@ def _prop(task_id, ptype, source="qc_consensus"):
     return {"type": ptype, "source": source, "task_id": task_id}
 
 
+def _accept(store, task_id, span, etype, project="p1"):
+    """Create one ACCEPTED task whose annotation tags ``span`` as ``etype``.
+    Recount-only: convention columns are populated by recount_project from
+    these accepted-task annotations, not by record_decision."""
+    import json
+
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    task = Task.new(task_id=task_id, pipeline_id=project,
+                    source_ref={"kind": "jsonl", "payload": {
+                        "rows": [{"row_index": 0, "input": span}]}})
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    rel = f"artifact_payloads/{task_id}/final.json"
+    ap = store.root / rel
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    ap.write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": {etype: [span]}}}]})}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel,
+        content_type="application/json"))
+
+
 def test_tally_counts_one_vote_per_distinct_task():
     proposals = [
         _prop("t1", "technology"),
@@ -101,6 +125,12 @@ def test_load_row_attaches_derived_fields(store):
         project_id="p1", span="Apple", entity_type="product",
         source="qc_consensus:c", task_id="t3",
     )
+    # Recount-only: back the votes with accepted tasks and recount so the
+    # materialized columns reflect them.
+    _accept(store, "t1", "Apple", "organization")
+    _accept(store, "t2", "Apple", "organization")
+    _accept(store, "t3", "Apple", "product")
+    svc.recount_project(project_id="p1")
     conv = svc.list_for_project("p1")[0]
     assert conv.distinct_task_count == 3
     assert conv.dominant_type == "organization"
@@ -136,6 +166,9 @@ def test_different_task_same_source_type_is_recorded(store):
                         source="qc_consensus", task_id="t2")  # new task → new vote
     proposals = _proposals(store)
     assert len(proposals) == 2
+    _accept(store, "t1", "Apple", "organization")
+    _accept(store, "t2", "Apple", "organization")
+    svc.recount_project(project_id="p1")
     conv = svc.list_for_project("p1")[0]
     assert conv.distinct_task_count == 2
 
@@ -147,8 +180,14 @@ def test_conflict_does_not_flip_to_disputed_soft_model(store):
                         source="qc_consensus", task_id="t1")
     svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
                         source="qc_consensus", task_id="t2")
-    conv = svc.record_decision(project_id="p1", span="Apple", entity_type="product",
-                              source="qc_consensus", task_id="t3")
+    svc.record_decision(project_id="p1", span="Apple", entity_type="product",
+                        source="qc_consensus", task_id="t3")
+    # Recount-only: the plurality winner becomes the type at recount time.
+    _accept(store, "t1", "Apple", "organization")
+    _accept(store, "t2", "Apple", "organization")
+    _accept(store, "t3", "Apple", "product")
+    svc.recount_project(project_id="p1")
+    conv = svc.list_for_project("p1")[0]
     # Soft model: stays active, entity_type tracks the plurality winner.
     assert conv.status == "active"
     assert conv.entity_type == "organization"
@@ -177,17 +216,23 @@ def test_operator_declaration_still_wins(store):
 
 
 def _seed_votes(svc, span, etype, n, project="p1", start=0):
+    """Record qc_consensus proposals AND back each with an ACCEPTED task so a
+    subsequent svc.recount_project(project) populates the columns. (Recount-only:
+    record_decision no longer maintains the empirical columns.)"""
     for i in range(start, start + n):
         svc.record_decision(project_id=project, span=span, entity_type=etype,
                             source="qc_consensus", task_id=f"t{i}",
                             row_content=f"{span} appears here {i}")
+        _accept(svc.store, f"t{i}", span, etype, project=project)
 
 
 def test_injection_requires_five_distinct_tasks(store):
     svc = EntityConventionService(store)
     _seed_votes(svc, "Salesforce", "organization", 4)  # 4 < 5 distinct tasks
+    svc.recount_project(project_id="p1")
     assert svc.find_matches_in_text("p1", "We use Salesforce daily") == []
     _seed_votes(svc, "Salesforce", "organization", 1, start=4)  # now 5
+    svc.recount_project(project_id="p1")
     matches = svc.find_matches_in_text("p1", "We use Salesforce daily")
     assert [c.span_original for c in matches] == ["Salesforce"]
 
@@ -197,6 +242,7 @@ def test_injection_blocked_when_dispute_pct_too_high(store):
     # 6 distinct tasks, 2 dissent → dispute_pct = 2/6 = 0.333 >= 0.20 → blocked.
     _seed_votes(svc, "Mercury", "organization", 4)
     _seed_votes(svc, "Mercury", "product", 2, start=4)
+    svc.recount_project(project_id="p1")
     conv = svc.list_for_project("p1")[0]
     assert conv.distinct_task_count == 6
     assert conv.dispute_pct >= 0.20
@@ -208,6 +254,7 @@ def test_injection_allowed_when_dispute_pct_under_threshold(store):
     # 10 distinct tasks, 1 dissent → dispute_pct = 0.10 < 0.20 → injected.
     _seed_votes(svc, "Mercury", "organization", 9)
     _seed_votes(svc, "Mercury", "product", 1, start=9)
+    svc.recount_project(project_id="p1")
     conv = svc.list_for_project("p1")[0]
     assert conv.distinct_task_count == 10
     assert conv.dispute_pct < 0.20

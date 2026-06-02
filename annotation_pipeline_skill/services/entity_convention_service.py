@@ -244,7 +244,12 @@ class EntityConventionService:
         ).fetchone()
         if row is None:
             conv_id = f"conv-{uuid4().hex[:16]}"
-            dom0, dist0, disp0, pct0 = _distinct_task_tally([proposal])
+            # Recount-only: the empirical columns (distinct_task_count,
+            # dispute_count, dispute_pct, dominant_type) and the auto entity_type
+            # are maintained SOLELY by recount_project. A new convention starts
+            # with zeroed aggregates, so an AUTO convention won't inject until
+            # the next recount. Operator-declared conventions still inject
+            # immediately via the created_by bypass (created_by=source below).
             conn.execute(
                 """
                 INSERT INTO entity_conventions
@@ -258,7 +263,7 @@ class EntityConventionService:
                     conv_id, project_id, span_lower, span.strip(), entity_type,
                     "active", 1, json.dumps([proposal]),
                     now.isoformat(), now.isoformat(), source, notes,
-                    dist0, disp0, pct0, dom0,
+                    0, 0, 0.0, None,
                 ),
             )
             return self._load_row(conn.execute(
@@ -283,10 +288,10 @@ class EntityConventionService:
         ):
             return self._load_row(row)
         proposals.append(proposal)
-        dominant_type, distinct_ct, dispute_ct, dispute_pct = _distinct_task_tally(proposals)
-        # evidence_count is now a plain display counter: the total number of
-        # recorded proposals. The injection gate uses distinct_task_count /
-        # dispute_pct (derived in _load_row), NOT this field.
+        # evidence_count is a plain display counter (total proposals). The
+        # empirical columns are NOT maintained here anymore — recount_project
+        # owns them (recount-only model). entity_type is only set here for
+        # OPERATOR declarations; auto proposals leave it for recount.
         new_count = len(proposals)
         if source.startswith("declared:"):
             # Explicit operator declaration is the final authority: it always
@@ -298,25 +303,14 @@ class EntityConventionService:
             # operator clears it; automated proposals only append evidence.
             new_status = "disputed"
             new_type = row["entity_type"]
-        elif any(
-            isinstance(p, dict) and _is_operator_source(p.get("source"))
-            for p in proposals
-        ):
-            # An operator has declared a policy for this span at some point in
-            # the chain. The operator's call is the final authority and is NOT
-            # silently overridden by later auto consensus — keep the locked
-            # type (consistent with the operator-declared injection bypass).
-            # Only another operator action (declared:/clear_dispute) can change
-            # it. The proposal is still appended as evidence.
+        else:
+            # Recount-only: auto (qc_consensus) proposals and operator locks
+            # already in the chain do NOT re-derive the type here. entity_type
+            # for auto conventions is set by recount_project; operator locks
+            # keep their type (created_by stays operator-stamped). No live
+            # soft-model plurality recompute.
             new_status = "active"
             new_type = row["entity_type"]
-        else:
-            # Soft model: automated conflicts NEVER hard-flip to 'disputed'.
-            # The plurality winner (one vote per distinct task) becomes the
-            # convention's current type; disagreement is tracked numerically
-            # via dispute_pct and enforced softly at injection time.
-            new_status = "active"
-            new_type = dominant_type if dominant_type is not None else row["entity_type"]
         # Stamp created_by whenever an operator/HR source acts on the
         # convention, so operator authority is cheaply queryable from the
         # small created_by column (the injection prefilter relies on this to
@@ -330,13 +324,11 @@ class EntityConventionService:
             """
             UPDATE entity_conventions
             SET entity_type=?, status=?, evidence_count=?, proposals_json=?,
-                created_by=?, updated_at=?,
-                distinct_task_count=?, dispute_count=?, dispute_pct=?, dominant_type=?
+                created_by=?, updated_at=?
             WHERE convention_id=?
             """,
             (new_type, new_status, new_count, json.dumps(proposals),
              new_created_by, now.isoformat(),
-             distinct_ct, dispute_ct, dispute_pct, dominant_type,
              row["convention_id"]),
         )
         return self._load_row(conn.execute(

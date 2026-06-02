@@ -31,12 +31,40 @@ def _columns(store, span_lower="android"):
     ).fetchone()
 
 
-def test_insert_stores_aggregate_columns(store):
+def _accept(store, task_id, span, etype, project="p"):
+    """ACCEPTED task tagging ``span`` as ``etype`` — recount-only backing."""
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    task = Task.new(task_id=task_id, pipeline_id=project,
+                    source_ref={"kind": "jsonl", "payload": {
+                        "rows": [{"row_index": 0, "input": span}]}})
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    rel = f"artifact_payloads/{task_id}/final.json"
+    ap = store.root / rel
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    ap.write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": {etype: [span]}}}]})}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel,
+        content_type="application/json"))
+
+
+def test_insert_seeds_zeroed_columns_then_recount_populates(store):
+    """Recount-only: record_decision insert seeds zeroed aggregates; only
+    recount_project (from accepted-task annotations) populates them."""
     svc = EntityConventionService(store)
     svc.record_decision(
         project_id="p", span="Android", entity_type="technology",
         source="qc_consensus", task_id="t1",
     )
+    row = _columns(store)
+    assert row["distinct_task_count"] == 0
+    assert row["dominant_type"] is None
+    # Back with an accepted task and recount -> columns populate.
+    _accept(store, "t1", "Android", "technology")
+    svc.recount_project(project_id="p")
     row = _columns(store)
     assert row["distinct_task_count"] == 1
     assert row["dispute_count"] == 0
@@ -44,18 +72,23 @@ def test_insert_stores_aggregate_columns(store):
     assert row["dominant_type"] == "technology"
 
 
-def test_update_path_keeps_columns_in_sync_with_tally(store):
+def test_recount_populates_columns_to_match_tally(store):
+    """After recount the columns match what _distinct_task_tally derives from
+    the (aligned) proposals — recount is the sole maintainer now."""
     svc = EntityConventionService(store)
     # 5 tasks agree technology, 1 disagrees organization.
     for i in range(5):
         svc.record_decision(project_id="p", span="Android", entity_type="technology",
                             source="qc_consensus", task_id=f"t{i}")
+        _accept(store, f"t{i}", "Android", "technology")
     svc.record_decision(project_id="p", span="Android", entity_type="organization",
                         source="qc_consensus", task_id="t_dissent")
+    _accept(store, "t_dissent", "Android", "organization")
+    svc.recount_project(project_id="p")
     row = _columns(store)
     proposals = json.loads(row["proposals_json"])
     dom, dist, disp, pct = _distinct_task_tally(proposals)
-    # Columns must equal exactly what the tally derives.
+    # Columns equal what the tally derives (proposals align with accepted tasks).
     assert row["distinct_task_count"] == dist == 6
     assert row["dispute_count"] == disp == 1
     assert abs(row["dispute_pct"] - pct) < 1e-9
@@ -98,6 +131,8 @@ def test_injection_path_does_not_read_proposals_json(store):
     for i in range(6):
         svc.record_decision(project_id="p", span="Android", entity_type="technology",
                             source="qc_consensus", task_id=f"t{i}")
+        _accept(store, f"t{i}", "Android", "technology")
+    svc.recount_project(project_id="p")
     cands = svc._iter_injection_candidates("p")
     assert len(cands) == 1
     c = cands[0]
@@ -109,12 +144,14 @@ def test_injection_path_does_not_read_proposals_json(store):
                          svc.find_matches_in_text("p", "my Android phone")}
 
 
-def test_migration_backfills_columns_via_replay_not_silently_zero(store):
-    """A convention written through record_decision has non-default columns —
-    guards against the columns silently staying at their DEFAULT 0."""
+def test_recount_backfills_columns_not_silently_zero(store):
+    """After recount a convention has non-default columns — guards against the
+    columns silently staying at their DEFAULT 0."""
     svc = EntityConventionService(store)
     for i in range(7):
         svc.record_decision(project_id="p", span="Equifax", entity_type="organization",
                             source="qc_consensus", task_id=f"t{i}")
+        _accept(store, f"t{i}", "Equifax", "organization")
+    svc.recount_project(project_id="p")
     row = _columns(store, "equifax")
     assert row["distinct_task_count"] == 7  # not the DEFAULT 0
