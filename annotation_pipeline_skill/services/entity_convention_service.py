@@ -506,6 +506,12 @@ class EntityConventionService:
         The whole rebuild runs in a single transaction so a crash leaves the
         prior table intact.
 
+        The empirical columns are populated here from the replayed proposals
+        (pure qc_consensus, no arbiter exclusion). For the canonical gate
+        population, follow a rebuild with ``recount_project`` (which counts
+        agreement tasks only, excluding arbiter overrides); until then the
+        columns reflect the rebuild's broader population.
+
         Returns a summary dict with ``tasks_seen``, ``tasks_with_spans`` and
         ``decisions_recorded`` counts.
         """
