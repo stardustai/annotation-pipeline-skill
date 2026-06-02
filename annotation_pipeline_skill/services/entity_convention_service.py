@@ -124,6 +124,34 @@ def _distinct_task_tally(
     return (dominant_type, distinct, dispute_count, dispute_count / distinct)
 
 
+def _effective_annotation_is_arbiter_correction(store, task_id: str) -> bool:
+    """True if a task's EFFECTIVE (latest) annotation is an arbiter OVERRIDE.
+
+    A convention vote is excluded for such tasks: the pipeline stages did NOT
+    agree — a single LLM arbiter ruled (``corrected_annotation``). This mirrors
+    ``_load_latest_annotation``'s precedence:
+      - a ``human_review_answer`` (a human had the final say) always wins, so an
+        HR-final task is NOT treated as arbiter-ruled even if an arbiter
+        correction exists earlier in its history → INCLUDED;
+      - ``annotator-wins`` tasks keep the annotator's ``annotation_result`` (no
+        ``arbiter_correction`` artifact) → INCLUDED;
+      - only when the latest ``annotation_result`` is itself the arbiter's
+        override (``source='arbiter_correction'`` or an ``*_arbiter_correction``
+        path) is the task EXCLUDED.
+    """
+    arts = store.list_artifacts(task_id)
+    if any(a.kind == "human_review_answer" for a in arts):
+        return False
+    anns = [a for a in arts if a.kind == "annotation_result"]
+    if not anns:
+        return False
+    last = anns[-1]
+    return (
+        (last.metadata or {}).get("source") == "arbiter_correction"
+        or "arbiter_correction" in (last.path or "")
+    )
+
+
 @dataclass(frozen=True)
 class EntityConvention:
     convention_id: str
@@ -520,10 +548,18 @@ class EntityConventionService:
         annotation of every ACCEPTED task — the convention analog of
         ``EntityStatisticsService.recount_project``.
 
-        Vote model: all ACCEPTED tasks (arbiter included), ONE vote per task
-        per span. A task tagging a span under multiple types contributes a
-        single deterministic vote (``max(types)``) so intra-task multi-typing
-        does not inflate ``dispute_pct`` (the 0.20 injection threshold).
+        Vote model: ACCEPTED tasks accepted by genuine pipeline AGREEMENT —
+        EXCLUDES tasks whose effective annotation is an arbiter OVERRIDE
+        (``corrected_annotation``: the stages diverged and a single LLM arbiter
+        ruled, which is not a convention-grade consensus). INCLUDES uncontested
+        tasks, ``annotator-wins`` (arbiter consulted and agreed), and HR-final
+        tasks (a human had the last word). See
+        ``_effective_annotation_is_arbiter_correction``. This intentionally
+        differs from ``EntityStatisticsService.recount_project`` (all-accepted):
+        conventions are the stricter, high-trust subset. ONE vote per task per
+        span; a task tagging a span under multiple types contributes a single
+        deterministic vote (``max(types)``) so intra-task multi-typing does not
+        inflate ``dispute_pct`` (the 0.20 injection threshold).
 
         Operator/HR-locked conventions (``created_by`` carries an operator
         prefix, or ``status='disputed'``) keep their ``entity_type`` and their
@@ -544,9 +580,9 @@ class EntityConventionService:
         NOTE: the live ``record_decision`` path also maintains these columns,
         but from a DIFFERENT population — its ``_distinct_task_tally`` counts
         only ``qc_consensus`` proposals in ``proposals_json``, whereas this
-        recount counts ALL accepted tasks (arbiter included), one vote per
-        task. A later ``record_decision`` on a span therefore re-derives that
-        span's columns from proposals and can overwrite a recount result;
+        recount counts agreement tasks (arbiter overrides excluded), one vote
+        per task. A later ``record_decision`` on a span therefore re-derives
+        that span's columns from proposals and can overwrite a recount result;
         treat recount as a periodic correction, not a permanent lock.
 
         Summary keys: ``recomputed`` + ``operator_preserved`` partition every
@@ -563,6 +599,11 @@ class EntityConventionService:
         votes: dict[str, dict[str, str]] = {}  # span_lower -> {task_id: type}
         for task in self.store.list_tasks_by_pipeline(project_id):
             if task.status is not TaskStatus.ACCEPTED:
+                continue
+            # Exclude tasks the arbiter OVERRODE — a convention needs genuine
+            # stage agreement, not a single arbiter's ruling. HR-final and
+            # annotator-wins tasks still count.
+            if _effective_annotation_is_arbiter_correction(self.store, task.task_id):
                 continue
             payload = _load_latest_annotation(self.store, task.task_id)
             if not isinstance(payload, dict):

@@ -102,3 +102,92 @@ def test_recount_one_vote_per_task_for_multi_type_span(tmp_path):
     assert conv.dispute_count == 0
     assert conv.dispute_pct == 0.0
     assert conv.dominant_type == max(["technology", "product"])
+
+
+def _add_arbiter_corrected_task(store, project_id, task_id, entities_by_type):
+    """ACCEPTED task whose EFFECTIVE (latest) annotation is an ARBITER OVERRIDE
+    (corrected_annotation). No human_review_answer, so it is treated as
+    arbiter-ruled and must be EXCLUDED from convention votes."""
+    task = Task.new(
+        task_id=task_id, pipeline_id=project_id,
+        source_ref={"kind": "jsonl", "payload": {
+            "rows": [{"row_index": 0, "input": "x"}]}},
+    )
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    rel = f"artifact_payloads/{task_id}/{task_id}_arbiter_correction.json"
+    abs_path = store.root / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": entities_by_type}}]
+    })}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel,
+        content_type="application/json", metadata={"source": "arbiter_correction"},
+    ))
+
+
+def _add_hr_final_after_arbiter_task(store, project_id, task_id, hr_entities):
+    """ACCEPTED task that was arbiter-corrected (project) but then HR-corrected.
+    The human_review_answer is the EFFECTIVE annotation, so it is INCLUDED
+    (human had the final say — not arbiter-ruled)."""
+    task = Task.new(
+        task_id=task_id, pipeline_id=project_id,
+        source_ref={"kind": "jsonl", "payload": {
+            "rows": [{"row_index": 0, "input": "x"}]}},
+    )
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    # Earlier arbiter override.
+    arb_rel = f"artifact_payloads/{task_id}/{task_id}_arbiter_correction.json"
+    (store.root / arb_rel).parent.mkdir(parents=True, exist_ok=True)
+    (store.root / arb_rel).write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": {"project": ["spark"]}}}]})}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=arb_rel,
+        content_type="application/json", metadata={"source": "arbiter_correction"}))
+    # Later HR answer (the effective final annotation).
+    hr_rel = f"artifact_payloads/{task_id}/hr.json"
+    (store.root / hr_rel).write_text(json.dumps({"answer": {
+        "rows": [{"row_index": 0, "output": {"entities": hr_entities}}]}}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="human_review_answer", path=hr_rel,
+        content_type="application/json"))
+
+
+def test_recount_excludes_arbiter_corrected_tasks(tmp_path):
+    """A convention vote is excluded when the task's effective annotation is an
+    arbiter OVERRIDE; uncontested / annotator-wins tasks are counted."""
+    store = SqliteStore.open(tmp_path)
+    svc = EntityConventionService(store)
+    svc.record_decision(project_id="p", span="spark", entity_type="technology",
+                        source="qc_consensus", task_id="seed")
+    # 3 uncontested accepted tasks tag spark=technology -> counted.
+    for i in range(3):
+        _add_accepted_task(store, "p", f"ok-{i}", {"technology": ["spark"]})
+    # 2 arbiter-corrected tasks tag spark=project -> EXCLUDED.
+    for i in range(2):
+        _add_arbiter_corrected_task(store, "p", f"arb-{i}", {"project": ["spark"]})
+
+    svc.recount_project(project_id="p")
+
+    conv = [c for c in svc.list_for_project("p") if c.span_lower == "spark"][0]
+    assert conv.distinct_task_count == 3   # arbiter-corrected votes excluded
+    assert conv.dominant_type == "technology"
+    assert conv.dispute_count == 0
+
+
+def test_recount_includes_hr_final_even_if_arbiter_touched(tmp_path):
+    """A task that was arbiter-corrected but then HR-corrected counts via its
+    HR-final annotation (human had the final say)."""
+    store = SqliteStore.open(tmp_path)
+    svc = EntityConventionService(store)
+    svc.record_decision(project_id="p", span="spark", entity_type="project",
+                        source="qc_consensus", task_id="seed")
+    _add_hr_final_after_arbiter_task(store, "p", "hr-0", {"technology": ["spark"]})
+
+    svc.recount_project(project_id="p")
+
+    conv = [c for c in svc.list_for_project("p") if c.span_lower == "spark"][0]
+    assert conv.distinct_task_count == 1
+    assert conv.dominant_type == "technology"   # HR-final answer counted
