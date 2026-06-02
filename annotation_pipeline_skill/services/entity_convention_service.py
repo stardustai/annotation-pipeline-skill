@@ -536,6 +536,25 @@ class EntityConventionService:
                         row_content=row_content,
                     )
                     decisions_recorded += 1
+            # Recount-only: record_decision no longer maintains the empirical
+            # columns, so populate them here from the just-replayed proposals
+            # (this is a pure qc_consensus replay, so the proposals tally equals
+            # the distinct-task vote). entity_type tracks the plurality winner,
+            # matching the legacy soft-model rebuild output. The canonical
+            # refresh against live accepted state is recount_project.
+            for crow in conn.execute(
+                "SELECT convention_id, proposals_json "
+                "FROM entity_conventions WHERE project_id=?", (project_id,)
+            ).fetchall():
+                props = json.loads(crow["proposals_json"] or "[]")
+                dom, dist, disp, pct = _distinct_task_tally(props)
+                conn.execute(
+                    "UPDATE entity_conventions SET "
+                    "entity_type=COALESCE(?, entity_type), dominant_type=?, "
+                    "distinct_task_count=?, dispute_count=?, dispute_pct=? "
+                    "WHERE convention_id=?",
+                    (dom, dom, dist, disp, pct, crow["convention_id"]),
+                )
         return {
             "tasks_seen": tasks_seen,
             "tasks_with_spans": tasks_with_spans,
@@ -576,13 +595,13 @@ class EntityConventionService:
         Returns a summary dict with ``conventions_seen``, ``recomputed``,
         ``operator_preserved`` and ``zeroed`` counts.
 
-        NOTE: the live ``record_decision`` path also maintains these columns,
-        but from a DIFFERENT population — its ``_distinct_task_tally`` counts
-        only ``qc_consensus`` proposals in ``proposals_json``, whereas this
-        recount counts agreement tasks (arbiter overrides excluded), one vote
-        per task. A later ``record_decision`` on a span therefore re-derives
-        that span's columns from proposals and can overwrite a recount result;
-        treat recount as a periodic correction, not a permanent lock.
+        NOTE: this is the SOLE maintainer of the empirical columns. The live
+        ``record_decision`` / ``clear_dispute`` paths no longer touch them (they
+        only append proposals + apply operator declarations), so a recount
+        result is durable until the next recount. ``rebuild_from_accepted_tasks``
+        populates the columns from a pure qc_consensus replay; this method is
+        the canonical refresh against current accepted state (agreement tasks
+        only — arbiter overrides excluded).
 
         Summary keys: ``recomputed`` + ``operator_preserved`` partition every
         convention seen; ``zeroed`` is an OVERLAPPING subset (rows whose span
