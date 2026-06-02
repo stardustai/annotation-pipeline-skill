@@ -11,9 +11,6 @@ import json
 from collections import Counter
 from typing import Any
 
-from annotation_pipeline_skill.services.entity_convention_service import (
-    _distinct_task_tally,
-)
 from annotation_pipeline_skill.similarity.diverse import select_diverse_examples
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 from annotation_pipeline_skill.text.wordfreq_utils import wordfreq_score
@@ -41,7 +38,8 @@ def check_past_experience(
 
     span_lower = entry.strip().lower()
     row = store._conn.execute(
-        "SELECT convention_id, entity_type, status, evidence_count, proposals_json "
+        "SELECT convention_id, entity_type, status, evidence_count, proposals_json, "
+        "distinct_task_count, dispute_count, dispute_pct, dominant_type "
         "FROM entity_conventions WHERE project_id=? AND span_lower=?",
         (project_id, span_lower),
     ).fetchone()
@@ -65,9 +63,13 @@ def check_past_experience(
         }
 
     proposals = json.loads(row["proposals_json"] or "[]")
-    dominant_type, distinct_tasks, dispute_count, dispute_pct = (
-        _distinct_task_tally(proposals)
-    )
+    # Recount-only: headline aggregates come from the materialized columns
+    # (maintained by recount_project), so this tool agrees with the injection
+    # gate. proposals_json is still used below for distribution + examples.
+    dominant_type = row["dominant_type"]
+    distinct_tasks = row["distinct_task_count"]
+    dispute_count = row["dispute_count"]
+    dispute_pct = row["dispute_pct"]
 
     # Distribution counts every proposal by its declared type.
     distribution = Counter(

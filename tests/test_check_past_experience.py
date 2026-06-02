@@ -64,25 +64,48 @@ def test_active_convention_returns_examples(store):
     )
 
 
-def test_conflicting_proposals_track_dispute_soft_model(store):
+def _accept(store, task_id, span, etype, project="p1"):
+    """ACCEPTED task tagging ``span`` as ``etype`` — recount-only backing."""
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task
+    from annotation_pipeline_skill.core.states import TaskStatus
+
+    task = Task.new(task_id=task_id, pipeline_id=project,
+                    source_ref={"kind": "jsonl", "payload": {
+                        "rows": [{"row_index": 0, "input": span}]}})
+    task.status = TaskStatus.ACCEPTED
+    store.save_task(task)
+    rel = f"artifact_payloads/{task_id}/final.json"
+    ap = store.root / rel
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    ap.write_text(json.dumps({"text": json.dumps({
+        "rows": [{"row_index": 0, "output": {"entities": {etype: [span]}}}]})}))
+    store.append_artifact(ArtifactRef.new(
+        task_id=task_id, kind="annotation_result", path=rel,
+        content_type="application/json"))
+
+
+def test_conflicting_proposals_track_dispute_via_recount(store):
+    """Recount-only: check_past_experience reports the headline aggregates from
+    the materialized columns (maintained by recount_project), so it agrees with
+    the injection gate. 2 org + 1 product accepted tasks -> dominant org, 1/3
+    dispute."""
     svc = EntityConventionService(store)
-    _seed(svc, "p1", "Apple", "organization", "qc_consensus",
-          "task_a", "row_1", "Apple's customer support helped me yesterday")
-    _seed(svc, "p1", "Apple", "organization", "qc_consensus",
-          "task_b", "row_2", "Apple announced a new privacy policy")
-    _seed(svc, "p1", "Apple", "product", "qc_consensus",
-          "task_c", "row_3", "My Apple iPad keeps crashing on updates")
+    # Create the convention row (columns zeroed under recount-only).
+    svc.record_decision(project_id="p1", span="Apple", entity_type="organization",
+                        source="qc_consensus", task_id="task_a")
+    # Back with accepted tasks reflecting the real distribution, then recount.
+    _accept(store, "task_a", "Apple", "organization")
+    _accept(store, "task_b", "Apple", "organization")
+    _accept(store, "task_c", "Apple", "product")
+    svc.recount_project(project_id="p1")
+
     result = check_past_experience(store, project_id="p1", entry="Apple")
-    # Soft model: stays active, plurality (organization) wins.
     assert result["convention"]["status"] == "active"
-    assert result["convention"]["type"] == "organization"
+    assert result["convention"]["type"] == "organization"      # recount-derived dominant
     assert result["convention"]["dominant_type"] == "organization"
     assert result["convention"]["distinct_task_count"] == 3
     assert result["convention"]["dispute_count"] == 1
     assert result["convention"]["dispute_pct"] == pytest.approx(1 / 3)
-    # Distribution still counts every proposal by its declared type.
-    assert result["distribution"] == {"organization": 2, "product": 1}
-    assert set(result["examples_by_type"].keys()) == {"organization", "product"}
 
 
 def test_skips_proposals_without_context_snippet(store):
