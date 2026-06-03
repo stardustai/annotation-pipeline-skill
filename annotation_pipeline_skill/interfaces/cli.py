@@ -161,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     create_parser = subparsers.add_parser("create-tasks")
     create_parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    create_parser.add_argument(
+        "--workspace", type=Path, default=None,
+        help="Project-namespace dir (e.g. projects/). When set, rejects a "
+             "--pipeline-id that already exists in another store under it "
+             "(project ids must be globally unique for ?project= addressing).",
+    )
     create_parser.add_argument("--source", type=Path, required=True)
     create_parser.add_argument("--pipeline-id", required=True)
     create_parser.add_argument("--batch-size", type=int, default=1)
@@ -240,6 +246,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     annotation_manager_v2 = import_subparsers.add_parser("annotation-manager-v2")
     annotation_manager_v2.add_argument("--project-root", type=Path, default=Path.cwd())
+    annotation_manager_v2.add_argument("--workspace", type=Path, default=None,
+        help="Project-namespace dir; rejects a --pipeline-id already used in another store under it.")
     annotation_manager_v2.add_argument("--source-task-root", type=Path, required=True)
     annotation_manager_v2.add_argument("--pipeline-id", required=True)
     annotation_manager_v2.add_argument("--task-prefix")
@@ -251,6 +259,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     jsonl_prelabeled = import_subparsers.add_parser("jsonl-prelabeled")
     jsonl_prelabeled.add_argument("--project-root", type=Path, default=Path.cwd())
+    jsonl_prelabeled.add_argument("--workspace", type=Path, default=None,
+        help="Project-namespace dir; rejects a --pipeline-id already used in another store under it.")
     jsonl_prelabeled.add_argument("--source", type=Path, required=True)
     jsonl_prelabeled.add_argument("--pipeline-id", required=True)
     jsonl_prelabeled.add_argument("--batch-size", type=int, default=10)
@@ -607,6 +617,7 @@ def handle_create_tasks(args: argparse.Namespace) -> int:
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
     validate_qc_sample_options(args.qc_sample_count, args.qc_sample_ratio)
+    assert_pipeline_id_globally_unique(args.project_root, args.pipeline_id, workspace=getattr(args, 'workspace', None))
     store = SqliteStore.open(args.project_root / ".annotation-pipeline")
     rows = read_jsonl(args.source)
     task_prefix = args.task_prefix or args.pipeline_id
@@ -648,6 +659,7 @@ def handle_create_tasks(args: argparse.Namespace) -> int:
 
 def handle_import_annotation_manager_v2(args: argparse.Namespace) -> int:
     validate_qc_sample_options(args.qc_sample_count, args.qc_sample_ratio)
+    assert_pipeline_id_globally_unique(args.project_root, args.pipeline_id, workspace=getattr(args, 'workspace', None))
     store = SqliteStore.open(args.project_root / ".annotation-pipeline")
     statuses = set(args.status or ["accepted", "merged"])
     task_prefix = args.task_prefix or args.pipeline_id
@@ -862,6 +874,7 @@ def _expected_prelabel_task_id(pipeline_id: str, batch_idx: int) -> str:
 
 
 def handle_import_jsonl_prelabeled(args: argparse.Namespace) -> int:
+    assert_pipeline_id_globally_unique(args.project_root, args.pipeline_id, workspace=getattr(args, 'workspace', None))
     store = SqliteStore.open(args.project_root / ".annotation-pipeline")
     rows = read_jsonl(args.source)
     offset = max(0, getattr(args, "start_batch_offset", 0) or 0)
@@ -1865,6 +1878,59 @@ def discover_project_stores(workspace: Path) -> dict[str, Path]:
             _add(item.parent)
 
     return result
+
+
+def assert_pipeline_id_globally_unique(
+    project_root: Path, pipeline_id: str, *, workspace: Path | None = None
+) -> None:
+    """Reject creating ``pipeline_id`` if it already exists in a DIFFERENT store
+    within ``workspace``.
+
+    project_id is the sole addressing key for the dashboard (``?project=`` with
+    no ``store=``), so it must be globally unique across every store in the
+    workspace. Adding more tasks to the SAME store's existing pipeline is fine
+    (the current project root is skipped). Reads sibling DBs read-only and never
+    migrates them. Raises SystemExit(1) with a clear message on collision.
+
+    The check is OPT-IN: it runs only when ``workspace`` is given (an explicit
+    project-namespace dir, e.g. ``projects/``). With ``workspace=None`` it is a
+    no-op — scanning a project root's incidental parent would false-positive on
+    unrelated sibling stores (e.g. pytest tmp dirs).
+    """
+    import sqlite3
+
+    if workspace is None:
+        return
+    workspace = Path(workspace)
+    if not workspace.exists():
+        return
+    project_root = Path(project_root)
+    current = project_root.resolve()
+    for _key, root in discover_project_stores(workspace).items():
+        if root.resolve() == current:
+            continue
+        db = root / ".annotation-pipeline" / "db.sqlite"
+        if not db.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                hit = conn.execute(
+                    "SELECT 1 FROM tasks WHERE pipeline_id=? LIMIT 1", (pipeline_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            continue  # no tasks table yet → nothing to collide with
+        if hit:
+            print(
+                f"error: pipeline_id {pipeline_id!r} already exists in store "
+                f"{root.name!r}; project ids must be globally unique because the "
+                f"dashboard addresses a project by ?project= alone. "
+                f"Choose a different --pipeline-id.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
 
 def _pid_alive(pid: int) -> bool:

@@ -101,14 +101,15 @@ describe("buildSearch", () => {
     expect(buildSearch(defaults, defaults)).toBe("");
   });
 
-  it("emits non-default view and present fields", () => {
+  it("emits non-default view and present fields (store is NOT written to URL)", () => {
     const state: UrlState = { view: "runtime", store: "abc", project: "p", task: "t-1" };
-    expect(buildSearch(state, defaults)).toBe("?view=runtime&store=abc&project=p&task=t-1");
+    // store is intentionally omitted — project is the addressing key.
+    expect(buildSearch(state, defaults)).toBe("?view=runtime&project=p&task=t-1");
   });
 
-  it("setting a value to null removes the param from the URL", () => {
+  it("setting a value to null removes the param; store is never emitted", () => {
     const state: UrlState = { view: "kanban", store: "abc", project: null, task: null };
-    expect(buildSearch(state, defaults)).toBe("?store=abc");
+    expect(buildSearch(state, defaults)).toBe("");
   });
 });
 
@@ -134,11 +135,11 @@ describe("useUrlState hook (manual driver, no react renderer)", () => {
     // Start with store + project set; bump view to "runtime".
     const start: UrlState = { view: "kanban", store: "abc", project: "p", task: null };
     writeUrl(start, defaults);
-    expect(fake.location.search).toBe("?store=abc&project=p");
+    expect(fake.location.search).toBe("?project=p");  // store not written
 
     const next: UrlState = { ...start, view: "runtime" };
     writeUrl(next, defaults);
-    expect(fake.location.search).toBe("?view=runtime&store=abc&project=p");
+    expect(fake.location.search).toBe("?view=runtime&project=p");
     // history.replaceState was used, not pushState
     expect(fake.history.replaceState).toHaveBeenCalled();
     expect(fake.history.pushState).not.toHaveBeenCalled();

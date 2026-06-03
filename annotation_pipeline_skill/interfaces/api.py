@@ -915,6 +915,20 @@ class DashboardApi:
         key = query.get("store", [None])[0]
         if key and key in self._stores:
             return self._stores[key]
+        # project-only addressing (?project= with no store=): find the store
+        # whose db holds that pipeline_id. project_ids are globally unique
+        # (enforced at creation), so the first match is unambiguous.
+        project = query.get("project", [None])[0]
+        if project and self._stores:
+            for st in self._stores.values():
+                try:
+                    hit = st._conn.execute(
+                        "SELECT 1 FROM tasks WHERE pipeline_id=? LIMIT 1", (project,)
+                    ).fetchone()
+                except Exception:
+                    hit = None
+                if hit:
+                    return st
         if self._default_store_key and self._default_store_key in self._stores:
             return self._stores[self._default_store_key]
         return self.store
@@ -1693,6 +1707,8 @@ class DashboardApi:
                 except Exception:  # noqa: BLE001 — cache update is best-effort
                     pass
             return self._json_response(200, {"removed": removed})
+        if route == "/api/providers/test":
+            return self._test_provider_response(store, body)
         return self._json_response(404, {"error": "not_found"})
 
     def _post_convention_response(self, store: SqliteStore, project_id: str | None, body: dict) -> tuple:
@@ -1916,6 +1932,79 @@ class DashboardApi:
         except (FileNotFoundError, OSError, ProfileValidationError) as exc:
             return self._json_response(400, {"error": "invalid_provider_config", "detail": str(exc)})
         return self._json_response(200, snapshot)
+
+    def _test_provider_response(self, store: SqliteStore, body: bytes) -> tuple[int, dict[str, str], bytes]:
+        """POST /api/providers/test — ping a single profile and return latency / error."""
+        import asyncio
+        import time
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+
+        profile_name = payload.get("profile_name") if isinstance(payload, dict) else None
+        if not profile_name:
+            return self._json_response(400, {"error": "missing_profile_name"})
+
+        from annotation_pipeline_skill.llm.client import LLMGenerateRequest
+        from annotation_pipeline_skill.llm.local_cli import LocalCLIClient
+        from annotation_pipeline_skill.llm.profiles import load_llm_registry, resolve_llm_profiles_path
+
+        profiles_path = resolve_llm_profiles_path(
+            workspace_root=self.workspace_root,
+            project_config_root=store.root,
+        )
+        if profiles_path is None:
+            return self._json_response(404, {"error": "llm_profiles_not_found"})
+        try:
+            registry = load_llm_registry(profiles_path)
+        except Exception as exc:  # noqa: BLE001
+            return self._json_response(400, {"error": "invalid_profiles", "detail": str(exc)})
+
+        profile = registry.profiles.get(profile_name)
+        if profile is None:
+            return self._json_response(404, {"error": "profile_not_found", "profile_name": profile_name})
+
+        ping_request = LLMGenerateRequest(
+            instructions='Respond with exactly the JSON object {"ok":true} and nothing else.',
+            prompt="ping",
+            continuity_handle=None,
+            response_format={"type": "json_object"},
+        )
+        project_id = store.root.parent.name
+
+        async def _run() -> dict:
+            t0 = time.monotonic()
+            client = LocalCLIClient(profile, store=store, project_id=project_id)
+            try:
+                result = await client.generate(ping_request)
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                diag = getattr(result, "diagnostics", None) or {}
+                err_ev = diag.get("error_event") if isinstance(diag, dict) else None
+                if isinstance(err_ev, dict):
+                    msg = err_ev.get("result_text") or "provider returned error"
+                    return {"ok": False, "latency_ms": latency_ms, "error": msg}
+                return {"ok": True, "latency_ms": latency_ms}
+            except Exception as exc:  # noqa: BLE001
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                diag = getattr(exc, "diagnostics", None) or {}
+                err_ev = diag.get("error_event") if isinstance(diag, dict) else None
+                msg = (err_ev.get("result_text") if isinstance(err_ev, dict) else None) or str(exc)[:300]
+                return {"ok": False, "latency_ms": latency_ms, "error": msg}
+            finally:
+                close = getattr(client, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        try:
+            result = asyncio.run(_run())
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "latency_ms": 0, "error": str(exc)[:300]}
+        return self._json_response(200, result)
 
     def _update_project_schema_response(self, store: SqliteStore, body: bytes) -> tuple[int, dict[str, str], bytes]:
         """PUT /api/schema — persist edited output_schema.json after JSON-Schema metaschema validation."""

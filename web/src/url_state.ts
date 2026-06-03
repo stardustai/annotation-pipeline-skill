@@ -44,9 +44,10 @@ export function buildSearch(state: UrlState, defaults: UrlState): string {
   if (state.view && state.view !== defaults.view) {
     params.set("view", state.view);
   }
-  if (state.store) {
-    params.set("store", state.store);
-  }
+  // store is intentionally NOT written to the URL: project_id is the single,
+  // human-readable addressing key (project ids are globally unique), and the
+  // backend resolves which store/db holds a given project. Keeping store out
+  // of the URL avoids the opaque hash and the stale-store bug when switching.
   if (state.project) {
     params.set("project", state.project);
   }
@@ -85,7 +86,11 @@ export function useUrlState(defaults: UrlState): [UrlState, UrlStateSetters] {
   const [state, setState] = useState<UrlState>(() => {
     if (typeof window === "undefined") return defaults;
     const parsed = parseUrlState(window.location.search, defaults);
-    if (!parsed.store) {
+    // Only fall back to the localStorage store when the URL carries NEITHER a
+    // store nor a project. When a project is present it is authoritative — the
+    // backend resolves the store from it — so a stale localStorage store must
+    // not override it (that was the "wrong store on load" bug).
+    if (!parsed.store && !parsed.project) {
       try {
         const stored = window.localStorage?.getItem(STORE_LOCALSTORAGE_KEY);
         if (stored) {
@@ -137,7 +142,16 @@ export function useUrlState(defaults: UrlState): [UrlState, UrlStateSetters] {
 
   const setStore = useCallback(
     (value: string | null) => {
-      updateField("store", value);
+      // Switching store must also clear project & task: they belong to the
+      // PREVIOUS store. Keeping a stale ?project=<old> filters the new store's
+      // kanban to a non-existent project and shows zero tasks. Reset all three
+      // atomically when the store actually changes.
+      setState((current) => {
+        if (current.store === value) return current;
+        const next = { ...current, store: value, project: null, task: null };
+        writeUrl(next, defaultsRef.current);
+        return next;
+      });
       if (typeof window !== "undefined") {
         try {
           if (value) {
@@ -150,7 +164,7 @@ export function useUrlState(defaults: UrlState): [UrlState, UrlStateSetters] {
         }
       }
     },
-    [updateField],
+    [],
   );
 
   const setProject = useCallback(
