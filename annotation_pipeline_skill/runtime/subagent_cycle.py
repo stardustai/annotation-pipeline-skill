@@ -588,6 +588,22 @@ class SubagentRuntime:
             task.next_retry_at = utc_now() + timedelta(seconds=backoff)
             return
 
+        if not arb.get("ran") and arb.get("exception_class"):
+            # The arbiter CALL itself failed — it never produced a verdict
+            # (provider/transport/CLI error: auth 401, connection refused,
+            # "local CLI provider failed", etc.). This is an infrastructure
+            # outage, NOT a task that needs human review — HR cannot fix a dead
+            # provider and the task would just be rewound. Stay in ARBITRATING
+            # with backoff (no failure cap) so it is re-arbitrated once the
+            # provider recovers, instead of polluting HR with outage casualties.
+            bail_n = int(task.metadata.get("arbiter_provider_bail_count", 0)) + 1
+            task.metadata["arbiter_provider_bail_count"] = bail_n
+            for k in ("exception_class", "exception_message"):
+                if arb.get(k):
+                    task.metadata[f"arbiter_last_{k}"] = arb[k]
+            task.next_retry_at = utc_now() + timedelta(seconds=min(30 * bail_n, 300))
+            return
+
         verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
         if verbatim_exhausted:
             count = int(task.metadata.get("arbiter_verbatim_bail_count", 0)) + 1
@@ -648,35 +664,20 @@ class SubagentRuntime:
                 )
         else:
             # Mechanical failure (JSON parse / shape errors / LLM exception).
-            # These are transient quality glitches — replaying arbitration usually
-            # succeeds. Stay in ARBITRATING with exponential backoff instead of
-            # escalating to HR; HR cannot fix a parse error and the task would
-            # just be rewound anyway.
+            # An arbitration ERROR is not something a human reviewer can fix —
+            # it is an arbiter/provider glitch. Per policy these STAY in
+            # ARBITRATING with exponential backoff (no failure cap → no HR) so
+            # they are re-arbitrated rather than dumped into the HR queue.
+            # Genuine human cases (uncertain/unresolved verdict, verbatim
+            # exhaustion) escalate to HR elsewhere; an operator can still move a
+            # persistently-stuck task manually (high arbiter_mechanical_retries).
             count = int(task.metadata.get("arbiter_mechanical_retries", 0)) + 1
             task.metadata["arbiter_mechanical_retries"] = count
             for k in ("exception_class", "exception_message"):
                 if arb.get(k):
                     task.metadata[f"arbiter_last_{k}"] = arb[k]
-            if count >= self.ARBITER_MECHANICAL_RETRY_CAP:
-                self._transition(
-                    task,
-                    TaskStatus.HUMAN_REVIEW,
-                    reason=(
-                        f"Arbiter retried {count} times but kept failing to return a usable "
-                        f"answer (JSON parse / shape errors); routing to human review"
-                    ),
-                    stage=stage,
-                    attempt_id=attempt_id,
-                    metadata={
-                        **hr_extra_metadata,
-                        "arbiter_mechanical_retries": count,
-                        "arbiter_ran": arb["ran"],
-                        "arbiter_mechanical_fail": arb["mechanical_fail"],
-                    },
-                )
-            else:
-                backoff = min(30 * count, 300)
-                task.next_retry_at = utc_now() + timedelta(seconds=backoff)
+            backoff = min(30 * count, 300)
+            task.next_retry_at = utc_now() + timedelta(seconds=backoff)
 
     def _retry_round_count(self, task_id: str) -> int:
         """Count how many *open* retry rounds have happened for this task.

@@ -2417,6 +2417,58 @@ def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
     assert bail_n == n_runs, f"expected {n_runs} transient bails, got {bail_n}"
 
 
+def test_arbiter_provider_auth_failure_stays_arbitrating_not_hr(tmp_path):
+    """A NON-transient arbiter provider/call failure (e.g. 401 auth invalidated,
+    'local CLI provider failed') is an infrastructure outage, not a human-review
+    case. It must STAY in ARBITRATING with backoff past the mechanical cap — NOT
+    route to HUMAN_REVIEW (which would pollute HR with outage casualties)."""
+    from annotation_pipeline_skill.llm.local_cli import ProviderCallError
+    from annotation_pipeline_skill.core.models import ArtifactRef, Task, FeedbackRecord, FeedbackDiscussionEntry
+    from annotation_pipeline_skill.core.states import FeedbackSource, FeedbackSeverity, TaskStatus
+    from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
+    from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+    class Auth401Client:
+        async def generate(self, request):
+            raise ProviderCallError(
+                "local CLI provider failed",
+                {"runtime": "codex_cli",
+                 "error_event": {"api_error_status": 401, "result_text": "token_invalidated"}},
+            )
+
+    store = SqliteStore.open(tmp_path)
+    task = Task.new(task_id="t-401", pipeline_id="pipe",
+                    source_ref={"kind": "jsonl", "payload": {
+                        "rows": [{"row_id": "r0", "row_index": 0, "input": "alpha"}]}})
+    task.status = TaskStatus.ARBITRATING
+    store.save_task(task)
+    ann_dir = store.root / "artifact_payloads" / "t-401"
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    (ann_dir / "ann.json").write_text(json.dumps({"text": json.dumps(
+        {"rows": [{"row_id": "r0", "row_index": 0, "output": {"entities": {}}}]})}), encoding="utf-8")
+    store.append_artifact(ArtifactRef.new(
+        task_id="t-401", kind="annotation_result",
+        path="artifact_payloads/t-401/ann.json", content_type="application/json"))
+    fb = FeedbackRecord.new(
+        task_id="t-401", attempt_id="t-401-attempt-0",
+        source_stage=FeedbackSource.QC, severity=FeedbackSeverity.WARNING,
+        category="missing_span", message="missing", target={}, suggested_action="arbiter", created_by="qc")
+    store.append_feedback(fb)
+    store.append_feedback_discussion(FeedbackDiscussionEntry.new(
+        task_id="t-401", feedback_id=fb.feedback_id,
+        role="annotator", stance="disagree", message="nope", consensus=False, created_by="annotator"))
+
+    runtime = SubagentRuntime(store=store, client_factory=lambda target: Auth401Client())
+    for _ in range(SubagentRuntime.ARBITER_MECHANICAL_RETRY_CAP + 2):
+        runtime.run_task(store.load_task("t-401"), stage_target="arbiter")
+
+    after = store.load_task("t-401")
+    assert after.status is TaskStatus.ARBITRATING, (
+        f"401 provider failure must keep the task in ARBITRATING, got {after.status}"
+    )
+    assert after.next_retry_at is not None  # backoff scheduled for retry
+
+
 # ---------------------------------------------------------------------------
 # Fix 2: _count_annotation_spans helper
 # ---------------------------------------------------------------------------
