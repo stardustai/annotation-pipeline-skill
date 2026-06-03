@@ -183,6 +183,17 @@ def _is_provider_permanent_error(exc: BaseException) -> bool:
     return False
 
 
+def _retry_backoff_seconds(attempt: int) -> int:
+    """Exponential backoff for ARBITRATING re-pickups.
+
+    ``attempt`` is the 1-based count of consecutive bails. Doubles from a 30s
+    base and is capped at 600s (10 min): 30, 60, 120, 240, 480, 600, 600, …
+    So a recovered provider is re-tried within ~10 min at worst, without
+    hammering a still-down one.
+    """
+    return min(30 * (2 ** max(0, attempt - 1)), 600)
+
+
 class SubagentRuntime:
     def __init__(
         self,
@@ -522,19 +533,19 @@ class SubagentRuntime:
             cleaned_annotation_text,
         )
 
-    # Hard cap on consecutive arbiter mechanical retries. After this many
-    # arbiter pickups produce no actionable verdict (codex error / no fix /
-    # bad correction), give up and route to HR. Prevents a stuck task from
-    # looping forever when the LLM consistently fails on it.
-    ARBITER_MECHANICAL_RETRY_CAP = 3
-    # Separate, much larger budget for verbatim-only failures. Reason:
-    # validation-layer auto-fix (auto_fix_safe_spans_in_place) absorbs
-    # boundary-only mismatches at write time, so verbatim-exhausted on the
-    # arbiter side typically means a genuine model hallucination — but it's
-    # also the LLM-noise-prone failure mode that tends to clear on the
-    # next pickup. Give it ~2× the mechanical budget before escalating; if
-    # the arbiter is consistently hallucinating on this task, HR is still
-    # the right destination, just not after 3 pickups.
+    # NOTE: there is intentionally no cap that escalates a mechanical/parse/
+    # provider arbiter failure to HR. Those are infrastructure/transient errors
+    # a human can't fix, so they stay in ARBITRATING with backoff and retry
+    # until they succeed (see _handle_arbiter_mechanical_fail). Only genuine
+    # human-needed outcomes escalate to HR: uncertain verdict, verbatim
+    # exhaustion (below), hallucination-reset cap, and confidence stalemate.
+    #
+    # Budget for verbatim-only arbiter failures. Validation-layer auto-fix
+    # (auto_fix_safe_spans_in_place) absorbs boundary-only mismatches at write
+    # time, so verbatim-exhausted on the arbiter side typically means a genuine
+    # model hallucination — but it's the LLM-noise-prone failure mode that often
+    # clears on the next pickup, so allow a generous number of retries before
+    # escalating to HR (where a human can fix the span).
     ARBITER_VERBATIM_BAIL_CAP = 6
 
     # Hallucination-reset thresholds. When _serialize_llm_json strips a
@@ -579,13 +590,12 @@ class SubagentRuntime:
         """
         if arb.get("rate_limited"):
             # Transient error (429 / 5xx). Don't count toward any failure cap.
-            # Stamp next_retry_at with exponential backoff (30s × bail#, cap 300s)
+            # Stamp next_retry_at with exponential backoff (30s, 60s, … cap 600s)
             # so the task isn't immediately re-claimed against the same overloaded
             # provider.
             bail_n = int(task.metadata.get("arbiter_transient_bail_count", 0)) + 1
             task.metadata["arbiter_transient_bail_count"] = bail_n
-            backoff = min(30 * bail_n, 300)
-            task.next_retry_at = utc_now() + timedelta(seconds=backoff)
+            task.next_retry_at = utc_now() + timedelta(seconds=_retry_backoff_seconds(bail_n))
             return
 
         if not arb.get("ran") and arb.get("exception_class"):
@@ -601,7 +611,7 @@ class SubagentRuntime:
             for k in ("exception_class", "exception_message"):
                 if arb.get(k):
                     task.metadata[f"arbiter_last_{k}"] = arb[k]
-            task.next_retry_at = utc_now() + timedelta(seconds=min(30 * bail_n, 300))
+            task.next_retry_at = utc_now() + timedelta(seconds=_retry_backoff_seconds(bail_n))
             return
 
         verbatim_exhausted = bool(arb.get("verbatim_retry_exhausted"))
@@ -676,8 +686,7 @@ class SubagentRuntime:
             for k in ("exception_class", "exception_message"):
                 if arb.get(k):
                     task.metadata[f"arbiter_last_{k}"] = arb[k]
-            backoff = min(30 * count, 300)
-            task.next_retry_at = utc_now() + timedelta(seconds=backoff)
+            task.next_retry_at = utc_now() + timedelta(seconds=_retry_backoff_seconds(count))
 
     def _retry_round_count(self, task_id: str) -> int:
         """Count how many *open* retry rounds have happened for this task.

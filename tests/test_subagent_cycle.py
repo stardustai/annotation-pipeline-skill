@@ -2344,9 +2344,9 @@ def test_resolve_uncertain_arbiter_unavailable_goes_to_hr(tmp_path):
 
 
 def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
-    """Arbiter 5xx transient errors must NOT count toward ARBITER_MECHANICAL_RETRY_CAP.
-    A task that keeps seeing 500s should stay in ARBITRATING indefinitely, not go to HR.
-    Each failure must stamp next_retry_at with exponential backoff (30s × n, cap 300s)."""
+    """Arbiter 5xx transient errors must keep the task in ARBITRATING indefinitely,
+    never escalating to HR. Each failure stamps next_retry_at with exponential
+    backoff (30s × n, cap 300s)."""
     from annotation_pipeline_skill.llm.local_cli import ProviderCallError
     from annotation_pipeline_skill.core.models import ArtifactRef, Task, FeedbackRecord, FeedbackDiscussionEntry
     from annotation_pipeline_skill.core.states import FeedbackSource, FeedbackSeverity, TaskStatus
@@ -2400,9 +2400,10 @@ def test_arbiter_transient_500_does_not_escalate_to_human_review(tmp_path):
 
     runtime = SubagentRuntime(store=store, client_factory=lambda target: Transient500Client())
 
-    # run_task drives the arbiter directly (run_once only picks up PENDING)
-    cap = SubagentRuntime.ARBITER_MECHANICAL_RETRY_CAP
-    n_runs = cap + 2
+    # run_task drives the arbiter directly (run_once only picks up PENDING).
+    # Run several times — well past where any old retry cap would have fired —
+    # to prove it never escalates to HR.
+    n_runs = 5
     for _ in range(n_runs):
         task = store.load_task("t-500")
         runtime.run_task(task, stage_target="arbiter")
@@ -2459,7 +2460,7 @@ def test_arbiter_provider_auth_failure_stays_arbitrating_not_hr(tmp_path):
         role="annotator", stance="disagree", message="nope", consensus=False, created_by="annotator"))
 
     runtime = SubagentRuntime(store=store, client_factory=lambda target: Auth401Client())
-    for _ in range(SubagentRuntime.ARBITER_MECHANICAL_RETRY_CAP + 2):
+    for _ in range(5):  # well past any old retry cap — must never reach HR
         runtime.run_task(store.load_task("t-401"), stage_target="arbiter")
 
     after = store.load_task("t-401")
@@ -2961,3 +2962,12 @@ def test_annotation_instructions_include_baseline_preservation_rule():
         "BASELINE PRESERVATION must appear between MANDATORY ROW COVERAGE and "
         "HANDLING QC FEEDBACK paragraphs"
     )
+
+
+def test_retry_backoff_is_exponential():
+    """ARBITRATING re-pickup backoff must be exponential (doubling), not linear,
+    capped at 600s: 30, 60, 120, 240, 480, 600, 600 …"""
+    from annotation_pipeline_skill.runtime.subagent_cycle import _retry_backoff_seconds
+    assert [_retry_backoff_seconds(n) for n in range(1, 8)] == [30, 60, 120, 240, 480, 600, 600]
+    # 1-based; defensive for 0/negative
+    assert _retry_backoff_seconds(0) == 30
