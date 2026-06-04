@@ -280,15 +280,12 @@ class SubagentRuntime:
         await self._run_task(task, stage_target)
 
     def _load_guideline(self, task: Task) -> str | None:
-        # Preferred: task is bound to a versioned AnnotationDocument.
-        if task.document_version_id:
-            try:
-                ver = self.store.load_document_version(task.document_version_id)
-                return f"Annotation guideline ({ver.version}):\n{ver.content}"
-            except FileNotFoundError:
-                pass  # fall through to project-level fallback
-        # Secondary: latest version of the singleton "Annotation Rules"
-        # document maintained by the dashboard's Annotation Rules tab.
+        # Always annotate/QC against the LATEST published annotation_rules
+        # version. A task's ``document_version_id`` records what it was bound to
+        # at creation, but the rules are a living singleton: republishing the
+        # guideline must immediately govern every in-flight task with no rebind.
+        # So the latest version of the singleton "Annotation Rules" document
+        # wins over the task's originally-bound version.
         try:
             for doc in self.store.list_documents():
                 if doc.metadata.get("role") == "annotation_rules":
@@ -299,6 +296,14 @@ class SubagentRuntime:
                     break
         except Exception:
             pass
+        # Fallback: the task's bound version — used only by stores that have no
+        # annotation_rules singleton (legacy / non-rules document bindings).
+        if task.document_version_id:
+            try:
+                ver = self.store.load_document_version(task.document_version_id)
+                return f"Annotation guideline ({ver.version}):\n{ver.content}"
+            except FileNotFoundError:
+                pass
         return None
 
     async def _run_task(self, task: Task, stage_target: str) -> None:
