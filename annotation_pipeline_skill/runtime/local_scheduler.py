@@ -130,6 +130,11 @@ class LocalRuntimeScheduler:
         self._runtime_max_workers: int = config.max_concurrent_tasks
         self._profiles_yaml_path = profiles_yaml_path
         self._profiles_yaml_mtime: float = 0.0
+        # Independent mtime tracker for the resolve-time hot-swap (below). The
+        # background config-watcher proved unreliable in production (a provider
+        # edit went unapplied for hours), so target/profile changes are also
+        # picked up synchronously on the next client build via a cheap stat().
+        self._resolve_reload_mtime: float = 0.0
         # Per-target cooldown for the provider health probe — once the
         # observer ticks at PROBE_INTERVAL_SECONDS it walks PROBE_TARGETS
         # in order; this tracks last successful probe timestamps so a
@@ -160,7 +165,31 @@ class LocalRuntimeScheduler:
             raise RuntimeError(
                 "scheduler not in registry-binding mode; cannot resolve target"
             )
+        self._maybe_hot_swap_registry()
         return self._client_builder(self._registry.resolve(target))
+
+    def _maybe_hot_swap_registry(self) -> None:
+        """Re-read llm_profiles.yaml and swap ``self._registry`` when the file
+        changed since the last resolve. Runs on every client build (a single
+        cheap ``stat()``; full parse only on mtime change), so a provider/target
+        edit takes effect on the NEXT task without depending on the background
+        config-watcher or a restart. Failures are swallowed — a bad edit must
+        never tank task execution; the previous good registry stays in use."""
+        path = self._profiles_yaml_path
+        if path is None:
+            return
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._resolve_reload_mtime:
+            return
+        self._resolve_reload_mtime = mtime
+        try:
+            from annotation_pipeline_skill.llm.profiles import load_llm_registry
+            self._registry = load_llm_registry(path)
+        except Exception:  # noqa: BLE001 — keep the last good registry on bad edits
+            pass
 
     def _structured_output_targets(self) -> frozenset[str]:
         """Return the set of target names whose profile has structured_output=True."""
@@ -239,6 +268,17 @@ class LocalRuntimeScheduler:
             # home lacks project-trust config, causing false-positive failures.
             # Balance / auth errors don't apply to OAuth sessions, so skip.
             if getattr(getattr(client, "profile", None), "runtime", None) == "codex_cli":
+                continue
+            # Skip local endpoints (127.x / localhost / ::1). The probe
+            # exists to catch remote wallet/auth failures; pinging a local
+            # vLLM gateway resets its idle-unload timer every 5 min and
+            # prevents the GPU from being released between pipeline runs.
+            _base_url: str = getattr(getattr(client, "profile", None), "base_url", "") or ""
+            if any(_base_url.startswith(p) for p in (
+                "http://127.", "https://127.",
+                "http://localhost", "https://localhost",
+                "http://[::1]", "https://[::1]",
+            )):
                 continue
             try:
                 result = await client.generate(ping_request)
@@ -961,8 +1001,15 @@ class LocalRuntimeScheduler:
             TaskStatus.ANNOTATING: 2,
             TaskStatus.PENDING: 3,
         }
+        # Within each stage, retry tasks (expired next_retry_at) come before
+        # fresh tasks so workers don't let backed-off tasks age indefinitely
+        # while always picking newly-queued work.
         candidates.sort(
-            key=lambda t: (_STAGE_PRIORITY.get(t.status, 99), t.created_at)
+            key=lambda t: (
+                _STAGE_PRIORITY.get(t.status, 99),
+                0 if t.next_retry_at is not None else 1,  # retries first
+                t.created_at,
+            )
         )
         # Skip tasks that another worker is already running. Without this,
         # the ANNOTATING resume branch below would bounce a live in-flight
