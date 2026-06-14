@@ -3580,7 +3580,15 @@ class SubagentRuntime:
             cleaned, _, _ = _serialize_llm_json(res.final_text, task=task)
             return json.loads(cleaned)
 
-        drafts = await asyncio.gather(*[_one(t) for t in cfg.targets])
+        # Tolerate partial failure: one annotator raising / returning bad JSON
+        # must not abort the whole round. Keep only the dict results.
+        results = await asyncio.gather(*[_one(t) for t in cfg.targets], return_exceptions=True)
+        drafts = [d for d in results if isinstance(d, dict)]
+        if len(drafts) < cfg.keep_threshold:
+            raise RuntimeError(
+                f"consensus annotation: only {len(drafts)} valid drafts "
+                f"< keep_threshold {cfg.keep_threshold}"
+            )
         consensus, disagreements = _consensus.build_consensus(drafts, cfg.keep_threshold)
 
         final_payload = consensus

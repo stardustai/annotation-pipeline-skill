@@ -31,6 +31,16 @@ class _StubClient:
                                  raw_response={}, usage={}, diagnostics={})
 
 
+class _BadJsonStubClient:
+    """Returns non-JSON text — simulates an annotator that fails to produce
+    valid output so the consensus gather sees a partial failure."""
+    async def generate(self, request):
+        from annotation_pipeline_skill.llm.client import LLMGenerateResult
+        return LLMGenerateResult(runtime="stub", provider="stub", model="stub",
+                                 continuity_handle=None, final_text="not json",
+                                 raw_response={}, usage={}, diagnostics={})
+
+
 def _ann(person_rows):
     return json.dumps({"rows": [{"row_index": i, "output": {"entities": {"person": p}}}
                                 for i, p in enumerate(person_rows)]})
@@ -77,6 +87,59 @@ def test_run_task_consensus_reaches_qc(tmp_path, monkeypatch):
 
     asyncio.run(rt._run_task(store.load_task("t2"), "annotation"))
     assert called.get("ok") is True
+
+
+def test_consensus_tolerates_one_failed_annotator(tmp_path):
+    """One annotator returns invalid JSON; with keep_threshold=1 the one good
+    draft's spans survive and the task still reaches a terminal state."""
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t_partial", pipeline_id="p",
+                 source_ref={"kind": "jsonl",
+                             "payload": {"rows": [{"row_index": 0, "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+
+    # "a" returns valid JSON with verbatim-safe spans; "b" returns garbage.
+    good = _ann([["Alice", "Bob"]])
+
+    def factory(target):
+        return _StubClient(good) if target == "a" else _BadJsonStubClient()
+
+    cfg = AnnotationConfig.from_dict({
+        "replicas": 2, "targets": ["a", "b"], "keep_threshold": 1,
+        "on_disagree": "drop", "accept_directly": True,
+    })
+    rt = SubagentRuntime(store, client_factory=factory, annotation_config=cfg)
+
+    asyncio.run(rt._run_task(store.load_task("t_partial"), "annotation"))
+
+    task = store.load_task("t_partial")
+    assert task.status is TaskStatus.ACCEPTED
+    from annotation_pipeline_skill.services.entity_statistics_service import _load_latest_annotation
+    persons = _load_latest_annotation(store, "t_partial")["rows"][0]["output"]["entities"]["person"]
+    assert set(persons) == {"Alice", "Bob"}
+
+
+def test_consensus_aborts_when_too_few_valid_drafts(tmp_path):
+    """When valid drafts fall below keep_threshold, a RuntimeError is raised so
+    the scheduler's bail/escalation handles it (no silent accept)."""
+    import pytest
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t_toofew", pipeline_id="p",
+                 source_ref={"kind": "jsonl",
+                             "payload": {"rows": [{"row_index": 0, "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+
+    def factory(target):
+        return _StubClient(_ann([["Alice"]])) if target == "a" else _BadJsonStubClient()
+
+    cfg = AnnotationConfig.from_dict({
+        "replicas": 2, "targets": ["a", "b"], "keep_threshold": 2,
+    })
+    rt = SubagentRuntime(store, client_factory=factory, annotation_config=cfg)
+    with pytest.raises(RuntimeError, match="keep_threshold"):
+        asyncio.run(rt._produce_consensus_annotation(store.load_task("t_toofew")))
 
 
 def test_scheduler_threads_annotation_config(tmp_path):
