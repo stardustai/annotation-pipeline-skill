@@ -7,19 +7,30 @@ clear gaps (补漏). `replicas: 1` (the default) is the legacy single-annotator 
 
 ## Config
 
+Define one target per annotator in `llm_profiles.yaml`, then list them in `workflow.yaml`:
+
 ```yaml
+# llm_profiles.yaml  (targets map: name -> model profile)
+targets:
+  annotation: MiniMax-M3        # annotator A
+  annotation_2: claude_sonnet   # annotator B  (add a dedicated second-annotator target)
+  arbiter: codex_5.5            # arbitration model
+  qc: glm_51                    # QC model (idle in multi-annotation)
+```
+```yaml
+# workflow.yaml
 stages:
   annotation:
     replicas: 2
-    targets: [annotation, qc]   # registry TARGET names (not profile names) → models via llm_profiles.yaml
-    keep_threshold: 2           # 2 = keep only unanimous spans; the rest go to the arbiter
-    on_disagree: arbiter        # arbiter | drop
-    arbiter_target: arbiter     # the real arbitration target (point it at a reliable model in llm_profiles.yaml)
+    targets: [annotation, annotation_2]   # one purpose-named annotator target per replica
+    keep_threshold: 2                     # 2 = keep only unanimous spans; the rest go to the arbiter
+    on_disagree: arbiter                  # arbiter | drop
+    arbiter_target: arbiter               # the real arbitration target
     # accept_directly: omitted → defaults true for replicas>1 (QC is disabled in multi-annotation)
 ```
 
 - `replicas` — number of annotators run per task.
-- `targets` — exactly `replicas` **registry target names** (the keys under `targets:` in `llm_profiles.yaml`, e.g. `annotation`, `qc`, `arbiter`), **not** raw profile names. Each resolves to a model. Use **different** models for the diversity that makes agreement meaningful. (Add dedicated targets like `annotator_a`/`annotator_b` to `llm_profiles.yaml` if you want explicit names.)
+- `targets` — exactly `replicas` **registry target names** (keys under `targets:` in `llm_profiles.yaml`), **not** raw profile names. Give each annotator its **own** target (e.g. `annotation`, `annotation_2`) pointing at a **different** model — don't reuse the `qc`/`arbiter` targets as annotators; that conflates roles. Diversity between the two models is what makes agreement meaningful.
 - `keep_threshold` — a span is auto-kept if it appears in ≥ this many drafts. `replicas` = unanimous (recommended for N=2), `1` = union.
 - `on_disagree` — `arbiter` resolves below-threshold spans + adds clear misses; `drop` discards them.
 - `arbiter_target` — the **arbitration** target that reconciles the N drafts (default `arbiter`). Must be **reliable** (valid output every task). QC is a single validator and cannot arbitrate, so don't point this at `qc`; use a real arbiter model.
