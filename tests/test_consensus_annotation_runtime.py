@@ -87,3 +87,26 @@ def test_scheduler_threads_annotation_config(tmp_path):
     sched = LocalRuntimeScheduler(store=store, client_factory=lambda t: None,
                                   config=RuntimeConfig(), annotation_config=cfg)
     assert sched.annotation_config.replicas == 2
+
+
+def test_accept_directly_skips_qc_and_accepts(tmp_path, monkeypatch):
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t3", pipeline_id="p",
+                 source_ref={"kind": "jsonl", "payload": {"rows": [{"row_index": 0, "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    canned = {"a": _ann([["Alice", "Bob"]]), "b": _ann([["Alice"]]),
+              "arbiter": json.dumps({"rows": [{"row_index": 0, "output": {"entities": {"person": ["Alice", "Bob"]}}}]})}
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2,
+                                      "arbiter_target": "arbiter", "accept_directly": True})
+    rt = SubagentRuntime(store, client_factory=lambda target: _StubClient(canned[target]), annotation_config=cfg)
+
+    qc_called = {"n": 0}
+    async def fake_qc(*a, **k): qc_called["n"] += 1
+    monkeypatch.setattr(rt, "_run_validation_and_qc", fake_qc)
+
+    asyncio.run(rt._run_task(store.load_task("t3"), "annotation"))
+    assert qc_called["n"] == 0
+    assert store.load_task("t3").status is TaskStatus.ACCEPTED
+    from annotation_pipeline_skill.services.entity_statistics_service import _load_latest_annotation
+    assert set(_load_latest_annotation(store, "t3")["rows"][0]["output"]["entities"]["person"]) == {"Alice", "Bob"}
