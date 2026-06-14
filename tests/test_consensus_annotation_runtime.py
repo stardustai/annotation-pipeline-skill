@@ -147,6 +147,39 @@ def test_consensus_aborts_when_too_few_valid_drafts(tmp_path):
         asyncio.run(rt._produce_consensus_annotation(store.load_task("t_toofew")))
 
 
+def test_accept_directly_routes_invalid_annotation_to_human_review(tmp_path):
+    """accept_directly must still run deterministic validation. A cross-type
+    collision in the arbiter's output must land the task in HUMAN_REVIEW, not
+    ACCEPTED."""
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t_collide", pipeline_id="p",
+                 source_ref={"kind": "jsonl",
+                             "payload": {"rows": [{"row_index": 0, "input": "Apple shipped it"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    # Drafts disagree (forces the arbiter), and the arbiter tags the SAME span
+    # ("Apple") as two entity types in one row -> cross-type collision.
+    bad_arbiter = json.dumps({"rows": [{"row_index": 0, "output": {"entities": {
+        "organization": ["Apple"], "technology": ["Apple"]}}}]})
+    canned = {
+        "a": json.dumps({"rows": [{"row_index": 0, "output": {"entities": {"organization": ["Apple"]}}}]}),
+        "b": json.dumps({"rows": [{"row_index": 0, "output": {"entities": {"technology": ["Apple"]}}}]}),
+        "arbiter": bad_arbiter,
+    }
+    cfg = AnnotationConfig.from_dict({
+        "replicas": 2, "targets": ["a", "b"], "keep_threshold": 2,
+        "arbiter_target": "arbiter", "on_disagree": "arbiter", "accept_directly": True,
+    })
+    rt = SubagentRuntime(store, client_factory=lambda target: _StubClient(canned[target]),
+                         annotation_config=cfg)
+
+    asyncio.run(rt._run_task(store.load_task("t_collide"), "annotation"))
+
+    task = store.load_task("t_collide")
+    assert task.status is TaskStatus.HUMAN_REVIEW
+    assert task.status is not TaskStatus.ACCEPTED
+
+
 def test_scheduler_threads_annotation_config(tmp_path):
     from annotation_pipeline_skill.runtime.local_scheduler import LocalRuntimeScheduler
     from annotation_pipeline_skill.core.runtime import RuntimeConfig

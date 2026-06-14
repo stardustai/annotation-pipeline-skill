@@ -369,9 +369,27 @@ class SubagentRuntime:
                              stage="annotation", attempt_id=self._next_attempt_id(task))
             artifact, attempt_id, text = await self._produce_consensus_annotation(task)
             if self.annotation_config.accept_directly:
-                self._transition(task, TaskStatus.ACCEPTED,
-                                 reason="dual annotation + arbiter consensus (no QC stage)",
-                                 stage="annotation", attempt_id=attempt_id)
+                # accept_directly skips _run_validation_and_qc, so run the
+                # deterministic validation here too — otherwise schema/coverage/
+                # cross-type-collision checks are bypassed and a broken
+                # annotation can be ACCEPTED outright. On failure, route to
+                # HUMAN_REVIEW instead of accepting.
+                validation_failure = self._check_annotation_validation(task, text)
+                if validation_failure is not None:
+                    self._transition(
+                        task, TaskStatus.HUMAN_REVIEW,
+                        reason=(
+                            "consensus annotation failed deterministic validation "
+                            f"({validation_failure['category']}): "
+                            f"{validation_failure['message']}"
+                        ),
+                        stage="annotation", attempt_id=attempt_id,
+                        metadata={"validation_category": validation_failure["category"]},
+                    )
+                else:
+                    self._transition(task, TaskStatus.ACCEPTED,
+                                     reason="dual annotation + arbiter consensus (no QC stage)",
+                                     stage="annotation", attempt_id=attempt_id)
             else:
                 await self._run_validation_and_qc(task, artifact, attempt_id, text)
             return
