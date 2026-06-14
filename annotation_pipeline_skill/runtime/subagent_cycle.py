@@ -3546,6 +3546,58 @@ class SubagentRuntime:
         # tasks transiting ANNOTATING → VALIDATING → QC, not just PENDING → ACCEPTED.
         self.store.save_task(task)
 
+    async def _produce_consensus_annotation(self, task: "Task"):
+        """Run N annotators, build consensus, arbitrate disagreements, and write a
+        single final annotation_result artifact. Returns (artifact, attempt_id, text)."""
+        import asyncio
+        from annotation_pipeline_skill.core.schema_validation import resolve_output_schema
+        from annotation_pipeline_skill.runtime import consensus as _consensus
+
+        cfg = self.annotation_config
+        guideline = self._load_guideline(task)
+        schema = resolve_output_schema(task, self.store)
+        user_prompt = self._annotation_prompt(task)
+        instr = _annotation_instructions(task, guideline=guideline, output_schema=schema)
+
+        async def _one(target: str):
+            res = await self._generate_async(target, LLMGenerateRequest(
+                instructions=instr, prompt=user_prompt,
+                response_format=self._build_response_format(target, stage="annotation", output_schema=schema),
+                task_id=task.task_id))
+            cleaned, _, _ = _serialize_llm_json(res.final_text, task=task)
+            return json.loads(cleaned)
+
+        drafts = await asyncio.gather(*[_one(t) for t in cfg.targets])
+        consensus, disagreements = _consensus.build_consensus(drafts, cfg.keep_threshold)
+
+        final_payload = consensus
+        if disagreements and cfg.on_disagree == "arbiter":
+            src_rows = (task.source_ref or {}).get("payload", {}).get("rows", []) if isinstance(task.source_ref, dict) else []
+            row_inputs = {r.get("row_index", i): str(r.get("input") or r.get("text") or "")
+                          for i, r in enumerate(src_rows) if isinstance(r, dict)}
+            merge_prompt = _consensus.build_arbiter_merge_prompt(
+                row_inputs=row_inputs, drafts=drafts, consensus=consensus, disagreements=disagreements)
+            arb = await self._generate_async(cfg.arbiter_target, LLMGenerateRequest(
+                instructions=instr, prompt=merge_prompt,
+                response_format=self._build_response_format(cfg.arbiter_target, stage="annotation", output_schema=schema),
+                task_id=task.task_id))
+            cleaned, _, _ = _serialize_llm_json(arb.final_text, task=task)
+            final_payload = json.loads(cleaned)
+
+        attempt_id = self._next_attempt_id(task)
+        text = json.dumps(final_payload, ensure_ascii=False, sort_keys=True)
+        result = LLMGenerateResult(
+            runtime="consensus", provider="consensus", model=",".join(cfg.targets),
+            continuity_handle=None, final_text=text,
+            raw_response={}, usage={}, diagnostics={})
+        artifact = self._write_stage_artifact(task, result, kind="annotation_result",
+                                              attempt_id=attempt_id, payload={"text": text})
+        # Persist the artifact into the store so list_artifacts (and thus
+        # _load_latest_annotation / recount) can see it; _write_stage_artifact
+        # only writes the payload file to disk and returns the ref.
+        self.store.append_artifact(artifact)
+        return artifact, attempt_id, text
+
     def _write_stage_artifact(
         self,
         task: Task,
