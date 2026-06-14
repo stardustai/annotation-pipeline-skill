@@ -3616,7 +3616,7 @@ class SubagentRuntime:
             row_inputs = {r.get("row_index", i): str(r.get("input") or r.get("text") or "")
                           for i, r in enumerate(src_rows) if isinstance(r, dict)}
             merge_prompt = _consensus.build_arbiter_merge_prompt(
-                row_inputs=row_inputs, drafts=drafts, consensus=consensus, disagreements=disagreements)
+                row_inputs=row_inputs, consensus=consensus, disagreements=disagreements)
             arb = await self._generate_async(cfg.arbiter_target, LLMGenerateRequest(
                 instructions=instr, prompt=merge_prompt,
                 response_format=self._build_response_format(cfg.arbiter_target, stage="annotation", output_schema=schema),

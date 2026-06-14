@@ -9,6 +9,7 @@ the actual annotators + arbiter.
 """
 from __future__ import annotations
 
+import json
 from collections import Counter
 from typing import Iterator
 
@@ -77,17 +78,16 @@ def build_consensus(drafts: list[dict], keep_threshold: int) -> tuple[dict, list
         by_row.setdefault(ri, {"entities": {}, "json_structures": {}})[field].setdefault(typ, []).append(span)
     rows_out = []
     for ri in row_order:
-        out = {f: {t: s for t, s in by_row[ri][f].items() if s} for f in _FIELDS}
+        # Sort each span list so artifact bytes are reproducible regardless of
+        # the order spans were encountered across drafts.
+        out = {f: {t: sorted(s) for t, s in by_row[ri][f].items() if s} for f in _FIELDS}
         out = {f: v for f, v in out.items() if v}
         rows_out.append({"row_index": ri, "output": out})
     return {"rows": rows_out}, disagreements
 
 
-import json as _json
-
-
 def build_arbiter_merge_prompt(
-    *, row_inputs: dict[int, str], drafts: list[dict],
+    *, row_inputs: dict[int, str],
     consensus: dict, disagreements: list[dict],
 ) -> str:
     """Build the user prompt for the arbiter merge call. The arbiter receives the
@@ -111,5 +111,5 @@ def build_arbiter_merge_prompt(
         "- 补漏:规则明确要求但所有草稿都漏的 span 才补(verbatim)。\n"
         "- 每个 span 必须是该行 input 的 verbatim 子串。\n\n"
         "严格输出 JSON:{\"rows\":[{\"row_index\":int,\"output\":{\"entities\":{...},\"json_structures\":{...}}}]}\n\n"
-        + _json.dumps(rows, ensure_ascii=False)
+        + json.dumps(rows, ensure_ascii=False)
     )

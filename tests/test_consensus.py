@@ -67,7 +67,7 @@ def test_merge_prompt_contains_drafts_and_disagreements():
     b = {"rows": [_row(0, {"person": ["Alice"]})]}
     consensus, disagree = build_consensus([a, b], keep_threshold=2)
     prompt = build_arbiter_merge_prompt(
-        row_inputs={0: "Alice at ACME"}, drafts=[a, b],
+        row_inputs={0: "Alice at ACME"},
         consensus=consensus, disagreements=disagree,
     )
     assert "ACME" in prompt
