@@ -11,7 +11,7 @@ from typing import Callable
 from uuid import uuid4
 
 from annotation_pipeline_skill.core.models import Task
-from annotation_pipeline_skill.core.runtime import ActiveRun, RuntimeConfig, RuntimeLease, RuntimeSnapshot
+from annotation_pipeline_skill.core.runtime import ActiveRun, AnnotationConfig, RuntimeConfig, RuntimeLease, RuntimeSnapshot
 from annotation_pipeline_skill.core.states import TaskStatus
 from annotation_pipeline_skill.llm.client import LLMClient
 from annotation_pipeline_skill.runtime.snapshot import build_runtime_snapshot
@@ -103,6 +103,7 @@ class LocalRuntimeScheduler:
         registry: Any | None = None,
         client_builder: Callable[[Any], LLMClient] | None = None,
         runtime: Any | None = None,
+        annotation_config: AnnotationConfig | None = None,
     ):
         self.store = store
         # Two binding modes for client_factory:
@@ -121,6 +122,7 @@ class LocalRuntimeScheduler:
         else:
             self.client_factory = client_factory
         self.config = config
+        self.annotation_config = annotation_config or AnnotationConfig()
         self._runtime_override = runtime
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         # Source-of-truth for hot-reloadable `max_concurrent_tasks`. Workers
@@ -472,6 +474,7 @@ class LocalRuntimeScheduler:
             max_qc_rounds=self.config.max_qc_rounds,
             config=self.config,
             structured_output_targets=self._structured_output_targets(),
+            annotation_config=self.annotation_config,
         )
 
         completed = 0

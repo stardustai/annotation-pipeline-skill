@@ -77,3 +77,13 @@ def test_run_task_consensus_reaches_qc(tmp_path, monkeypatch):
 
     asyncio.run(rt._run_task(store.load_task("t2"), "annotation"))
     assert called.get("ok") is True
+
+
+def test_scheduler_threads_annotation_config(tmp_path):
+    from annotation_pipeline_skill.runtime.local_scheduler import LocalRuntimeScheduler
+    from annotation_pipeline_skill.core.runtime import RuntimeConfig
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2})
+    sched = LocalRuntimeScheduler(store=store, client_factory=lambda t: None,
+                                  config=RuntimeConfig(), annotation_config=cfg)
+    assert sched.annotation_config.replicas == 2
