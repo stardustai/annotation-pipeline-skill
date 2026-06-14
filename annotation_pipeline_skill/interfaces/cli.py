@@ -60,6 +60,13 @@ CONFIG_FILES: dict[str, str] = {
     "workflow.yaml": """stages:
   annotation:
     target: annotation
+    # --- N-way consensus annotation (optional; omit for single-annotator) ---
+    # replicas: 2                          # run N annotators per task
+    # targets: [annotator_a, annotator_b]  # one target per replica (or 1 target, broadcast to N)
+    # keep_threshold: 2                    # keep spans agreed by >=K of N (2 = unanimous)
+    # on_disagree: arbiter                 # arbiter | drop
+    # arbiter_target: arbiter              # resolves disagreements + 补漏
+    # accept_directly: false               # true: dual+arbiter ACCEPTS without a QC stage
   qc:
     target: qc
 human_review:
@@ -2139,6 +2146,11 @@ def _build_runtime_scheduler(
     def _build_client(profile):
         return LocalCLIClient(profile, store=context.store, project_id=project_id)
 
+    # N-way consensus annotation topology (replicas>1) comes from
+    # workflow.yaml stages.annotation; replicas==1 is the legacy single path.
+    annotation_config = context.config.annotation
+    annotation_config.validate()
+
     return LocalRuntimeScheduler(
         store=context.store,
         client_factory=lambda target: _build_client(context.registry.resolve(target)),
@@ -2146,6 +2158,7 @@ def _build_runtime_scheduler(
         client_builder=_build_client,
         config=runtime_config,
         profiles_yaml_path=profiles_yaml_path,
+        annotation_config=annotation_config,
     )
 
 
