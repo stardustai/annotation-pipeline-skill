@@ -76,3 +76,14 @@ def test_accept_directly_defaults_false():
 def test_accept_directly_parsed():
     c = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "accept_directly": True})
     assert c.accept_directly is True
+
+
+def test_accept_directly_defaults_true_for_multi_annotation():
+    # multi-annotation: the arbiter is the gate, QC disabled by default
+    c = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"]})
+    assert c.accept_directly is True
+
+
+def test_accept_directly_explicit_false_overrides_multi_default():
+    c = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "accept_directly": False})
+    assert c.accept_directly is False

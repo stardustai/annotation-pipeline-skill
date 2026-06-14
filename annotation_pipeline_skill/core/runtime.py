@@ -89,7 +89,7 @@ class AnnotationConfig:
     keep_threshold: int = 1
     on_disagree: str = "arbiter"   # "arbiter" (resolve+fill) | "drop" (skip below-threshold)
     arbiter_target: str = "arbiter"
-    accept_directly: bool = False   # True: after consensus+arbiter, ACCEPT without a QC stage
+    accept_directly: bool = False   # ACCEPT after arbiter, no QC stage. Defaults True when replicas>1 (see from_dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "AnnotationConfig":
@@ -100,13 +100,19 @@ class AnnotationConfig:
         if len(targets) == 1 and replicas > 1:
             targets = targets * replicas
         keep_threshold = int(data.get("keep_threshold", replicas))
+        # In multi-annotation the arbiter IS the quality gate (it cross-checks
+        # the N drafts), so QC is disabled by default — accept straight after the
+        # arbiter merge. Single-annotation keeps QC. An explicit accept_directly
+        # always wins.
+        _ad = data.get("accept_directly")
+        accept_directly = (replicas > 1) if _ad is None else bool(_ad)
         return cls(
             replicas=replicas,
             targets=targets,
             keep_threshold=keep_threshold,
             on_disagree=str(data.get("on_disagree", "arbiter")),
             arbiter_target=str(data.get("arbiter_target", "arbiter")),
-            accept_directly=bool(data.get("accept_directly", False)),
+            accept_directly=accept_directly,
         )
 
     def validate(self) -> None:

@@ -82,7 +82,7 @@ def test_run_task_consensus_reaches_qc(tmp_path, monkeypatch):
     store.save_task(t)
     canned = {"a": _ann([["Alice", "Bob"]]), "b": _ann([["Alice"]]),
               "arbiter": json.dumps({"rows": [{"row_index": 0, "output": {"entities": {"person": ["Alice", "Bob"]}}}]})}
-    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2, "arbiter_target": "arbiter"})
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2, "arbiter_target": "arbiter", "accept_directly": False})  # opt into QC (multi-annotation skips it by default)
     rt = SubagentRuntime(store, client_factory=lambda target: _StubClient(canned[target]), annotation_config=cfg)
 
     called = {}
