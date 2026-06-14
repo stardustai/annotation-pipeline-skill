@@ -107,6 +107,22 @@ class AnnotationConfig:
             arbiter_target=str(data.get("arbiter_target", "arbiter")),
         )
 
+    def validate(self) -> None:
+        if self.replicas < 1:
+            raise ValueError(f"annotation.replicas must be >= 1, got {self.replicas}")
+        if len(self.targets) != self.replicas:
+            raise ValueError(
+                f"annotation.targets must list exactly replicas={self.replicas} entries, "
+                f"got {len(self.targets)}: {self.targets}"
+            )
+        if not (1 <= self.keep_threshold <= self.replicas):
+            raise ValueError(
+                f"annotation.keep_threshold must be in [1, replicas={self.replicas}], "
+                f"got {self.keep_threshold}"
+            )
+        if self.on_disagree not in {"arbiter", "drop"}:
+            raise ValueError(f"annotation.on_disagree must be 'arbiter' or 'drop', got {self.on_disagree!r}")
+
 
 @dataclass(frozen=True)
 class ActiveRun:
