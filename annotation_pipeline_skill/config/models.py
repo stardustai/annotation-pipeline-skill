@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from annotation_pipeline_skill.core.runtime import RuntimeConfig
+from annotation_pipeline_skill.core.runtime import AnnotationConfig, RuntimeConfig
 
 
 @dataclass(frozen=True)
@@ -27,3 +27,4 @@ class ProjectConfig:
     callbacks: dict
     workflow: dict
     runtime: RuntimeConfig
+    annotation: AnnotationConfig = field(default_factory=lambda: AnnotationConfig())

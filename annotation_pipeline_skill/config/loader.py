@@ -8,7 +8,7 @@ from annotation_pipeline_skill.config.models import (
     AnnotatorConfig,
     ProjectConfig,
 )
-from annotation_pipeline_skill.core.runtime import RuntimeConfig
+from annotation_pipeline_skill.core.runtime import AnnotationConfig, RuntimeConfig
 from annotation_pipeline_skill.llm.profiles import (
     ProfileValidationError,
     load_llm_registry,
@@ -60,6 +60,9 @@ def build_project_config_from_data(
         callbacks=callbacks_data.get("callbacks", {}),
         workflow=workflow_data,
         runtime=RuntimeConfig.from_dict(workflow_data.get("runtime") or {}),
+        annotation=AnnotationConfig.from_dict(
+            (workflow_data.get("stages") or {}).get("annotation") or {}
+        ),
     )
 
 

@@ -48,3 +48,22 @@ def test_validate_rejects_target_count_mismatch():
 
 def test_validate_accepts_single():
     AnnotationConfig.from_dict({}).validate()  # no raise
+
+
+from annotation_pipeline_skill.config.loader import build_project_config_from_data
+
+
+def test_loader_parses_stages_annotation():
+    cfg = build_project_config_from_data(
+        annotators_data={}, external_data={}, callbacks_data={},
+        workflow_data={"stages": {"annotation": {"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2}}},
+    )
+    assert cfg.annotation.replicas == 2
+    assert cfg.annotation.targets == ["a", "b"]
+
+
+def test_loader_defaults_single_when_absent():
+    cfg = build_project_config_from_data(
+        annotators_data={}, external_data={}, callbacks_data={}, workflow_data={},
+    )
+    assert cfg.annotation.replicas == 1
