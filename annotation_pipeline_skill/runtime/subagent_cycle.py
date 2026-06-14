@@ -3582,6 +3582,7 @@ class SubagentRuntime:
 
         # Tolerate partial failure: one annotator raising / returning bad JSON
         # must not abort the whole round. Keep only the dict results.
+        started_at = utc_now()
         results = await asyncio.gather(*[_one(t) for t in cfg.targets], return_exceptions=True)
         drafts = [d for d in results if isinstance(d, dict)]
         if len(drafts) < cfg.keep_threshold:
@@ -3605,6 +3606,7 @@ class SubagentRuntime:
             cleaned, _, _ = _serialize_llm_json(arb.final_text, task=task)
             final_payload = json.loads(cleaned)
 
+        finished_at = utc_now()
         attempt_id = self._next_attempt_id(task)
         text = json.dumps(final_payload, ensure_ascii=False, sort_keys=True)
         result = LLMGenerateResult(
@@ -3613,10 +3615,32 @@ class SubagentRuntime:
             raw_response={}, usage={}, diagnostics={})
         artifact = self._write_stage_artifact(task, result, kind="annotation_result",
                                               attempt_id=attempt_id, payload={"text": text})
-        # Persist the artifact into the store so list_artifacts (and thus
-        # _load_latest_annotation / recount) can see it; _write_stage_artifact
-        # only writes the payload file to disk and returns the ref.
-        self.store.append_artifact(artifact)
+        # Record an Attempt covering the annotation stage so the dashboard
+        # timeline shows a stage (was stages=[] with a bare artifact write).
+        # _append_attempt persists BOTH the attempt and the artifact into the
+        # store, so list_artifacts (and thus _load_latest_annotation / recount)
+        # can see it — do not also call append_artifact (would double-insert).
+        self._append_attempt(
+            Attempt(
+                attempt_id=attempt_id,
+                task_id=task.task_id,
+                index=task.current_attempt,
+                stage="annotation",
+                status=AttemptStatus.SUCCEEDED,
+                started_at=started_at,
+                finished_at=finished_at,
+                provider_id="consensus",
+                model=",".join(cfg.targets),
+                effort=None,
+                route_role="annotation",
+                summary=(
+                    f"consensus annotation: {len(drafts)} valid drafts from "
+                    f"{len(cfg.targets)} replicas ({','.join(cfg.targets)})"
+                ),
+                artifacts=[artifact],
+            ),
+            artifact,
+        )
         return artifact, attempt_id, text
 
     def _write_stage_artifact(

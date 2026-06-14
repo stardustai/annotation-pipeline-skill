@@ -67,6 +67,11 @@ def test_consensus_two_drafts_produces_final_artifact(tmp_path):
     final = _load_latest_annotation(store, "t1")
     persons = final["rows"][0]["output"]["entities"]["person"]
     assert set(persons) == {"Alice", "Bob"}
+    # An annotation-stage attempt must be recorded for the dashboard timeline.
+    attempts = store.list_attempts("t1")
+    ann_attempts = [a for a in attempts if a.stage == "annotation"]
+    assert ann_attempts, "consensus annotation should record an annotation-stage attempt"
+    assert ann_attempts[-1].provider_id == "consensus"
 
 
 def test_run_task_consensus_reaches_qc(tmp_path, monkeypatch):
