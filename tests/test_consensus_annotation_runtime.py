@@ -57,3 +57,23 @@ def test_consensus_two_drafts_produces_final_artifact(tmp_path):
     final = _load_latest_annotation(store, "t1")
     persons = final["rows"][0]["output"]["entities"]["person"]
     assert set(persons) == {"Alice", "Bob"}
+
+
+def test_run_task_consensus_reaches_qc(tmp_path, monkeypatch):
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t2", pipeline_id="p",
+                 source_ref={"kind": "jsonl", "payload": {"rows": [{"row_index": 0, "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    canned = {"a": _ann([["Alice", "Bob"]]), "b": _ann([["Alice"]]),
+              "arbiter": json.dumps({"rows": [{"row_index": 0, "output": {"entities": {"person": ["Alice", "Bob"]}}}]})}
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2, "arbiter_target": "arbiter"})
+    rt = SubagentRuntime(store, client_factory=lambda target: _StubClient(canned[target]), annotation_config=cfg)
+
+    called = {}
+    async def fake_qc(task, artifact, attempt_id, text):
+        called["ok"] = True
+    monkeypatch.setattr(rt, "_run_validation_and_qc", fake_qc)
+
+    asyncio.run(rt._run_task(store.load_task("t2"), "annotation"))
+    assert called.get("ok") is True

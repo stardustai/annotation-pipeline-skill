@@ -363,6 +363,14 @@ class SubagentRuntime:
                 )
                 return
 
+        if self.annotation_config.replicas > 1 and task.status in (TaskStatus.PENDING, TaskStatus.ANNOTATING):
+            self._transition(task, TaskStatus.ANNOTATING,
+                             reason=f"consensus annotation: {self.annotation_config.replicas} replicas",
+                             stage="annotation", attempt_id=self._next_attempt_id(task))
+            artifact, attempt_id, text = await self._produce_consensus_annotation(task)
+            await self._run_validation_and_qc(task, artifact, attempt_id, text)
+            return
+
         guideline = self._load_guideline(task)
         annotation_attempt_id = self._next_attempt_id(task)
         self._transition(
