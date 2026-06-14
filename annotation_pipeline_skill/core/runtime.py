@@ -77,6 +77,38 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class AnnotationConfig:
+    """Annotation-stage topology, parsed from workflow.yaml `stages.annotation`.
+
+    replicas == 1 reproduces the legacy single-annotator flow exactly.
+    replicas > 1 runs N annotators (one per entry in `targets`), keeps spans
+    agreed by >= keep_threshold of them, and routes the rest to `arbiter_target`.
+    """
+    replicas: int = 1
+    targets: list[str] = field(default_factory=lambda: ["annotation"])
+    keep_threshold: int = 1
+    on_disagree: str = "arbiter"   # "arbiter" (resolve+fill) | "drop" (skip below-threshold)
+    arbiter_target: str = "arbiter"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AnnotationConfig":
+        data = data or {}
+        replicas = int(data.get("replicas", 1))
+        targets = list(data.get("targets") or ["annotation"])
+        # Broadcast a single target to N replicas (same model run N times).
+        if len(targets) == 1 and replicas > 1:
+            targets = targets * replicas
+        keep_threshold = int(data.get("keep_threshold", replicas))
+        return cls(
+            replicas=replicas,
+            targets=targets,
+            keep_threshold=keep_threshold,
+            on_disagree=str(data.get("on_disagree", "arbiter")),
+            arbiter_target=str(data.get("arbiter_target", "arbiter")),
+        )
+
+
+@dataclass(frozen=True)
 class ActiveRun:
     run_id: str
     task_id: str
