@@ -13,7 +13,7 @@ logger = logging.getLogger("annotation_pipeline_skill.runtime.subagent_cycle")
 from robust_json import loads as _robust_json_loads
 
 from annotation_pipeline_skill.core.models import ArtifactRef, Attempt, FeedbackDiscussionEntry, FeedbackRecord, Task, utc_now
-from annotation_pipeline_skill.core.runtime import RuntimeConfig
+from annotation_pipeline_skill.core.runtime import AnnotationConfig, RuntimeConfig
 from annotation_pipeline_skill.core.schema_validation import (
     SchemaValidationError,
     resolve_output_schema,
@@ -203,6 +203,7 @@ class SubagentRuntime:
         max_qc_rounds: int | None = None,
         config: RuntimeConfig | None = None,
         structured_output_targets: frozenset[str] = frozenset(),
+        annotation_config: "AnnotationConfig | None" = None,
     ):
         self.store = store
         self.client_factory = client_factory
@@ -213,6 +214,7 @@ class SubagentRuntime:
         # list test stubs it consumes a client and breaks retry flows.
         self._profile_name_cache: dict[str, str | None] = {}
         self._structured_output_targets = structured_output_targets
+        self.annotation_config = annotation_config or AnnotationConfig()
         # ``config`` carries the project-level QC sampling policy and the
         # max-rounds setting. When omitted (callers that predate the lift, or
         # tests that only care about the per-task flow), fall back to defaults.
