@@ -3625,6 +3625,15 @@ class SubagentRuntime:
             final_payload = json.loads(cleaned)
 
         finished_at = utc_now()
+        # Schema requires `row_id` on every row, but build_consensus/arbiter only
+        # carry `row_index` — backfill row_id from the task's source rows so the
+        # final annotation passes schema validation (else accept_directly → HR).
+        _src = (task.source_ref or {}).get("payload", {}).get("rows", []) if isinstance(task.source_ref, dict) else []
+        _rid = {r.get("row_index", i): r.get("row_id", f"row-{r.get('row_index', i)}")
+                for i, r in enumerate(_src) if isinstance(r, dict)}
+        for _row in (final_payload.get("rows", []) if isinstance(final_payload, dict) else []):
+            if isinstance(_row, dict) and not _row.get("row_id"):
+                _row["row_id"] = _rid.get(_row.get("row_index", 0), f"row-{_row.get('row_index', 0)}")
         attempt_id = self._next_attempt_id(task)
         text = json.dumps(final_payload, ensure_ascii=False, sort_keys=True)
         result = LLMGenerateResult(

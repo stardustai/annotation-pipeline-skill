@@ -67,6 +67,7 @@ def test_consensus_two_drafts_produces_final_artifact(tmp_path):
     final = _load_latest_annotation(store, "t1")
     persons = final["rows"][0]["output"]["entities"]["person"]
     assert set(persons) == {"Alice", "Bob"}
+    assert final["rows"][0].get("row_id")  # schema requires row_id on every row
     # An annotation-stage attempt must be recorded for the dashboard timeline.
     attempts = store.list_attempts("t1")
     ann_attempts = [a for a in attempts if a.stage == "annotation"]
