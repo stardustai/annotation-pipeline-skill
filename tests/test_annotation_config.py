@@ -67,3 +67,12 @@ def test_loader_defaults_single_when_absent():
         annotators_data={}, external_data={}, callbacks_data={}, workflow_data={},
     )
     assert cfg.annotation.replicas == 1
+
+
+def test_accept_directly_defaults_false():
+    assert AnnotationConfig.from_dict({}).accept_directly is False
+
+
+def test_accept_directly_parsed():
+    c = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "accept_directly": True})
+    assert c.accept_directly is True

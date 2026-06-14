@@ -89,6 +89,7 @@ class AnnotationConfig:
     keep_threshold: int = 1
     on_disagree: str = "arbiter"   # "arbiter" (resolve+fill) | "drop" (skip below-threshold)
     arbiter_target: str = "arbiter"
+    accept_directly: bool = False   # True: after consensus+arbiter, ACCEPT without a QC stage
 
     @classmethod
     def from_dict(cls, data: dict) -> "AnnotationConfig":
@@ -105,6 +106,7 @@ class AnnotationConfig:
             keep_threshold=keep_threshold,
             on_disagree=str(data.get("on_disagree", "arbiter")),
             arbiter_target=str(data.get("arbiter_target", "arbiter")),
+            accept_directly=bool(data.get("accept_directly", False)),
         )
 
     def validate(self) -> None:
