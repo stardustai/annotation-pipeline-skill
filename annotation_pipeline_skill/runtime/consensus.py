@@ -81,3 +81,35 @@ def build_consensus(drafts: list[dict], keep_threshold: int) -> tuple[dict, list
         out = {f: v for f, v in out.items() if v}
         rows_out.append({"row_index": ri, "output": out})
     return {"rows": rows_out}, disagreements
+
+
+import json as _json
+
+
+def build_arbiter_merge_prompt(
+    *, row_inputs: dict[int, str], drafts: list[dict],
+    consensus: dict, disagreements: list[dict],
+) -> str:
+    """Build the user prompt for the arbiter merge call. The arbiter receives the
+    per-row input text, the already-agreed consensus, and the disputed spans, and
+    must return the FINAL annotation: keep consensus, resolve each disagreement per
+    the rules (选择题), and add only clearly-required missed spans (补漏)."""
+    rows = []
+    for row in consensus.get("rows") or []:
+        ri = row.get("row_index", 0)
+        rows.append({
+            "row_index": ri,
+            "input": row_inputs.get(ri, ""),
+            "agreed": row.get("output", {}),
+            "disputed": [d for d in disagreements if d["row_index"] == ri],
+        })
+    return (
+        "你是标注仲裁器(arbiter)。每行给出 input、已一致的 agreed 标注、以及 disputed(只有部分草稿标了的 span)。\n"
+        "产出每行正确的最终标注:\n"
+        "- 保留 agreed。\n"
+        "- 对 disputed 做选择题:按规则选对的 type;不该标的删。\n"
+        "- 补漏:规则明确要求但所有草稿都漏的 span 才补(verbatim)。\n"
+        "- 每个 span 必须是该行 input 的 verbatim 子串。\n\n"
+        "严格输出 JSON:{\"rows\":[{\"row_index\":int,\"output\":{\"entities\":{...},\"json_structures\":{...}}}]}\n\n"
+        + _json.dumps(rows, ensure_ascii=False)
+    )

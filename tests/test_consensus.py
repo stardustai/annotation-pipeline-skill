@@ -57,3 +57,19 @@ def test_type_conflict_same_span_surfaces_both_as_disagreements():
     assert consensus["rows"][0]["output"].get("entities", {}) == {}
     types = {(d["type"], d["span"]) for d in disagree}
     assert types == {("organization", "Apple"), ("technology", "Apple")}
+
+
+from annotation_pipeline_skill.runtime.consensus import build_arbiter_merge_prompt
+
+
+def test_merge_prompt_contains_drafts_and_disagreements():
+    a = {"rows": [_row(0, {"person": ["Alice"], "organization": ["ACME"]})]}
+    b = {"rows": [_row(0, {"person": ["Alice"]})]}
+    consensus, disagree = build_consensus([a, b], keep_threshold=2)
+    prompt = build_arbiter_merge_prompt(
+        row_inputs={0: "Alice at ACME"}, drafts=[a, b],
+        consensus=consensus, disagreements=disagree,
+    )
+    assert "ACME" in prompt
+    assert "Alice at ACME" in prompt
+    assert "json" in prompt.lower()
