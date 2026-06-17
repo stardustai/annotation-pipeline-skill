@@ -86,6 +86,63 @@ def build_consensus(drafts: list[dict], keep_threshold: int) -> tuple[dict, list
     return {"rows": rows_out}, disagreements
 
 
+def coalesce_rows_by_index(payload: dict) -> dict:
+    """Merge rows that share a ``row_index`` into a single row.
+
+    The arbiter LLM has been observed to emit each row twice — one filled copy
+    plus one empty ``{entities:{}, json_structures:{}}`` scaffold — doubling the
+    row count and tripping the output schema's ``maxItems`` cap (every multi-row
+    task → schema_invalid → human review). We can't trust a model to keep rows
+    unique, so coalesce defensively: group by ``row_index`` (preserving first-seen
+    order) and union spans per (field, type), deduped + sorted. Empty copies
+    contribute nothing and vanish into the union; unique-row payloads pass through
+    unchanged. ``row_id`` is preserved from the first copy that carries one.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return payload
+
+    order: list[int] = []
+    merged: dict[int, dict] = {}
+    row_ids: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ri = row.get("row_index", 0)
+        if ri not in merged:
+            merged[ri] = {f: {} for f in _FIELDS}
+            order.append(ri)
+        rid = row.get("row_id")
+        if rid and ri not in row_ids:
+            row_ids[ri] = rid
+        out = row.get("output") or {}
+        if not isinstance(out, dict):
+            continue
+        for field in _FIELDS:
+            buckets = out.get(field) or {}
+            if not isinstance(buckets, dict):
+                continue
+            for typ, spans in buckets.items():
+                if not isinstance(spans, list):
+                    continue
+                dst = merged[ri][field].setdefault(typ, set())
+                dst.update(s for s in spans if isinstance(s, str) and s)
+
+    rows_out = []
+    for ri in order:
+        # Always emit BOTH fields (as {} when empty): the output schema marks
+        # entities + json_structures as required on every row, so dropping an
+        # empty field fails validation -> human review.
+        out = {f: {t: sorted(s) for t, s in merged[ri][f].items() if s} for f in _FIELDS}
+        row = {"row_index": ri, "output": out}
+        if ri in row_ids:
+            row["row_id"] = row_ids[ri]
+        rows_out.append(row)
+    return {"rows": rows_out}
+
+
 def build_arbiter_merge_prompt(
     *, row_inputs: dict[int, str],
     consensus: dict, disagreements: list[dict],

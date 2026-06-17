@@ -3625,6 +3625,12 @@ class SubagentRuntime:
             final_payload = json.loads(cleaned)
 
         finished_at = utc_now()
+        # The arbiter may re-emit rows (each row_index appearing twice — a filled
+        # copy plus an empty scaffold), doubling the row count past the schema's
+        # maxItems and bouncing every multi-row task to HR. Collapse to one row
+        # per row_index before validation.
+        if isinstance(final_payload, dict):
+            final_payload = _consensus.coalesce_rows_by_index(final_payload)
         # Schema requires `row_id` on every row, but build_consensus/arbiter only
         # carry `row_index` — backfill row_id from the task's source rows so the
         # final annotation passes schema validation (else accept_directly → HR).
