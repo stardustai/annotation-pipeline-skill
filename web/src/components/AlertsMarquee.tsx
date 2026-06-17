@@ -13,6 +13,11 @@ interface AlertsMarqueeProps {
 const REFRESH_INTERVAL_MS = 15000;
 const ALERT_LIMIT = 50;
 const EVENT_LIMIT = 30;
+
+// Alert kinds that represent genuine errors (drive red marquee + 🚨 badge).
+// Informational kinds like "config_reload" are shown in the ticker but do NOT
+// make the marquee red.
+const ERROR_ALERT_KINDS = new Set(["provider_health", "provider_alert"]);
 /** Task transitions older than this are dropped from the ticker. */
 const EVENT_FRESHNESS_MINUTES = 3;
 
@@ -104,15 +109,20 @@ export function AlertsMarquee({ storeKey, projectId, onClick, freshnessMinutes =
 
   if (items.length === 0) return null;
 
+  const hasErrors = alerts.some((a) => ERROR_ALERT_KINDS.has(a.kind ?? ""));
   return (
     <div
-      className="alerts-marquee"
+      className={`alerts-marquee${hasErrors ? "" : " alerts-marquee--ok"}`}
       role="alert"
       aria-live="polite"
       title="Click to view all alerts"
       onClick={onClick}
     >
-      <span className="alerts-marquee-badge">🚨 {alerts.length > 0 ? alerts.length : null}{alerts.length > 0 && transitions.length > 0 ? " · " : null}{transitions.length > 0 ? `▶ ${transitions.length}` : null}</span>
+      <span className="alerts-marquee-badge">
+        {hasErrors ? `🚨 ${alerts.length}` : null}
+        {hasErrors && transitions.length > 0 ? " · " : null}
+        {transitions.length > 0 ? `▶ ${transitions.length}` : null}
+      </span>
       <div className="alerts-marquee-viewport">
         <div className="alerts-marquee-track">
           {items.map((item, idx) => renderItem(item, idx, ""))}

@@ -9,7 +9,7 @@ from typing import Literal, Mapping
 import yaml
 
 
-Runtime = Literal["codex_cli", "anthropic_sdk", "openai_sdk"]
+Runtime = Literal["codex_cli", "claude_cli", "anthropic_sdk", "openai_sdk"]
 
 LLM_PROFILES_FILENAME = "llm_profiles.yaml"
 
@@ -128,10 +128,10 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
     if not isinstance(raw, dict):
         raise ProfileValidationError(f"LLM profile must be a mapping: {name}")
     runtime = raw.get("runtime")
-    if runtime not in {"codex_cli", "anthropic_sdk", "openai_sdk"}:
+    if runtime not in {"codex_cli", "claude_cli", "anthropic_sdk", "openai_sdk"}:
         raise ProfileValidationError(
-            f"profile {name} runtime must be 'codex_cli', 'anthropic_sdk', "
-            f"or 'openai_sdk', got: {runtime!r}"
+            f"profile {name} runtime must be 'codex_cli', 'claude_cli', "
+            f"'anthropic_sdk', or 'openai_sdk', got: {runtime!r}"
         )
     model = _required_string(raw.get("model"), f"profile {name} model")
     base_url = _required_string(raw.get("base_url"), f"profile {name} base_url")

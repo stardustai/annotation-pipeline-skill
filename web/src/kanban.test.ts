@@ -23,6 +23,7 @@ const snapshot: KanbanSnapshot = {
           latest_attempt_status: null,
           feedback_count: 0,
           retry_pending: false,
+          retry_wait_seconds: null,
           blocked: false,
           external_sync_pending: false,
           row_count: null,

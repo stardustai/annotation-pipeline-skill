@@ -297,6 +297,8 @@ class LocalCLIClient:
             return await self._openai_impl.generate(request)
         if self.profile.runtime == "codex_cli":
             return await self._generate_codex(request)
+        if self.profile.runtime == "claude_cli":
+            return await self._generate_claude(request)
         raise ValueError(f"unsupported runtime: {self.profile.runtime}")
 
     async def _generate_codex(self, request: LLMGenerateRequest) -> LLMGenerateResult:
@@ -374,6 +376,141 @@ class LocalCLIClient:
         finally:
             prompt_file.unlink(missing_ok=True)
 
+    async def _generate_claude(self, request: LLMGenerateRequest) -> LLMGenerateResult:
+        """Run a one-shot call using the `claude -p` CLI subprocess.
+
+        Auth is read from ~/.claude/.credentials.json by the claude binary
+        itself — no env injection or isolated home needed. The credentials
+        file is re-read by claude on each subprocess invocation, so a
+        re-login is picked up immediately without restarting the pipeline.
+        """
+        import tempfile
+
+        user_prompt = request.prompt or _messages_to_prompt(request.input_items)
+        system_prompt = _inject_schema_into_instructions(
+            request.instructions, request.response_format
+        ) or ""
+
+        # Write prompts to temp files to avoid ARG_MAX limits for long contexts.
+        sys_file: Path | None = None
+        prompt_file: Path | None = None
+        try:
+            if system_prompt:
+                with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", delete=False, suffix=".txt"
+                ) as f:
+                    sys_file = Path(f.name)
+                    f.write(system_prompt)
+
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", delete=False, suffix=".txt"
+            ) as f:
+                prompt_file = Path(f.name)
+                f.write(user_prompt)
+
+            command = [
+                "claude",
+                "-p",
+                "--model", self.profile.model,
+                "--output-format", "json",
+                "--no-session-persistence",
+                "--dangerously-skip-permissions",
+                "--allowedTools", "",
+            ]
+            if sys_file:
+                command.extend(["--system-prompt-file", str(sys_file)])
+
+            # Pass the prompt via stdin to avoid shell quoting issues.
+            prompt_bytes = user_prompt.encode("utf-8")
+
+            # Minimal env: claude CLI needs HOME to find ~/.claude/.credentials.json
+            env = {k: v for k, v in os.environ.items() if k in ("HOME", "PATH", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "XDG_RUNTIME_DIR")}
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(request.cwd) if request.cwd else None,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=_die_with_parent,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(input=prompt_bytes),
+                    timeout=float(self.profile.timeout_seconds or 900),
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                process.kill()
+                try:
+                    await process.wait()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+
+        finally:
+            if sys_file:
+                sys_file.unlink(missing_ok=True)
+            if prompt_file:
+                prompt_file.unlink(missing_ok=True)
+
+        raw_output = stdout.decode("utf-8", errors="replace").strip()
+        diagnostics: dict[str, Any] = {"returncode": process.returncode}
+        if stderr:
+            diagnostics["stderr"] = stderr.decode("utf-8", errors="replace")[-4000:]
+
+        # Parse the JSON emitted by `claude -p --output-format json`.
+        # Shape: a JSON array of event objects; the terminal element has
+        # {"type":"result","subtype":"success","result":"<text>","is_error":false,...}
+        final_text = ""
+        usage: dict[str, Any] | None = None
+        raw_response: Any = raw_output
+        result_obj: dict[str, Any] | None = None
+        try:
+            events = json.loads(raw_output)
+            if isinstance(events, list):
+                raw_response = events
+                # Find the terminal result event
+                for ev in events:
+                    if isinstance(ev, dict) and ev.get("type") == "result":
+                        result_obj = ev
+                        break
+            elif isinstance(events, dict):
+                # Fallback: single-object format (older CLI versions)
+                result_obj = events
+                raw_response = events
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        if result_obj is not None:
+            if result_obj.get("is_error"):
+                diagnostics["error_event"] = result_obj
+                raise ProviderCallError(
+                    f"claude CLI returned error: {result_obj.get('result', raw_output[:200])}",
+                    diagnostics,
+                )
+            final_text = result_obj.get("result", "")
+            raw_usage = result_obj.get("usage") or {}
+            cost = result_obj.get("total_cost_usd")
+            if raw_usage or cost:
+                usage = {**raw_usage, **({"cost_usd": cost} if cost else {})}
+        else:
+            # Fallback: treat the whole output as plain text.
+            final_text = raw_output
+
+        if process.returncode != 0 and not final_text:
+            raise ProviderCallError("claude CLI subprocess failed", diagnostics)
+
+        return LLMGenerateResult(
+            runtime="claude_cli",
+            provider=self.profile.name,
+            model=self.profile.model,
+            continuity_handle=None,  # claude_cli is one-shot; no thread resumption
+            final_text=final_text,
+            usage=usage,
+            raw_response=raw_response,
+            diagnostics=diagnostics,
+        )
 
 
 def _write_isolated_codex_config(path: Path, *, model: str, reasoning_effort: str | None) -> None:

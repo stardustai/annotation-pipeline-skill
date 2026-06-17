@@ -186,7 +186,13 @@ export function KanbanBoard({ snapshot, selectedTaskId, onSelectTask, onMoveTask
                       {card.annotator_model ? <span className="badge model-a" title="Annotator model">A: {card.annotator_model}</span> : null}
                       {card.qc_model ? <span className="badge model-q" title="QC model">Q: {card.qc_model}</span> : null}
                       {card.feedback_count > 0 ? <span className="badge warn">{card.feedback_count} feedback</span> : null}
-                      {card.retry_pending ? <span className="badge">retry</span> : null}
+                      {card.retry_pending ? (
+                        <span className={`badge ${(card.retry_wait_seconds ?? 0) > 0 ? "retry-wait" : "retry-ready"}`}>
+                          {(card.retry_wait_seconds ?? 0) > 0
+                            ? `retry ${card.retry_wait_seconds}s`
+                            : "retry"}
+                        </span>
+                      ) : null}
                       {card.external_sync_pending ? <span className="badge">sync</span> : null}
                     </span>
                   </button>
@@ -225,6 +231,7 @@ function snapshotCardOrShim(snapshot: KanbanSnapshot, taskId: string): TaskCard 
     latest_attempt_status: null,
     feedback_count: 0,
     retry_pending: false,
+    retry_wait_seconds: null,
     blocked: false,
     external_sync_pending: false,
     row_count: null,

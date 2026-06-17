@@ -200,6 +200,7 @@ def _task_card(index: dict, task: Task) -> dict:
         "latest_attempt_status": latest_attempt.get("status") if latest_attempt else None,
         "feedback_count": feedback_count,
         "retry_pending": task.next_retry_at is not None,
+        "retry_wait_seconds": max(0, int((task.next_retry_at - datetime.now(timezone.utc)).total_seconds())) if task.next_retry_at is not None else None,
         "blocked": task.status is TaskStatus.BLOCKED,
         "external_sync_pending": task.task_id in index["pending_outbox_task_ids"],
         "row_count": row_count,

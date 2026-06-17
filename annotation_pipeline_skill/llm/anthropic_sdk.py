@@ -41,18 +41,29 @@ class AnthropicSDKClient(BaseSdkClient):
         project_id: str | None = None,
     ) -> None:
         super().__init__(profile, store=store, project_id=project_id)
-        api_key = profile.resolve_api_key() or None
+        # Client is created lazily so that credentials re-read on every call.
+        # This allows the pipeline to pick up a fresh Claude OAuth token after
+        # re-login without requiring a process restart.
+        self._client: AsyncAnthropic | None = None
+        self._client_key: str | None = None  # sentinel to detect token rotation
+
+    def _get_client(self) -> AsyncAnthropic:
+        """Return a cached AsyncAnthropic client, rebuilding it if the
+        resolved key/token has changed since last call (e.g. after re-login)."""
+        api_key = self.profile.resolve_api_key() or None
         auth_token: str | None = None
         if not api_key:
             auth_token = _read_oauth_access_token(os.environ)
-        if not api_key and not auth_token:
-            api_key = "sk-no-key-configured"
-        self._client = AsyncAnthropic(
-            **({"auth_token": auth_token} if auth_token else {"api_key": api_key}),
-            base_url=profile.base_url,
-            max_retries=0,
-            timeout=float(profile.timeout_seconds or 900),
-        )
+        current_key = auth_token or api_key or "sk-no-key-configured"
+        if self._client is None or current_key != self._client_key:
+            self._client = AsyncAnthropic(
+                **({"auth_token": auth_token} if auth_token else {"api_key": current_key}),
+                base_url=self.profile.base_url,
+                max_retries=0,
+                timeout=float(self.profile.timeout_seconds or 900),
+            )
+            self._client_key = current_key
+        return self._client
 
     async def _call_api(
         self,
@@ -73,7 +84,7 @@ class AnthropicSDKClient(BaseSdkClient):
         # the outer agent loop iteration count is not inflated.
         for _pause_iter in range(10):
             try:
-                response = await self._client.messages.create(
+                response = await self._get_client().messages.create(
                     model=self.profile.model,
                     system=system or "",
                     messages=anthropic_messages,

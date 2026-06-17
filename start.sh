@@ -93,7 +93,7 @@ esac
 
 # Source API keys (silent if files don't exist).
 set -a
-for f in deepseek.env glm.env minimax.env; do
+for f in deepseek.env glm.env minimax.env anthropic.env; do
     [[ -f "${AUTH_DIR}/${f}" ]] && source "${AUTH_DIR}/${f}"
 done
 set +a

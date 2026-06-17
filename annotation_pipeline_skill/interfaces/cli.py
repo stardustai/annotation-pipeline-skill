@@ -2000,6 +2000,26 @@ def _auto_resume_schedulers(stores: dict, workspace_root: Path) -> None:
             print(f"[serve] failed to auto-resume scheduler for {project_name}: {exc}", flush=True)
 
 
+def _start_scheduler_watchdog(stores: dict, workspace_root: Path, interval: float = 30.0) -> None:
+    """Background thread: restart any scheduler whose owner file exists but PID died.
+
+    Runs every ``interval`` seconds so a crashed scheduler is detected and
+    restarted within one watchdog tick rather than waiting for the next server
+    restart.  Same logic as ``_auto_resume_schedulers``; extracted so both the
+    startup path and the watchdog share identical behaviour.
+    """
+    def _watch() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                _auto_resume_schedulers(stores, workspace_root)
+            except Exception:  # noqa: BLE001 — never let the watchdog tank serve
+                pass
+
+    t = threading.Thread(target=_watch, daemon=True, name="scheduler-watchdog")
+    t.start()
+
+
 def _start_reload_watcher(watch_dir: Path, interval: float = 1.0) -> None:
     """Background thread: restart the process when any .py file mtime changes."""
     mtimes: dict[Path, float] = {}
@@ -2040,6 +2060,7 @@ def handle_serve(args: argparse.Namespace) -> int:
     runtime_config = None
     workspace_root = Path(args.workspace).resolve()
     _auto_resume_schedulers(stores, workspace_root)
+    _start_scheduler_watchdog(stores, workspace_root)
     try:
         profiles_path = resolve_llm_profiles_path(
             workspace_root=workspace_root,
