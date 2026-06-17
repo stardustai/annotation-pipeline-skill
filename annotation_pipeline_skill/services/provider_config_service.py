@@ -60,7 +60,127 @@ def build_provider_config_snapshot(
             "max_concurrent_tasks": registry.max_concurrent_tasks,
         },
         "diagnostics": diagnostics,
+        "pipeline": _build_pipeline_view(config_root, registry.targets),
     }
+
+
+def _build_pipeline_view(
+    config_root: Path, targets: Mapping[str, str]
+) -> dict[str, Any] | None:
+    """Structured view of the project's annotation workflow for the dashboard
+    diagram. Reads the project's workflow.yaml (one level up from the
+    ``.annotation-pipeline`` config_root) and resolves each stage target to its
+    profile name. Returns None if the project config can't be loaded (e.g. the
+    workspace-global providers view with no single project in scope)."""
+    try:
+        from annotation_pipeline_skill.config.loader import load_project_config
+
+        # `config_root` may be the project root itself or its
+        # ``.annotation-pipeline`` subdir (callers differ). load_project_config
+        # appends ``.annotation-pipeline``, so normalize to the project root.
+        project_root = (
+            config_root.parent
+            if config_root.name == ".annotation-pipeline"
+            else config_root
+        )
+        ann = load_project_config(project_root).annotation
+    except Exception:
+        return None
+
+    def resolve(target: str) -> str | None:
+        return targets.get(target)
+
+    multi = ann.replicas > 1
+    qc_enabled = not ann.accept_directly
+    return {
+        "mode": "multi-annotation" if multi else "single",
+        "replicas": ann.replicas,
+        "annotators": [
+            {"target": t, "profile": resolve(t)} for t in ann.targets
+        ],
+        "keep_threshold": ann.keep_threshold,
+        "on_disagree": ann.on_disagree,
+        "arbiter": {"target": ann.arbiter_target, "profile": resolve(ann.arbiter_target)},
+        "accept_directly": ann.accept_directly,
+        "qc": {"enabled": qc_enabled, "target": "qc", "profile": resolve("qc")},
+    }
+
+
+def save_pipeline_config(
+    config_root: Path,
+    payload: Mapping[str, Any],
+    *,
+    workspace_root: Path | None = None,
+) -> dict[str, Any]:
+    """Update ``stages.annotation`` in the project's workflow.yaml from a
+    structured payload (replicas, targets, keep_threshold, on_disagree,
+    arbiter_target, accept_directly). Validates the field constraints AND that
+    every referenced target exists in llm_profiles.yaml. Returns the refreshed
+    pipeline view. NOTE: workflow.yaml is read at runtime startup, so the change
+    only takes effect after the project's runtime is restarted."""
+    from annotation_pipeline_skill.core.runtime import AnnotationConfig
+
+    # config_root may be the project root or its .annotation-pipeline subdir.
+    project_root = (
+        config_root.parent if config_root.name == ".annotation-pipeline" else config_root
+    )
+    wf_path = project_root / ".annotation-pipeline" / "workflow.yaml"
+
+    ann_in: dict[str, Any] = {
+        "replicas": int(payload.get("replicas", 1)),
+        "targets": list(payload.get("targets") or ["annotation"]),
+        "keep_threshold": int(payload.get("keep_threshold", payload.get("replicas", 1))),
+        "on_disagree": str(payload.get("on_disagree", "arbiter")),
+        "arbiter_target": str(payload.get("arbiter_target", "arbiter")),
+    }
+    if payload.get("accept_directly") is not None:
+        ann_in["accept_directly"] = bool(payload["accept_directly"])
+    cfg = AnnotationConfig.from_dict(ann_in)
+    cfg.validate()
+
+    profiles_path = resolve_llm_profiles_path(
+        workspace_root=workspace_root, project_config_root=config_root
+    )
+    if profiles_path is None:
+        raise FileNotFoundError(f"no {LLM_PROFILES_FILENAME} found")
+    registry = load_llm_registry(profiles_path)
+    missing = [t for t in (list(cfg.targets) + [cfg.arbiter_target]) if t not in registry.targets]
+    if missing:
+        raise ValueError(
+            f"unknown target(s) not mapped in {LLM_PROFILES_FILENAME} targets: {sorted(set(missing))}"
+        )
+
+    try:
+        data = yaml.safe_load(wf_path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+    ann = dict(stages.get("annotation")) if isinstance(stages.get("annotation"), dict) else {}
+    ann.setdefault("target", "annotation")
+    ann["replicas"] = cfg.replicas
+    if cfg.replicas > 1:
+        ann["targets"] = list(cfg.targets)
+        ann["keep_threshold"] = cfg.keep_threshold
+        ann["on_disagree"] = cfg.on_disagree
+        ann["arbiter_target"] = cfg.arbiter_target
+        if payload.get("accept_directly") is not None:
+            ann["accept_directly"] = bool(payload["accept_directly"])
+        else:
+            ann.pop("accept_directly", None)  # fall back to default (true for replicas>1)
+    else:
+        # Classic single-annotator: strip the multi-only keys.
+        for k in ("targets", "keep_threshold", "on_disagree", "arbiter_target", "accept_directly"):
+            ann.pop(k, None)
+    stages["annotation"] = ann
+    data["stages"] = stages
+
+    wf_path.parent.mkdir(parents=True, exist_ok=True)
+    wf_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    return _build_pipeline_view(config_root, registry.targets)
 
 
 def save_provider_config(

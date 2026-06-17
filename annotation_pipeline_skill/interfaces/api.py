@@ -32,7 +32,7 @@ from annotation_pipeline_skill.services.human_review_service import HumanReviewS
 from annotation_pipeline_skill.services.outbox_dispatch_service import build_outbox_summary
 from annotation_pipeline_skill.runtime.monitor import validate_runtime_snapshot
 from annotation_pipeline_skill.runtime.snapshot import build_runtime_snapshot
-from annotation_pipeline_skill.services.provider_config_service import build_provider_config_snapshot, save_provider_config
+from annotation_pipeline_skill.services.provider_config_service import build_provider_config_snapshot, save_provider_config, save_pipeline_config
 from annotation_pipeline_skill.services.readiness_service import build_readiness_report
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
 from annotation_pipeline_skill.llm.profiles import ProfileValidationError
@@ -1347,6 +1347,8 @@ class DashboardApi:
             return self._update_config_response(store, config_id, body)
         if route == "/api/providers":
             return self._update_provider_config_response(store, body)
+        if route == "/api/pipeline":
+            return self._update_pipeline_config_response(store, body)
         if route == "/api/annotators":
             return self._update_annotators_response(store, body)
         if route == "/api/schema":
@@ -1932,6 +1934,21 @@ class DashboardApi:
         except (FileNotFoundError, OSError, ProfileValidationError) as exc:
             return self._json_response(400, {"error": "invalid_provider_config", "detail": str(exc)})
         return self._json_response(200, snapshot)
+
+    def _update_pipeline_config_response(self, store: SqliteStore, body: bytes) -> tuple[int, dict[str, str], bytes]:
+        """PUT /api/pipeline — update stages.annotation in the project's
+        workflow.yaml from a structured payload. Per-project (store-addressed)."""
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            return self._json_response(400, {"error": "invalid_json", "detail": str(exc)})
+        if not isinstance(payload, dict):
+            return self._json_response(400, {"error": "invalid_payload"})
+        try:
+            pipeline = save_pipeline_config(store.root, payload, workspace_root=self.workspace_root)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            return self._json_response(400, {"error": "invalid_pipeline_config", "detail": str(exc)})
+        return self._json_response(200, {"pipeline": pipeline})
 
     def _test_provider_response(self, store: SqliteStore, body: bytes) -> tuple[int, dict[str, str], bytes]:
         """POST /api/providers/test — ping a single profile and return latency / error."""

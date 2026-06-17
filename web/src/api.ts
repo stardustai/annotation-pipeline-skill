@@ -6,6 +6,7 @@ import type {
   DocumentsSnapshot,
   EventLog,
   KanbanSnapshot,
+  PipelineView,
   ProjectSnapshot,
   ProviderConfigSnapshot,
   RuntimeMonitorReport,
@@ -452,6 +453,42 @@ export async function saveProviderConfig(payload: {
     throw new Error(errorPayload?.detail ?? errorPayload?.error ?? `Provider save returned ${response.status}`);
   }
   return response.json() as Promise<ProviderConfigSnapshot>;
+}
+
+export async function savePipelineConfig(payload: {
+  replicas: number;
+  targets: string[];
+  keep_threshold: number;
+  on_disagree: string;
+  arbiter_target: string;
+  accept_directly?: boolean | null;
+}, storeKey: string | null = null): Promise<{ pipeline: PipelineView | null }> {
+  const response = await fetch(withStore("/api/pipeline", storeKey), {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorPayload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+    throw new Error(errorPayload?.detail ?? errorPayload?.error ?? `Pipeline save returned ${response.status}`);
+  }
+  return response.json() as Promise<{ pipeline: PipelineView | null }>;
+}
+
+export async function testProvider(
+  profileName: string,
+  storeKey: string | null = null,
+): Promise<{ ok: boolean; latency_ms: number; error?: string }> {
+  const response = await fetch(withStore("/api/providers/test", storeKey), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ profile_name: profileName }),
+  });
+  if (!response.ok) {
+    const errorPayload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+    throw new Error(errorPayload?.detail ?? errorPayload?.error ?? `Test returned ${response.status}`);
+  }
+  return response.json() as Promise<{ ok: boolean; latency_ms: number; error?: string }>;
 }
 
 export async function fetchDocuments(storeKey: string | null = null): Promise<DocumentsSnapshot> {

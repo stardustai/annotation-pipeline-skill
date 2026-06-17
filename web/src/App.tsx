@@ -314,20 +314,25 @@ export default function App() {
               </select>
             </label>
           ) : null}
-          <label className="project-selector">
-            <span>Pipeline</span>
-            <select
-              value={selectedProjectId ?? ""}
-              onChange={(event) => handleProjectChange(event.target.value)}
-            >
-              <option value="">All pipelines</option>
-              {projects.map((project) => (
-                <option key={project.project_id} value={project.project_id}>
-                  {project.project_id} ({project.task_count} tasks)
-                </option>
-              ))}
-            </select>
-          </label>
+          {/* A store normally holds one pipeline (project), which is
+              auto-selected — so the selector only appears when a store
+              actually contains more than one pipeline to choose between. */}
+          {projects.length > 1 ? (
+            <label className="project-selector">
+              <span>Pipeline</span>
+              <select
+                value={selectedProjectId ?? ""}
+                onChange={(event) => handleProjectChange(event.target.value)}
+              >
+                <option value="">All pipelines</option>
+                {projects.map((project) => (
+                  <option key={project.project_id} value={project.project_id}>
+                    {project.project_id} ({project.task_count} tasks)
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           {loading || error ? (
             <div className={`status-pill ${error ? "error" : ""}`}>
               {loading ? "Loading" : "API error"}
@@ -456,7 +461,7 @@ export default function App() {
         />
       ) : null}
       {viewMode === "output" ? <OutputPanel projectId={selectedProjectId} storeKey={selectedStoreKey} storePath={stores.find((s) => s.key === selectedStoreKey)?.path ?? null} /> : null}
-      {viewMode === "providers" ? <ProvidersPanel /> : null}
+      {viewMode === "providers" ? <ProvidersPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "config" ? <ConfigPanel storeKey={selectedStoreKey} /> : null}
       {viewMode === "annotation-rules" ? (
         <section className="runtime-panel" aria-label="Annotation rules and schema">

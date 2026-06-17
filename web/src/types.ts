@@ -12,6 +12,7 @@ export interface TaskCard {
   latest_attempt_status: string | null;
   feedback_count: number;
   retry_pending: boolean;
+  retry_wait_seconds: number | null;
   blocked: boolean;
   external_sync_pending: boolean;
   row_count: number | null;
@@ -281,6 +282,17 @@ export interface ProviderDiagnostic {
   checks: ProviderCheck[];
 }
 
+export interface PipelineView {
+  mode: "multi-annotation" | "single";
+  replicas: number;
+  annotators: { target: string; profile: string | null }[];
+  keep_threshold: number;
+  on_disagree: string;
+  arbiter: { target: string; profile: string | null };
+  accept_directly: boolean;
+  qc: { enabled: boolean; target: string; profile: string | null };
+}
+
 export interface ProviderConfigSnapshot {
   config_valid: boolean;
   profiles: ProviderProfileConfig[];
@@ -289,6 +301,7 @@ export interface ProviderConfigSnapshot {
     max_concurrent_tasks: number | null;
   };
   diagnostics: Record<string, ProviderDiagnostic>;
+  pipeline?: PipelineView | null;
 }
 
 export type TaskDeviation = {

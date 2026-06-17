@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchProviderConfig, saveProviderConfig } from "../api";
+import { fetchProviderConfig, saveProviderConfig, savePipelineConfig, testProvider } from "../api";
 import { createProviderProfile, profileStatusLabel, profileTitle, providerConfigPayload } from "../providers";
-import type { ProviderConfigSnapshot, Runtime, ProviderProfileConfig } from "../types";
+import type { ProviderConfigSnapshot, Runtime, ProviderProfileConfig, PipelineView } from "../types";
+import { WorkflowDiagram } from "./WorkflowDiagram";
 
 // Stages the runtime resolves via `client_factory(target_name)`. Order
 // matters for layout (top row = the most-edited two; second row =
@@ -14,16 +15,26 @@ const stageTargets = [
   "fallback",
 ];
 
-export function ProvidersPanel() {
+export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }) {
   // Providers are workspace-global: a single llm_profiles.yaml shared across
   // every project in the workspace. We always pass storeKey=null so the API
   // resolves to the workspace-level file (with project-local fallback).
   const [snapshot, setSnapshot] = useState<ProviderConfigSnapshot | null>(null);
+  // The pipeline (workflow.yaml) IS per-project, so it's fetched separately with
+  // the selected store key while profile editing stays workspace-global.
+  const [pipeline, setPipeline] = useState<PipelineView | null>(null);
+  const [pipelineForm, setPipelineForm] = useState<{
+    targets: string[]; keep_threshold: number; arbiter_target: string; on_disagree: string; run_qc: boolean;
+  } | null>(null);
+  const [pipelineSaving, setPipelineSaving] = useState(false);
+  const [pipelineMsg, setPipelineMsg] = useState<string | null>(null);
   const [selectedProfile, setSelectedProfile] = useState<string | null>(null);
   const [newRuntime, setNewRuntime] = useState<Runtime>("claude_cli");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; latency_ms: number; error?: string } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -45,6 +56,85 @@ export function ProvidersPanel() {
       active = false;
     };
   }, []);
+
+  // Per-project pipeline view (multi-annotation vs classic), refetched when the
+  // selected project changes. Kept separate from the global profiles snapshot.
+  useEffect(() => {
+    let active = true;
+    fetchProviderConfig(storeKey)
+      .then((snap) => {
+        if (active) setPipeline(snap.pipeline ?? null);
+      })
+      .catch(() => {
+        if (active) setPipeline(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [storeKey]);
+
+  const availableTargets = useMemo(
+    () => (snapshot ? Object.keys(snapshot.targets) : []),
+    [snapshot],
+  );
+
+  // Keep the always-visible config form in sync with the live pipeline — on
+  // load, on project switch, and after a save (which updates `pipeline`).
+  useEffect(() => {
+    if (!pipeline) {
+      setPipelineForm(null);
+      return;
+    }
+    setPipelineForm({
+      targets: pipeline.annotators.map((a) => a.target),
+      keep_threshold: pipeline.keep_threshold,
+      arbiter_target: pipeline.arbiter.target,
+      on_disagree: pipeline.on_disagree,
+      run_qc: pipeline.qc.enabled, // multi: qc.enabled === !accept_directly
+    });
+  }, [pipeline]);
+
+  function resetPipelineForm() {
+    if (!pipeline) return;
+    setPipelineForm({
+      targets: pipeline.annotators.map((a) => a.target),
+      keep_threshold: pipeline.keep_threshold,
+      arbiter_target: pipeline.arbiter.target,
+      on_disagree: pipeline.on_disagree,
+      run_qc: pipeline.qc.enabled,
+    });
+    setPipelineMsg(null);
+  }
+
+  function patchPipelineForm(patch: Partial<NonNullable<typeof pipelineForm>>) {
+    setPipelineForm((prev) => (prev ? { ...prev, ...patch } : prev));
+  }
+
+  async function savePipeline() {
+    if (!pipelineForm) return;
+    const replicas = pipelineForm.targets.length;
+    setPipelineSaving(true);
+    setPipelineMsg(null);
+    try {
+      const res = await savePipelineConfig(
+        {
+          replicas,
+          targets: pipelineForm.targets,
+          keep_threshold: Math.min(Math.max(1, pipelineForm.keep_threshold), replicas),
+          on_disagree: pipelineForm.on_disagree,
+          arbiter_target: pipelineForm.arbiter_target,
+          accept_directly: replicas > 1 ? !pipelineForm.run_qc : undefined,
+        },
+        storeKey,
+      );
+      if (res.pipeline) setPipeline(res.pipeline);
+      setPipelineMsg("Saved to workflow.yaml — restart the project runtime to apply.");
+    } catch (reason) {
+      setPipelineMsg(reason instanceof Error ? reason.message : "Pipeline save failed");
+    } finally {
+      setPipelineSaving(false);
+    }
+  }
 
   const selected = useMemo(
     () => snapshot?.profiles.find((profile) => profile.name === selectedProfile) ?? null,
@@ -87,6 +177,20 @@ export function ProvidersPanel() {
   function updateTarget(stage: string, profileName: string) {
     if (!snapshot) return;
     setSnapshot({ ...snapshot, targets: { ...snapshot.targets, [stage]: profileName } });
+  }
+
+  async function runTest() {
+    if (!selected) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await testProvider(selected.name, null);
+      setTestResult(result);
+    } catch (reason: unknown) {
+      setTestResult({ ok: false, latency_ms: 0, error: reason instanceof Error ? reason.message : "Unknown error" });
+    } finally {
+      setTesting(false);
+    }
   }
 
   async function validateProviders() {
@@ -134,6 +238,106 @@ export function ProvidersPanel() {
       </div>
 
       {message ? <div className="notice compact">{message}</div> : null}
+
+      {/* Pipeline diagram — read-only visual of the project's annotation
+          workflow (multi-annotation vs classic), derived from workflow.yaml.
+          One workflow per project, so there's no pipeline selector. */}
+      {pipeline ? (
+        <div className="provider-pipeline" style={{ marginBottom: "1rem" }}>
+          <h3 style={{ marginTop: 0, marginBottom: "0.25rem" }}>Pipeline</h3>
+          <p style={{ marginTop: 0, marginBottom: "0.5rem", fontSize: "0.85rem", color: "var(--muted, #6b7280)" }}>
+            {pipeline.mode === "multi-annotation"
+              ? `Multi-annotation: ${pipeline.replicas} annotators → consensus → arbiter → accept (QC disabled — the arbiter is the gate).`
+              : "Classic: annotation → QC → arbiter → accept."}
+          </p>
+          <WorkflowDiagram pipeline={pipeline} />
+          {pipelineMsg ? <div className="notice compact" style={{ marginTop: "0.5rem" }}>{pipelineMsg}</div> : null}
+          {pipelineForm ? (
+            <div className="pipeline-editor" style={{ marginTop: "0.75rem", padding: "0.75rem", border: "1px solid var(--border, #2a2a2a)", borderRadius: 8 }}>
+              <h4 style={{ marginTop: 0, marginBottom: "0.25rem" }}>Configure multi-annotation</h4>
+              <p style={{ marginTop: 0, marginBottom: "0.5rem", fontSize: "0.85rem", color: "var(--muted, #6b7280)" }}>
+                One row = one annotator (replicas). Two or more annotators → multi-annotation (consensus + arbiter, QC off).
+                Targets resolve to models via Stage Targets / llm_profiles.yaml.
+              </p>
+              <label style={{ display: "block", fontWeight: 500, marginBottom: "0.25rem" }}>Annotators ({pipelineForm.targets.length})</label>
+              {pipelineForm.targets.map((t, i) => (
+                <div key={i} style={{ display: "flex", gap: "0.5rem", marginBottom: "0.35rem", alignItems: "center" }}>
+                  <select
+                    value={t}
+                    onChange={(e) => {
+                      const next = [...pipelineForm.targets];
+                      next[i] = e.target.value;
+                      patchPipelineForm({ targets: next });
+                    }}
+                  >
+                    {availableTargets.map((name) => (
+                      <option key={name} value={name}>{name}{snapshot?.targets[name] ? ` (${snapshot.targets[name]})` : ""}</option>
+                    ))}
+                  </select>
+                  {pipelineForm.targets.length > 1 ? (
+                    <button className="view-tab" type="button" onClick={() => patchPipelineForm({ targets: pipelineForm.targets.filter((_, j) => j !== i) })}>
+                      Remove
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+              <button
+                className="view-tab"
+                type="button"
+                style={{ marginBottom: "0.6rem" }}
+                onClick={() => {
+                  const unused = availableTargets.find((n) => !pipelineForm.targets.includes(n)) ?? availableTargets[0];
+                  if (unused) patchPipelineForm({ targets: [...pipelineForm.targets, unused] });
+                }}
+              >
+                + Add annotator
+              </button>
+              {pipelineForm.targets.length > 1 ? (
+                <div className="pipeline-editor-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem", marginBottom: "0.6rem" }}>
+                  <label>
+                    <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>keep_threshold (1–{pipelineForm.targets.length})</span>
+                    <input
+                      type="number" min={1} max={pipelineForm.targets.length} value={pipelineForm.keep_threshold}
+                      onChange={(e) => patchPipelineForm({ keep_threshold: Number(e.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>arbiter target</span>
+                    <select value={pipelineForm.arbiter_target} onChange={(e) => patchPipelineForm({ arbiter_target: e.target.value })}>
+                      {availableTargets.map((name) => (
+                        <option key={name} value={name}>{name}{snapshot?.targets[name] ? ` (${snapshot.targets[name]})` : ""}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>on disagreement</span>
+                    <select value={pipelineForm.on_disagree} onChange={(e) => patchPipelineForm({ on_disagree: e.target.value })}>
+                      <option value="arbiter">arbiter (resolve + fill)</option>
+                      <option value="drop">drop (discard)</option>
+                    </select>
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", alignSelf: "end" }}>
+                    <input type="checkbox" checked={pipelineForm.run_qc} onChange={(e) => patchPipelineForm({ run_qc: e.target.checked })} />
+                    <span style={{ fontSize: "0.85rem" }}>also run QC after merge</span>
+                  </label>
+                </div>
+              ) : (
+                <p style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)", marginBottom: "0.6rem" }}>
+                  Single annotator → classic annotation → QC → arbiter flow.
+                </p>
+              )}
+              <div style={{ display: "flex", gap: "0.5rem" }}>
+                <button className="primary-button" type="button" disabled={pipelineSaving} onClick={savePipeline}>
+                  {pipelineSaving ? "Saving" : "Save pipeline"}
+                </button>
+                <button className="view-tab" type="button" disabled={pipelineSaving} onClick={resetPipelineForm}>
+                  Reset
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Stage Targets — pinned to the TOP since it's the most-edited
           block and the routing decisions here determine which profile
@@ -190,7 +394,7 @@ export function ProvidersPanel() {
               className={profile.name === selectedProfile ? "provider-list-item selected" : "provider-list-item"}
               key={profile.name}
               type="button"
-              onClick={() => setSelectedProfile(profile.name)}
+              onClick={() => { setSelectedProfile(profile.name); setTestResult(null); }}
             >
               <span>{profileTitle(profile)}</span>
               <small className={`provider-status ${profileStatusLabel(snapshot, profile.name)}`}>
@@ -205,9 +409,21 @@ export function ProvidersPanel() {
             <>
               <div className="provider-section-header">
                 <h3>Profile</h3>
-                <button className="view-tab danger" type="button" onClick={deleteProfile} disabled={snapshot.profiles.length <= 1}>
-                  Delete
-                </button>
+                <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                  {testResult && (
+                    <span className={`provider-test-result ${testResult.ok ? "ok" : "fail"}`}>
+                      {testResult.ok
+                        ? `✓ ${testResult.latency_ms}ms`
+                        : `✗ ${testResult.error ?? "failed"}`}
+                    </span>
+                  )}
+                  <button className="view-tab" type="button" onClick={runTest} disabled={testing}>
+                    {testing ? "Testing…" : "Test"}
+                  </button>
+                  <button className="view-tab danger" type="button" onClick={deleteProfile} disabled={snapshot.profiles.length <= 1}>
+                    Delete
+                  </button>
+                </div>
               </div>
               <div className="provider-form-grid">
                 <TextField label="Name" value={selected.name} onChange={(value) => updateSelected({ name: value })} />
