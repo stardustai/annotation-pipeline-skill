@@ -444,6 +444,15 @@ class SubagentRuntime:
         cleaned_annotation_text, _stripped_spans, _total_spans = _serialize_llm_json(
             annotation_result.final_text, task=task
         )
+        # Strip anonymization placeholders + alpha nested-substring duplicates
+        # (deterministic, precision-safe) before persisting the annotation.
+        try:
+            from annotation_pipeline_skill.core.span_cleanup import clean_spans_in_place
+            _ap = json.loads(cleaned_annotation_text)
+            if clean_spans_in_place(_ap):
+                cleaned_annotation_text = json.dumps(_ap, ensure_ascii=False)
+        except (json.JSONDecodeError, ValueError):
+            pass
         # High-hallucination reset: if a large fraction of the annotated spans
         # were hallucinated (non-verbatim), wipe the feedback for this attempt
         # and reset to PENDING for a clean re-annotation rather than letting
@@ -3631,6 +3640,11 @@ class SubagentRuntime:
         # per row_index before validation.
         if isinstance(final_payload, dict):
             final_payload = _consensus.coalesce_rows_by_index(final_payload)
+            # Strip anonymization placeholders ({$...}, XX-masks, ORG\d+) and
+            # alpha nested-substring duplicates — deterministic precision-safe
+            # cleanup so the dual-annotation output never ships these errors.
+            from annotation_pipeline_skill.core.span_cleanup import clean_spans_in_place
+            clean_spans_in_place(final_payload)
         # Schema requires `row_id` on every row, but build_consensus/arbiter only
         # carry `row_index` — backfill row_id from the task's source rows so the
         # final annotation passes schema validation (else accept_directly → HR).
