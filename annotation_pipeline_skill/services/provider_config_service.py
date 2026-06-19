@@ -88,7 +88,9 @@ def _build_pipeline_view(
         return None
 
     def resolve(target: str) -> str | None:
-        return targets.get(target)
+        # A target name maps to a profile; a profile name used directly as a
+        # target resolves to itself.
+        return targets.get(target) or target
 
     multi = ann.replicas > 1
     qc_enabled = not ann.accept_directly
@@ -144,10 +146,12 @@ def save_pipeline_config(
     if profiles_path is None:
         raise FileNotFoundError(f"no {LLM_PROFILES_FILENAME} found")
     registry = load_llm_registry(profiles_path)
-    missing = [t for t in (list(cfg.targets) + [cfg.arbiter_target]) if t not in registry.targets]
+    # Accept either a named target OR a profile used directly as an annotator.
+    known = set(registry.targets) | set(registry.profiles)
+    missing = [t for t in (list(cfg.targets) + [cfg.arbiter_target]) if t not in known]
     if missing:
         raise ValueError(
-            f"unknown target(s) not mapped in {LLM_PROFILES_FILENAME} targets: {sorted(set(missing))}"
+            f"unknown target/profile(s) not in {LLM_PROFILES_FILENAME}: {sorted(set(missing))}"
         )
 
     try:

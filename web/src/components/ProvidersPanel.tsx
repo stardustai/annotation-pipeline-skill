@@ -4,15 +4,12 @@ import { createProviderProfile, profileStatusLabel, profileTitle, providerConfig
 import type { ProviderConfigSnapshot, Runtime, ProviderProfileConfig, PipelineView } from "../types";
 import { WorkflowDiagram } from "./WorkflowDiagram";
 
-// Stages the runtime resolves via `client_factory(target_name)`. Order
-// matters for layout (top row = the most-edited two; second row =
-// arbitration; third = fallback). Note: `arbiter_secondary` is the
-// prior-divergence second arbiter and should usually be a different
-// LLM family from `arbiter` to keep the cross-LLM check honest.
-const stageTargets = [
-  "annotation", "qc",
-  "arbiter", "arbiter_secondary",
-  "fallback",
+// Preferred display order for the well-known stage targets; ANY other target
+// present in llm_profiles.yaml (annotation_2, annotation_sonnet, custom ones)
+// is rendered after these — the grid is NOT limited to a fixed set.
+const STAGE_TARGET_ORDER = [
+  "annotation", "annotation_2", "annotation_sonnet", "qc",
+  "arbiter", "arbiter_secondary", "fallback",
 ];
 
 export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }) {
@@ -35,6 +32,7 @@ export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }
   const [message, setMessage] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; latency_ms: number; error?: string } | null>(null);
+  const [newTargetName, setNewTargetName] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -77,6 +75,22 @@ export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }
     () => (snapshot ? Object.keys(snapshot.targets) : []),
     [snapshot],
   );
+
+  // All stage targets present in llm_profiles.yaml, well-known ones first then
+  // any extras (annotation_2, annotation_sonnet, custom). Not a fixed list.
+  const orderedStageTargets = useMemo(() => {
+    const keys = snapshot ? Object.keys(snapshot.targets) : [];
+    const known = STAGE_TARGET_ORDER.filter((k) => keys.includes(k));
+    const extra = keys.filter((k) => !STAGE_TARGET_ORDER.includes(k)).sort();
+    return [...known, ...extra];
+  }, [snapshot]);
+
+  function addStageTarget() {
+    const name = newTargetName.trim();
+    if (!name || !snapshot || snapshot.targets[name] !== undefined) return;
+    setSnapshot({ ...snapshot, targets: { ...snapshot.targets, [name]: "" } });
+    setNewTargetName("");
+  }
 
   // Keep the always-visible config form in sync with the live pipeline — on
   // load, on project switch, and after a save (which updates `pipeline`).
@@ -270,9 +284,16 @@ export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }
                       patchPipelineForm({ targets: next });
                     }}
                   >
-                    {availableTargets.map((name) => (
-                      <option key={name} value={name}>{name}{snapshot?.targets[name] ? ` (${snapshot.targets[name]})` : ""}</option>
-                    ))}
+                    <optgroup label="Targets (role → model)">
+                      {availableTargets.map((name) => (
+                        <option key={`t-${name}`} value={name}>{name}{snapshot?.targets[name] ? ` (${snapshot.targets[name]})` : ""}</option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Models (pick a provider directly)">
+                      {(snapshot?.profiles ?? []).map((p) => (
+                        <option key={`p-${p.name}`} value={p.name}>{p.name}</option>
+                      ))}
+                    </optgroup>
                   </select>
                   {pipelineForm.targets.length > 1 ? (
                     <button className="view-tab" type="button" onClick={() => patchPipelineForm({ targets: pipelineForm.targets.filter((_, j) => j !== i) })}>
@@ -304,9 +325,16 @@ export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }
                   <label>
                     <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>arbiter target</span>
                     <select value={pipelineForm.arbiter_target} onChange={(e) => patchPipelineForm({ arbiter_target: e.target.value })}>
-                      {availableTargets.map((name) => (
-                        <option key={name} value={name}>{name}{snapshot?.targets[name] ? ` (${snapshot.targets[name]})` : ""}</option>
-                      ))}
+                      <optgroup label="Targets (role → model)">
+                        {availableTargets.map((name) => (
+                          <option key={`t-${name}`} value={name}>{name}{snapshot?.targets[name] ? ` (${snapshot.targets[name]})` : ""}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Models (pick a provider directly)">
+                        {(snapshot?.profiles ?? []).map((p) => (
+                          <option key={`p-${p.name}`} value={p.name}>{p.name}</option>
+                        ))}
+                      </optgroup>
                     </select>
                   </label>
                   <label>
@@ -347,15 +375,14 @@ export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }
       <div className="provider-targets" style={{ marginBottom: "1rem" }}>
         <h3 style={{ marginTop: 0 }}>Stage Targets</h3>
         <p style={{ marginTop: "-0.25rem", marginBottom: "0.5rem", fontSize: "0.85rem", color: "var(--muted, #6b7280)" }}>
-          Each stage routes to one profile at runtime via{" "}
-          <code>client_factory(stage_name)</code>. <code>arbiter_secondary</code>{" "}
-          is the prior-divergence second arbiter — use a different LLM family
-          from <code>arbiter</code> for an honest cross-LLM check.{" "}
-          <code>fallback</code> is invoked on transient provider errors
-          (429 / 5xx) when a primary stage call fails.
+          Every target configured in <code>llm_profiles.yaml</code> is shown here and routes to one
+          profile at runtime via <code>client_factory(target_name)</code> — including the
+          multi-annotation targets (<code>annotation_2</code>, …). Point any of them at any profile
+          (glm, haiku, …), or add a new target below. <code>arbiter_secondary</code> is the
+          prior-divergence second arbiter; <code>fallback</code> is used on transient provider errors.
         </p>
         <div className="target-grid">
-          {stageTargets.map((stage) => (
+          {orderedStageTargets.map((stage) => (
             <label key={stage}>
               <span>{stage}</span>
               <select value={snapshot.targets[stage] ?? ""} onChange={(event) => updateTarget(stage, event.target.value)}>
@@ -373,6 +400,22 @@ export function ProvidersPanel({ storeKey = null }: { storeKey?: string | null }
             value={snapshot.limits.max_concurrent_tasks}
             onChange={(value) => setSnapshot({ ...snapshot, limits: { max_concurrent_tasks: value } })}
           />
+        </div>
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.5rem" }}>
+          <input
+            type="text"
+            placeholder="new target name (e.g. annotation_3)"
+            value={newTargetName}
+            onChange={(event) => setNewTargetName(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Enter") addStageTarget(); }}
+            style={{ flex: "0 1 280px" }}
+          />
+          <button className="view-tab" type="button" onClick={addStageTarget} disabled={!newTargetName.trim()}>
+            + Add target
+          </button>
+          <span style={{ fontSize: "0.8rem", color: "var(--muted, #6b7280)" }}>
+            then assign it a profile above and Save
+          </span>
         </div>
       </div>
 

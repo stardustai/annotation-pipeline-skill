@@ -73,6 +73,11 @@ class LLMRegistry:
     def resolve(self, target: str) -> LLMProfile:
         profile_name = self.targets.get(target)
         if not profile_name:
+            # A profile name may be used directly as a target (e.g. an
+            # annotator pointed straight at `glm_46` / `claude_haiku` instead
+            # of going through a named target). Fall back to that.
+            if target in self.profiles:
+                return self.profiles[target]
             raise ProfileValidationError(f"LLM target is not configured: {target}")
         profile = self.profiles.get(profile_name)
         if profile is None:
