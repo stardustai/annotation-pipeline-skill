@@ -1148,6 +1148,13 @@ class SubagentRuntime:
         """Return list of {feedback, payload} for ALL divergent (span, type) pairs,
         or None when every span is agree/cold_start.
         """
+        # Multi-annotation: the consensus arbiter IS the quality gate, so the
+        # prior cross-check (which routes divergences to a second arbiter) is
+        # redundant — and actively harmful while priors still reflect pre-fix
+        # data: it flags the corrected types as "divergent" and reverts them to
+        # the polluted dominant prior. Skip it entirely for replicas > 1.
+        if self.annotation_config.replicas > 1:
+            return None
         from annotation_pipeline_skill.services.entity_statistics_service import (
             EntityStatisticsService,
             iter_span_decisions,
