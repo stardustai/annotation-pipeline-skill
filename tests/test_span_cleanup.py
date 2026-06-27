@@ -86,21 +86,27 @@ def test_nested_rule_is_entities_only():
 
 
 def test_placeholder_still_dropped_in_json_structures():
+    # Use a VALID json_structures type (status) — 'number' is an entity type and
+    # is now relocated to entities by key-normalization, so it can't double as
+    # the json_structures example here.
     p = {"rows": [{"row_index": 0, "row_id": "r0", "output": {
-        "entities": {}, "json_structures": {"number": ["{$300.00}", "fifteen"]},
+        "entities": {}, "json_structures": {"status": ["{$300.00}", "still broken"]},
     }}]}
     removed = clean_spans_in_place(p)
     assert removed == 1
-    assert p["rows"][0]["output"]["json_structures"]["number"] == ["fifteen"]
+    assert p["rows"][0]["output"]["json_structures"]["status"] == ["still broken"]
 
 
-def test_company_retyped_from_technology_to_organization():
+def test_app_names_are_NOT_blanket_retyped_to_organization():
+    # Policy (2026-06-19): the blanket technology->organization retype was removed.
+    # In this app-review domain, app/product mentions stay `technology`; the
+    # company-vs-app call is per-mention and left to the annotator. So clean_spans
+    # must NOT move google/Skype out of technology.
     p = _payload({"technology": ["google", "PyTorch", "Skype"], "organization": ["Acme"]})
-    changed = clean_spans_in_place(p)
+    clean_spans_in_place(p)
     ent = p["rows"][0]["output"]["entities"]
-    assert ent["technology"] == ["PyTorch"]            # real tech kept
-    assert set(ent["organization"]) == {"Acme", "google", "Skype"}  # companies moved
-    assert changed == 2
+    assert set(ent["technology"]) == {"google", "PyTorch", "Skype"}  # untouched
+    assert ent["organization"] == ["Acme"]
 
 
 def test_sensor_row_drops_bare_numbers():
@@ -129,14 +135,128 @@ def test_version_strings_dropped_from_number():
     assert p["rows"][0]["output"]["entities"]["number"] == ["10%"]   # versions dropped, unit kept
 
 
-def test_company_variants_retyped():
+def test_app_name_variants_stay_technology():
+    # Policy (2026-06-19): blanket app->organization retype removed; app/product
+    # names (incl. spacing/nickname variants) stay `technology` unless the
+    # annotator tags the company-entity sense.
     p = _payload({"technology": ["you tube", "what's app", "tripadvisor"]})
     clean_spans_in_place(p)
     ent = p["rows"][0]["output"]["entities"]
-    assert "technology" not in ent
-    assert set(ent["organization"]) == {"you tube", "what's app", "tripadvisor"}
+    assert set(ent["technology"]) == {"you tube", "what's app", "tripadvisor"}
+    assert "organization" not in ent
 
 
 def test_clean_noop_on_clean_payload():
     p = _payload({"organization": ["Chase", "Equifax"], "number": ["1500"]})
     assert clean_spans_in_place(p) == 0
+
+
+# ── type-key normalization (2026-06-19) ─────────────────────────────────────
+# Annotators mis-section type-keys (entity types under json_structures, or vice
+# versa) and emit whitespace-prefixed keys, which fail schema validation and
+# bounce tasks to Human Review even though the spans are fine. Regression for
+# the 43-task HR backlog (16 of which were exactly this).
+from annotation_pipeline_skill.core.span_cleanup import normalize_output_keys_in_place
+
+
+def test_entity_type_key_under_json_structures_is_moved_to_entities():
+    payload = {"rows": [{"row_index": 0, "output": {
+        "entities": {"technology": ["ppsspp"]},
+        "json_structures": {"document": ["ppsspp FAQ"], "status": ["works well"]},
+    }}]}
+    n = normalize_output_keys_in_place(payload)
+    out = payload["rows"][0]["output"]
+    assert out["entities"]["document"] == ["ppsspp FAQ"]      # moved into entities
+    assert "document" not in out["json_structures"]           # gone from json
+    assert out["json_structures"]["status"] == ["works well"] # untouched
+    assert out["entities"]["technology"] == ["ppsspp"]
+    assert n >= 1
+
+
+def test_time_under_json_structures_is_moved_to_entities():
+    payload = {"rows": [{"row_index": 0, "output": {
+        "entities": {}, "json_structures": {"time": ["seven minutes"]},
+    }}]}
+    normalize_output_keys_in_place(payload)
+    out = payload["rows"][0]["output"]
+    assert out["entities"]["time"] == ["seven minutes"]
+    assert "time" not in out["json_structures"]
+
+
+def test_whitespace_prefixed_keys_are_stripped():
+    payload = {"rows": [{"row_index": 0, "output": {
+        "entities": {"\ntechnology": ["Android"]},
+        "json_structures": {"\ndecision": ["we will ship"]},
+    }}]}
+    normalize_output_keys_in_place(payload)
+    out = payload["rows"][0]["output"]
+    assert out["entities"]["technology"] == ["Android"]
+    assert out["json_structures"]["decision"] == ["we will ship"]
+    assert "\ntechnology" not in out["entities"]
+
+
+def test_normalization_merges_and_dedupes():
+    # 'document' arrives in both sections; entities is the valid home.
+    payload = {"rows": [{"row_index": 0, "output": {
+        "entities": {"document": ["Exhibit B"]},
+        "json_structures": {"document": ["Exhibit B", "Schedule 3.1"]},
+    }}]}
+    normalize_output_keys_in_place(payload)
+    out = payload["rows"][0]["output"]
+    assert sorted(out["entities"]["document"]) == ["Exhibit B", "Schedule 3.1"]
+    assert "document" not in out["json_structures"]
+
+
+def test_clean_spans_in_place_applies_key_normalization():
+    # End-to-end: clean_spans_in_place must also normalize keys (single wiring point).
+    payload = {"rows": [{"row_index": 0, "output": {
+        "entities": {}, "json_structures": {"time": ["3 years"]},
+    }}]}
+    clean_spans_in_place(payload)
+    out = payload["rows"][0]["output"]
+    assert out["entities"]["time"] == ["3 years"]
+    assert "time" not in out["json_structures"]
+
+
+def test_strips_disallowed_top_level_payload_keys():
+    # The answer schema allows only `rows` at the top level. Some imports leaked
+    # auxiliary keys (e.g. `discussion_replies`) into the answer payload, which
+    # fails root-level additionalProperties and blocks corrections. Strip them.
+    payload = {
+        "rows": [{"row_index": 0, "output": {"entities": {}, "json_structures": {}}}],
+        "discussion_replies": [{"author": "x", "text": "hi"}],
+    }
+    n = normalize_output_keys_in_place(payload)
+    assert "discussion_replies" not in payload
+    assert "rows" in payload
+    assert n >= 1
+
+
+def test_clean_spans_strips_top_level_and_placeholder_together():
+    payload = {
+        "rows": [{"row_index": 0, "output": {
+            "entities": {"organization": ["ORG616", "Chase"]}, "json_structures": {}}}],
+        "discussion_replies": ["leaked"],
+    }
+    clean_spans_in_place(payload)
+    assert "discussion_replies" not in payload                       # top-level stripped
+    assert payload["rows"][0]["output"]["entities"]["organization"] == ["Chase"]  # ORG616 dropped
+
+
+def test_top_level_strip_noop_when_only_rows():
+    payload = {"rows": [{"row_index": 0, "output": {"entities": {}, "json_structures": {}}}]}
+    n = normalize_output_keys_in_place(payload)
+    assert set(payload.keys()) == {"rows"}
+    assert n == 0
+
+
+def test_technology_phrase_stays_in_json_structures():
+    # 'technology' is valid in both; keep it where the annotator put it.
+    payload = {"rows": [{"row_index": 0, "output": {
+        "entities": {"technology": ["Python"]},
+        "json_structures": {"technology": ["Large Language Models"]},
+    }}]}
+    normalize_output_keys_in_place(payload)
+    out = payload["rows"][0]["output"]
+    assert out["entities"]["technology"] == ["Python"]
+    assert out["json_structures"]["technology"] == ["Large Language Models"]
