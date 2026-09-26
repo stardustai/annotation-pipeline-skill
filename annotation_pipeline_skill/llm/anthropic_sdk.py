@@ -98,7 +98,7 @@ class AnthropicSDKClient(BaseSdkClient):
                     messages=anthropic_messages,
                     tools=tools or anthropic.NOT_GIVEN,
                     metadata=metadata or anthropic.NOT_GIVEN,
-                    max_tokens=32000,
+                    max_tokens=self.profile.max_output_tokens or 32000,
                     extra_headers=extra_headers or None,
                 )
             except anthropic.APIError as exc:

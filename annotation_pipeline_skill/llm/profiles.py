@@ -50,6 +50,12 @@ class LLMProfile:
     disable_continuity: bool | None = None
     structured_output: bool | None = None
     tools: list[dict] | None = None
+    # Output controls for API runtimes (openai_sdk, anthropic_sdk). Unset = the server's own default.
+    # A response that hits max_output_tokens is reported as truncated and is never accepted as an answer
+    # (runtime/subagent_cycle.py retries it); frequency_penalty (-2..2) discourages the repetition loops
+    # that run a response to the limit.
+    max_output_tokens: int | None = None
+    frequency_penalty: float | None = None
 
     def resolve_api_key(self, env: Mapping[str, str] = os.environ) -> str:
         if self.api_key:
@@ -156,6 +162,8 @@ def _parse_profile(name: str, raw: object) -> LLMProfile:
         disable_continuity=_optional_bool(raw.get("disable_continuity"), f"profile {name} disable_continuity"),
         structured_output=_optional_bool(raw.get("structured_output"), f"profile {name} structured_output"),
         tools=_optional_tool_groups(raw.get("tools"), f"profile {name} tools"),
+        max_output_tokens=_optional_positive_int(raw.get("max_output_tokens"), f"profile {name} max_output_tokens"),
+        frequency_penalty=_optional_penalty(raw.get("frequency_penalty"), f"profile {name} frequency_penalty"),
     )
 
 
@@ -208,6 +216,16 @@ def _optional_positive_int(value: object, label: str) -> int | None:
     if parsed <= 0:
         raise ProfileValidationError(f"invalid {label}")
     return parsed
+
+
+def _optional_penalty(value: object, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProfileValidationError(f"invalid {label}: must be a number between -2 and 2")
+    if not -2.0 <= float(value) <= 2.0:
+        raise ProfileValidationError(f"invalid {label}: must be between -2 and 2")
+    return float(value)
 
 
 def _optional_non_negative_int(value: object, label: str) -> int | None:

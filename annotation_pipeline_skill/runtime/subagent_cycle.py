@@ -21,6 +21,7 @@ from annotation_pipeline_skill.core.schema_validation import (
 )
 from annotation_pipeline_skill.core.states import AttemptStatus, FeedbackSeverity, FeedbackSource, TaskStatus
 from annotation_pipeline_skill.core.transitions import transition_task
+from annotation_pipeline_skill.llm.base_sdk_client import ProviderCallError
 from annotation_pipeline_skill.llm.client import LLMClient, LLMGenerateRequest, LLMGenerateResult
 from annotation_pipeline_skill.llm.structured_output import (
     build_annotation_strict_schema,
@@ -429,7 +430,7 @@ class SubagentRuntime:
                 conventions_block + "\n\n" + annotation_user_prompt
             )
         _ann_output_schema = resolve_output_schema(task, self.store)
-        annotation_result = await self._generate_async(
+        annotation_result = await self._generate_complete(
             stage_target,
             LLMGenerateRequest(
                 instructions=_annotation_instructions(
@@ -1446,6 +1447,24 @@ class SubagentRuntime:
         logger.warning(
             "arbiter_enum_coerce task=%s dropped=%s rescued=%s",
             task.task_id, dropped, rescued or {},
+        )
+
+    # A model that loops ("AI", "AI", "AI", ...) runs to its output limit and the SDK client returns the
+    # cut-off text with diagnostics["truncated"]. Half a JSON document is not an answer: the parser would
+    # auto-close it, keep one row, and the empty-row backfill would make that draft look valid. So such a
+    # response is generated again, and if it keeps truncating the call fails instead of returning it.
+    TRUNCATED_RESPONSE_ATTEMPTS = 3
+
+    async def _generate_complete(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
+        for _attempt in range(self.TRUNCATED_RESPONSE_ATTEMPTS):
+            result = await self._generate_async(target, request)
+            if not (result.diagnostics or {}).get("truncated"):
+                return result
+        raise ProviderCallError(
+            f"{target}: response truncated at the output limit in {self.TRUNCATED_RESPONSE_ATTEMPTS} "
+            f"consecutive attempts; not accepting a partial annotation",
+            {"error_kind": "truncated_response", "target": target, "attempts": self.TRUNCATED_RESPONSE_ATTEMPTS,
+             "stop_reason": (result.diagnostics or {}).get("stop_reason")},
         )
 
     async def _generate_async(self, target: str, request: LLMGenerateRequest) -> LLMGenerateResult:
@@ -3627,7 +3646,7 @@ class SubagentRuntime:
         instr = _annotation_instructions(task, guideline=guideline, output_schema=schema)
 
         async def _one(target: str):
-            res = await self._generate_async(target, LLMGenerateRequest(
+            res = await self._generate_complete(target, LLMGenerateRequest(
                 instructions=instr, prompt=user_prompt,
                 response_format=self._build_response_format(target, stage="annotation", output_schema=schema),
                 task_id=task.task_id))
@@ -3657,7 +3676,7 @@ class SubagentRuntime:
             merge_prompt = _consensus.build_arbiter_merge_prompt(
                 source_rows=src_rows, consensus=consensus, disagreements=disagreements)
             self._persist_substage(task, "arbitrating")  # arbiter resolves disagreements
-            arb = await self._generate_async(cfg.arbiter_target, LLMGenerateRequest(
+            arb = await self._generate_complete(cfg.arbiter_target, LLMGenerateRequest(
                 instructions=instr, prompt=merge_prompt,
                 response_format=self._build_response_format(cfg.arbiter_target, stage="annotation", output_schema=schema),
                 task_id=task.task_id))

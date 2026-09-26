@@ -177,3 +177,45 @@ def test_openai_sdk_profile_is_valid_runtime(tmp_path):
     })
     assert profile.runtime == "openai_sdk"
     assert profile.model == "qwen3.6-35b-a3b"
+
+
+def test_output_controls_are_optional_and_validated(tmp_path: Path):
+    p = _write_yaml(tmp_path, """
+profiles:
+  capped:
+    runtime: openai_sdk
+    model: m
+    base_url: http://127.0.0.1:1/v1
+    max_output_tokens: 16384
+    frequency_penalty: 0.3
+  plain:
+    runtime: openai_sdk
+    model: m
+    base_url: http://127.0.0.1:1/v1
+targets:
+  annotation: capped
+  qc: plain
+""")
+    registry = load_llm_registry(p)
+    capped, plain = registry.resolve("annotation"), registry.resolve("qc")
+    assert (capped.max_output_tokens, capped.frequency_penalty) == (16384, 0.3)
+    assert (plain.max_output_tokens, plain.frequency_penalty) == (None, None)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_output_tokens", 0), ("max_output_tokens", "many"),
+    ("frequency_penalty", 2.5), ("frequency_penalty", "high"), ("frequency_penalty", True),
+])
+def test_invalid_output_controls_raise(tmp_path: Path, field, value):
+    p = _write_yaml(tmp_path, f"""
+profiles:
+  bad:
+    runtime: openai_sdk
+    model: m
+    base_url: http://127.0.0.1:1/v1
+    {field}: {value}
+targets:
+  annotation: bad
+""")
+    with pytest.raises(ProfileValidationError):
+        load_llm_registry(p)

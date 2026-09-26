@@ -356,3 +356,55 @@ def test_substage_is_cleared_when_the_consensus_cycle_raises(tmp_path):
     with pytest.raises(RuntimeError, match="keep_threshold"):
         asyncio.run(rt._run_task(store.load_task("t_fail"), "annotation"))
     assert _substage(store, "t_fail") is None
+
+
+class _TruncatingThenCompleteClient:
+    """Answers with a cut-off response (the SDK client's diagnostics["truncated"]) `truncated` times, then a
+    complete one — or never completes when `truncated` is None."""
+    def __init__(self, complete_text, truncated):
+        self._complete, self._truncated, self.calls = complete_text, truncated, 0
+
+    async def generate(self, request):
+        from annotation_pipeline_skill.llm.client import LLMGenerateResult
+        self.calls += 1
+        cut = self._truncated is None or self.calls <= self._truncated
+        # a loop runs to the limit: the text is a fragment that the lenient parser would happily auto-close
+        text = '{"rows": [{"row_index": 0, "row_id": "r0", "output": {"entities": {"person": ["Alice", "Alice", "Alice"' if cut else self._complete
+        return LLMGenerateResult(runtime="stub", provider="stub", model="stub", continuity_handle=None,
+                                 final_text=text, raw_response={}, usage={},
+                                 diagnostics={"truncated": True, "stop_reason": "max_tokens"} if cut else {})
+
+
+def _two_annotator_task(tmp_path, task_id):
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id=task_id, pipeline_id="p",
+                 source_ref={"kind": "jsonl", "payload": {"rows": [{"row_index": 0, "row_id": "r0", "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    return store
+
+
+def test_truncated_response_is_generated_again_and_only_the_complete_one_is_used(tmp_path):
+    store = _two_annotator_task(tmp_path, "t_trunc_retry")
+    good = _ann([["Alice", "Bob"]])
+    flaky = _TruncatingThenCompleteClient(good, truncated=2)
+    steady = _StubClient(good)
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2})
+    rt = SubagentRuntime(store, client_factory=lambda target: flaky if target == "a" else steady, annotation_config=cfg)
+    asyncio.run(rt._produce_consensus_annotation(store.load_task("t_trunc_retry")))
+    assert flaky.calls == 3  # two cut-off responses were thrown away
+    from annotation_pipeline_skill.services.entity_statistics_service import _load_latest_annotation
+    assert set(_load_latest_annotation(store, "t_trunc_retry")["rows"][0]["output"]["entities"]["person"]) == {"Alice", "Bob"}
+
+
+def test_response_that_always_truncates_fails_the_draft_instead_of_being_auto_closed(tmp_path):
+    import pytest
+    store = _two_annotator_task(tmp_path, "t_trunc_fail")
+    looping = _TruncatingThenCompleteClient(None, truncated=None)
+    steady = _StubClient(_ann([["Alice", "Bob"]]))
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2})
+    rt = SubagentRuntime(store, client_factory=lambda target: looping if target == "a" else steady, annotation_config=cfg)
+    # the truncated draft is dropped (not repaired into a one-row draft), so only one valid draft remains
+    with pytest.raises(RuntimeError, match="keep_threshold"):
+        asyncio.run(rt._produce_consensus_annotation(store.load_task("t_trunc_fail")))
+    assert looping.calls == SubagentRuntime.TRUNCATED_RESPONSE_ATTEMPTS

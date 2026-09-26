@@ -293,3 +293,24 @@ def test_api_error_raises_local_cli_execution_error(tmp_path, monkeypatch):
         ))
     assert "401" in str(exc.value) or "Unauthorized" in str(exc.value)
     assert exc.value.diagnostics["runtime"] == "openai_sdk"
+
+
+# --- output controls ---------------------------------------------------------
+
+def test_output_controls_forwarded_when_set(tmp_path, monkeypatch):
+    mock = _patch_create(monkeypatch, [_fake_chat_response()])
+    monkeypatch.chdir(tmp_path)
+    asyncio.run(OpenAISDKClient(_profile(max_output_tokens=16384, frequency_penalty=0.3)).generate(
+        LLMGenerateRequest(instructions="s", prompt="p", task_id="t-1"),
+    ))
+    assert mock.call_args.kwargs["max_tokens"] == 16384
+    assert mock.call_args.kwargs["frequency_penalty"] == 0.3
+
+
+def test_output_controls_absent_when_not_set(tmp_path, monkeypatch):
+    mock = _patch_create(monkeypatch, [_fake_chat_response()])
+    monkeypatch.chdir(tmp_path)
+    asyncio.run(OpenAISDKClient(_profile()).generate(
+        LLMGenerateRequest(instructions="s", prompt="p", task_id="t-1"),
+    ))
+    assert "max_tokens" not in mock.call_args.kwargs and "frequency_penalty" not in mock.call_args.kwargs

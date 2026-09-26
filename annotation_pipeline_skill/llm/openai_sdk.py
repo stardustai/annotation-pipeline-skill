@@ -69,6 +69,10 @@ class OpenAISDKClient(BaseSdkClient):
                 kwargs["reasoning_effort"] = self.profile.reasoning_effort
             if response_format:
                 kwargs["response_format"] = response_format
+            if self.profile.max_output_tokens:
+                kwargs["max_tokens"] = self.profile.max_output_tokens
+            if self.profile.frequency_penalty is not None:
+                kwargs["frequency_penalty"] = self.profile.frequency_penalty
             if extra_headers:
                 kwargs["extra_headers"] = extra_headers
 
