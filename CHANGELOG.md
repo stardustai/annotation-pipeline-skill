@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Multi-annotation results now carry exactly the task's source rows** (`runtime/consensus.py`, `SubagentRuntime._produce_consensus_annotation`). On `zh_chunks_v6` 87 of 220 consensus results went to human review for mechanical row errors:
+  - `missing_rows` — every `row_id` was `str(row_index)` ("170", "171", ...). The arbiter merge prompt showed only `row_index` while the output schema requires `row_id`, so the arbiter invented one; the old backfill only filled *empty* ids.
+  - `schema_invalid` — an extra empty row `row_index 0` (`row_id` "row-0" / "0"). MiniMax-M2.7 (which does not enforce the json_schema response format) emitted its first row as `{"output": {...}}` with no row keys, copying the annotation prompt's empty-row example; `build_consensus` defaulted the missing `row_index` to 0 and carried it into the result (and the arbiter echoed it back as `"0"`).
+
+  Fix at the source: `build_consensus(..., source_rows=)` emits one row per source row (source `row_index` + `row_id`) and ignores draft rows that are not source rows; `build_arbiter_merge_prompt(source_rows=...)` shows each row's `row_id` and asks for rows to be copied unchanged; the arbiter output goes through `align_rows_to_source` (replaces `coalesce_rows_by_index` and the `row_id` backfill), which takes `row_id` from the source, drops non-source rows, merges duplicate rows, and leaves omitted rows absent so coverage validation still reports them. The annotation instructions' empty-row example now includes `row_index`/`row_id` with an explicit copy-unchanged rule. Replaying the 220 existing v6 results through the alignment fixes all 87 with spans unchanged.
+
 ### Added
 
 - **Offline accuracy evaluation with consensus judging** (`annotation_pipeline_skill.eval`, CLI `eval-accuracy`).

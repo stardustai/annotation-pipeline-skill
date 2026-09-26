@@ -212,3 +212,95 @@ def test_accept_directly_skips_qc_and_accepts(tmp_path, monkeypatch):
     assert store.load_task("t3").status is TaskStatus.ACCEPTED
     from annotation_pipeline_skill.services.entity_statistics_service import _load_latest_annotation
     assert set(_load_latest_annotation(store, "t3")["rows"][0]["output"]["entities"]["person"]) == {"Alice", "Bob"}
+
+
+def _v6_like_store(tmp_path, task_id):
+    """A project whose output schema mirrors zh_chunks_v6: row_index + row_id +
+    output required on every row, and maxItems = rows in the batch."""
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    (store.root / "output_schema.json").write_text(json.dumps({
+        "type": "object", "required": ["rows"], "additionalProperties": False,
+        "properties": {"rows": {"type": "array", "minItems": 1, "maxItems": 2, "items": {
+            "type": "object", "required": ["row_index", "row_id", "output"],
+            "properties": {"row_index": {"type": "integer"}, "row_id": {"type": "string"},
+                           "output": {"type": "object", "required": ["entities", "json_structures"]}},
+        }}},
+    }))
+    t = Task.new(task_id=task_id, pipeline_id="p", source_ref={"kind": "jsonl", "payload": {"rows": [
+        {"row_index": 40, "row_id": "zh6-0022-1", "input": "Friday 和 ChatGPT"},
+        {"row_index": 41, "row_id": "zh6-0023-0", "input": "阿里云 折扣"},
+    ]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    return store
+
+
+def test_consensus_result_rows_are_the_source_rows(tmp_path):
+    """Regression for zh_chunks_v6 (-000005/-000011/-000018): MiniMax emitted its
+    first row without row_index/row_id, consensus defaulted it to a phantom row
+    0, and the arbiter — shown only row_index — wrote row_id = str(row_index).
+    The final artifact must be exactly the source rows with their source ids,
+    and pass deterministic validation (was schema_invalid / missing_rows)."""
+    store = _v6_like_store(tmp_path, "t_rows")
+    qwen = json.dumps({"rows": [
+        {"row_index": 40, "row_id": "zh6-0022-1", "output": {"entities": {"product": ["Friday", "ChatGPT"]}, "json_structures": {}}},
+        {"row_index": 41, "row_id": "zh6-0023-0", "output": {"entities": {"organization": ["阿里云"]}, "json_structures": {}}},
+    ]})
+    minimax = json.dumps({"rows": [
+        {"output": {"entities": {"product": ["Friday"]}, "json_structures": {}}},
+        {"row_index": 41, "row_id": "zh6-0023-0", "output": {"entities": {"organization": ["阿里云"]}, "json_structures": {}}},
+    ]})
+    arbiter = json.dumps({"rows": [
+        {"row_index": 0, "row_id": "0", "output": {"entities": {}, "json_structures": {}}},
+        {"row_index": 40, "row_id": "40", "output": {"entities": {"product": ["Friday", "ChatGPT"]}, "json_structures": {}}},
+        {"row_index": 41, "row_id": "41", "output": {"entities": {"organization": ["阿里云"]}, "json_structures": {}}},
+    ]})
+    canned = {"qwen": qwen, "minimax": minimax, "arbiter": arbiter}
+    cfg = AnnotationConfig.from_dict({
+        "replicas": 2, "targets": ["qwen", "minimax"], "keep_threshold": 2,
+        "arbiter_target": "arbiter", "on_disagree": "arbiter", "accept_directly": True,
+    })
+    rt = SubagentRuntime(store, client_factory=lambda target: _StubClient(canned[target]),
+                         annotation_config=cfg)
+
+    asyncio.run(rt._run_task(store.load_task("t_rows"), "annotation"))
+
+    assert store.load_task("t_rows").status is TaskStatus.ACCEPTED
+    from annotation_pipeline_skill.services.entity_statistics_service import _load_latest_annotation
+    final = _load_latest_annotation(store, "t_rows")
+    assert [(r["row_index"], r["row_id"]) for r in final["rows"]] == [
+        (40, "zh6-0022-1"), (41, "zh6-0023-0")]
+    assert final["rows"][0]["output"]["entities"]["product"] == ["ChatGPT", "Friday"]
+
+
+def test_arbiter_prompt_carries_source_row_ids(tmp_path):
+    store = _v6_like_store(tmp_path, "t_prompt")
+    seen = {}
+
+    class _Recording(_StubClient):
+        async def generate(self, request):
+            seen["prompt"] = request.prompt
+            return await super().generate(request)
+
+    drafts = {
+        "a": json.dumps({"rows": [{"row_index": 40, "row_id": "zh6-0022-1", "output": {"entities": {"product": ["Friday"]}, "json_structures": {}}}]}),
+        "b": json.dumps({"rows": [{"row_index": 40, "row_id": "zh6-0022-1", "output": {"entities": {}, "json_structures": {}}}]}),
+    }
+    arbiter = json.dumps({"rows": [{"row_index": 40, "row_id": "zh6-0022-1", "output": {"entities": {}, "json_structures": {}}}]})
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2,
+                                      "arbiter_target": "arbiter", "on_disagree": "arbiter"})
+    rt = SubagentRuntime(store, client_factory=lambda t: _Recording(arbiter) if t == "arbiter" else _StubClient(drafts[t]),
+                         annotation_config=cfg)
+    asyncio.run(rt._produce_consensus_annotation(store.load_task("t_prompt")))
+    assert '"row_id": "zh6-0022-1"' in seen["prompt"]
+    assert '"row_id": "zh6-0023-0"' in seen["prompt"]
+
+
+def test_annotation_instructions_empty_row_example_carries_row_keys():
+    """The empty-row example used to be {"output": {...}} with no row keys; MiniMax
+    copied it verbatim for the first row (2 of 8 fresh v6 tasks)."""
+    from annotation_pipeline_skill.runtime.subagent_cycle import _annotation_instructions
+    t = Task.new(task_id="t", pipeline_id="p", source_ref={"kind": "jsonl", "payload": {"rows": []}})
+    instr = _annotation_instructions(t)
+    assert '{"output": {"entities": {}, "json_structures": {}}}' not in instr
+    assert '"row_index": <that row\'s row_index>, "row_id": "<that row\'s row_id>"' in instr

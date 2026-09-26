@@ -3624,15 +3624,17 @@ class SubagentRuntime:
                 f"consensus annotation: only {len(drafts)} valid drafts "
                 f"< keep_threshold {cfg.keep_threshold}"
             )
-        consensus, disagreements = _consensus.build_consensus(drafts, cfg.keep_threshold)
+        # The task's own source rows define the row set: consensus, the arbiter
+        # prompt and the final alignment are all keyed on them, so a draft or
+        # arbiter row that isn't a source row can't leak into the result.
+        src_rows = (task.source_ref or {}).get("payload", {}).get("rows", []) if isinstance(task.source_ref, dict) else []
+        consensus, disagreements = _consensus.build_consensus(
+            drafts, cfg.keep_threshold, source_rows=src_rows)
 
         final_payload = consensus
         if disagreements and cfg.on_disagree == "arbiter":
-            src_rows = (task.source_ref or {}).get("payload", {}).get("rows", []) if isinstance(task.source_ref, dict) else []
-            row_inputs = {r.get("row_index", i): str(r.get("input") or r.get("text") or "")
-                          for i, r in enumerate(src_rows) if isinstance(r, dict)}
             merge_prompt = _consensus.build_arbiter_merge_prompt(
-                row_inputs=row_inputs, consensus=consensus, disagreements=disagreements)
+                source_rows=src_rows, consensus=consensus, disagreements=disagreements)
             arb = await self._generate_async(cfg.arbiter_target, LLMGenerateRequest(
                 instructions=instr, prompt=merge_prompt,
                 response_format=self._build_response_format(cfg.arbiter_target, stage="annotation", output_schema=schema),
@@ -3641,26 +3643,16 @@ class SubagentRuntime:
             final_payload = json.loads(cleaned)
 
         finished_at = utc_now()
-        # The arbiter may re-emit rows (each row_index appearing twice — a filled
-        # copy plus an empty scaffold), doubling the row count past the schema's
-        # maxItems and bouncing every multi-row task to HR. Collapse to one row
-        # per row_index before validation.
         if isinstance(final_payload, dict):
-            final_payload = _consensus.coalesce_rows_by_index(final_payload)
+            # Re-key the arbiter's rows onto the source rows: row_id comes from
+            # the source (never the model), rows outside the source are dropped
+            # and duplicate row_index copies are merged.
+            final_payload = _consensus.align_rows_to_source(final_payload, src_rows)
             # Strip anonymization placeholders ({$...}, XX-masks, ORG\d+) and
             # alpha nested-substring duplicates — deterministic precision-safe
             # cleanup so the dual-annotation output never ships these errors.
             from annotation_pipeline_skill.core.span_cleanup import clean_spans_in_place
             clean_spans_in_place(final_payload)
-        # Schema requires `row_id` on every row, but build_consensus/arbiter only
-        # carry `row_index` — backfill row_id from the task's source rows so the
-        # final annotation passes schema validation (else accept_directly → HR).
-        _src = (task.source_ref or {}).get("payload", {}).get("rows", []) if isinstance(task.source_ref, dict) else []
-        _rid = {r.get("row_index", i): r.get("row_id", f"row-{r.get('row_index', i)}")
-                for i, r in enumerate(_src) if isinstance(r, dict)}
-        for _row in (final_payload.get("rows", []) if isinstance(final_payload, dict) else []):
-            if isinstance(_row, dict) and not _row.get("row_id"):
-                _row["row_id"] = _rid.get(_row.get("row_index", 0), f"row-{_row.get('row_index', 0)}")
         attempt_id = self._next_attempt_id(task)
         text = json.dumps(final_payload, ensure_ascii=False, sort_keys=True)
         result = LLMGenerateResult(
@@ -3833,7 +3825,12 @@ def _annotation_instructions(
         "For text entity spans, copy exact contiguous text spans from task.source_ref.payload.text. "
         "MANDATORY ROW COVERAGE: the output rows array MUST contain an entry for EVERY row in "
         "task.source_ref.payload.rows, in the same order. If a row has no entities and no phrases, "
-        "still include it with empty dicts: {\"output\": {\"entities\": {}, \"json_structures\": {}}}. "
+        "still include it with empty dicts: "
+        "{\"row_index\": <that row's row_index>, \"row_id\": \"<that row's row_id>\", "
+        "\"output\": {\"entities\": {}, \"json_structures\": {}}}. "
+        "Every output row MUST carry the row_index AND row_id of its source row, copied unchanged "
+        "(row_id is the source row's own id string, never its row_index); do not renumber rows and "
+        "do not add rows that are not in task.source_ref.payload.rows. "
         "Omitting any input row is a validation error that resets the task. "
         "For json_structures: on every row, scan the input text for instances of every phrase type the schema "
         "declares and populate json_structures with arrays of VERBATIM strings copied from the input — no "
