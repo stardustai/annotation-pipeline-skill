@@ -9,12 +9,41 @@ export interface UrlState {
 
 export interface UrlStateSetters {
   setView: (value: string) => void;
-  setStore: (value: string | null) => void;
+  // keepProjectTask: adopt a store WITHOUT clearing project/task. Used when the
+  // store is being resolved FROM the current project on load (they're already
+  // consistent) — as opposed to a user switching stores in the dropdown, where
+  // the old project/task must be cleared.
+  setStore: (value: string | null, opts?: { keepProjectTask?: boolean }) => void;
   setProject: (value: string | null) => void;
   setTask: (value: string | null) => void;
 }
 
 const STORE_LOCALSTORAGE_KEY = "storeKey";
+
+/**
+ * Pure: decide which store key should be selected on load, given the available
+ * stores, the project from the URL, and the current (possibly stale/null) store.
+ *
+ * - If the current store key is still a valid store → keep it.
+ * - Else if a project is in the URL → adopt the store that OWNS that project
+ *   (project ids are globally unique). If no store claims it, return null so the
+ *   backend resolves the store from the project — never silently fall back to
+ *   the first (demo) store, which was the "refresh → demo" bug.
+ * - Else (no project) → fall back to the first store.
+ */
+export function resolveStoreForProject(
+  stores: ReadonlyArray<{ key: string; project_ids?: string[] }>,
+  projectId: string | null,
+  currentStoreKey: string | null,
+): string | null {
+  if (stores.length === 0) return currentStoreKey;
+  if (stores.some((s) => s.key === currentStoreKey)) return currentStoreKey;
+  if (projectId) {
+    const owner = stores.find((s) => (s.project_ids ?? []).includes(projectId));
+    return owner ? owner.key : null;
+  }
+  return stores[0].key;
+}
 
 /**
  * Pure: parse a `window.location.search`-style string into UrlState.
@@ -141,14 +170,18 @@ export function useUrlState(defaults: UrlState): [UrlState, UrlStateSetters] {
   );
 
   const setStore = useCallback(
-    (value: string | null) => {
+    (value: string | null, opts?: { keepProjectTask?: boolean }) => {
       // Switching store must also clear project & task: they belong to the
       // PREVIOUS store. Keeping a stale ?project=<old> filters the new store's
       // kanban to a non-existent project and shows zero tasks. Reset all three
-      // atomically when the store actually changes.
+      // atomically when the store actually changes — UNLESS keepProjectTask is
+      // set (the store is being resolved from the current project, so they're
+      // already consistent and the project must survive).
       setState((current) => {
         if (current.store === value) return current;
-        const next = { ...current, store: value, project: null, task: null };
+        const next = opts?.keepProjectTask
+          ? { ...current, store: value }
+          : { ...current, store: value, project: null, task: null };
         writeUrl(next, defaultsRef.current);
         return next;
       });

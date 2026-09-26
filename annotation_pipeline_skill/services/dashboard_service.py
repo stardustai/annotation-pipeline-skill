@@ -26,6 +26,117 @@ OPERATOR_COLUMNS: list[tuple[str, str]] = [
 ]
 
 
+def _task_substage(task: Task) -> str | None:
+    meta = task.metadata if isinstance(task.metadata, dict) else {}
+    return meta.get("runtime_substage")
+
+
+def _resolve_models(store: SqliteStore, targets: list[str]) -> dict[str, str]:
+    """Map each annotation target to its model name for column headers
+    (e.g. annotation → qwen3.6-35b-a3b). Falls back to the target name."""
+    resolved: dict[str, str] = {}
+    try:
+        from annotation_pipeline_skill.llm.profiles import (
+            load_llm_registry,
+            resolve_llm_profiles_path,
+        )
+
+        path = resolve_llm_profiles_path(
+            workspace_root=store.root.parent.parent,
+            project_config_root=store.root,
+        )
+        if path is not None:
+            reg = load_llm_registry(path)
+            for target in targets:
+                try:
+                    resolved[target] = reg.resolve(target).model
+                except Exception:
+                    resolved[target] = target
+    except Exception:
+        pass
+    return resolved
+
+
+# Cache the column config (mode + resolved model names) by the mtimes of the two
+# files it derives from, so the 5s kanban poll doesn't re-read+parse workflow.yaml
+# and llm_profiles.yaml on every request. Keyed per store; invalidated on edit.
+_COLUMN_CONFIG_CACHE: dict[str, tuple] = {}
+
+
+def _annotation_column_config(store: SqliteStore) -> tuple[int, list[str], str, dict[str, str]]:
+    """Returns (replicas, annotator_targets, arbiter_target, model_names), cached
+    by the mtimes of workflow.yaml + llm_profiles.yaml. A project without a
+    workflow.yaml is the default single-annotation shape; a malformed one raises."""
+    workflow_path = store.root / "workflow.yaml"
+    profiles_path = store.root.parent.parent / "llm_profiles.yaml"
+
+    def _mtime(path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    signature = (_mtime(workflow_path), _mtime(profiles_path))
+    key = str(store.root)
+    cached = _COLUMN_CONFIG_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    from annotation_pipeline_skill.config.loader import load_annotation_config
+
+    ann = load_annotation_config(store.root.parent)
+    replicas = int(ann.replicas or 1)
+    targets = list(ann.targets or ["annotation"])
+    arb_target = ann.arbiter_target or "arbiter"
+    models = _resolve_models(store, [*targets, arb_target]) if replicas > 1 else {}
+    result = (replicas, targets, arb_target, models)
+    _COLUMN_CONFIG_CACHE[key] = (signature, result)
+    return result
+
+
+def _internal_columns(store: SqliteStore, tasks: list[Task]):
+    """Internal-board columns as ``(column_id, title, predicate(task) -> bool)``,
+    adapted to the pipeline mode.
+
+    Multi-annotation (replicas > 1) runs the N annotators in PARALLEL then the
+    arbiter, all inside the single ANNOTATING status, and disables QC. We expand
+    that into a per-annotator column for each annotator plus an Arbiter column,
+    using the live ``runtime_substage`` the runtime stamps on the task:
+    ``annotating`` → an in-flight task shows in EVERY annotator column at once
+    (they run concurrently); ``arbitrating`` → it shows only in the Arbiter
+    column. The QC column is dropped — EXCEPT when a task is actually in QC (a
+    scheduler-resume edge case can transition a task there), so no task is ever
+    invisible. ``tasks`` is the (already project-filtered) task list."""
+    def by_status(status: TaskStatus):
+        return lambda task, _s=status: task.status is _s
+
+    replicas, targets, arb_target, models = _annotation_column_config(store)
+    if replicas <= 1:
+        return [(cid, title, by_status(status)) for cid, title, status in KANBAN_COLUMNS]
+
+    def in_annotating(task: Task) -> bool:
+        return task.status is TaskStatus.ANNOTATING and _task_substage(task) != "arbitrating"
+
+    def in_arbitrating(task: Task) -> bool:
+        return task.status is TaskStatus.ARBITRATING or (
+            task.status is TaskStatus.ANNOTATING and _task_substage(task) == "arbitrating"
+        )
+
+    cols = [("pending", "Pending", by_status(TaskStatus.PENDING))]
+    for i, target in enumerate(targets):
+        cols.append((f"annotator_{i + 1}", f"Annotator {i + 1}: {models.get(target, target)}", in_annotating))
+    cols.append(("arbiter", f"Arbiter: {models.get(arb_target, arb_target)}", in_arbitrating))
+    # Only surface QC when something is actually there (resume edge case) — keeps
+    # the always-empty column hidden in the normal accept_directly flow but never
+    # lets a QC-status task fall through every predicate and vanish.
+    if any(task.status is TaskStatus.QC for task in tasks):
+        cols.append(("qc", "QC", by_status(TaskStatus.QC)))
+    cols.append(("human_review", "Human Review", by_status(TaskStatus.HUMAN_REVIEW)))
+    cols.append(("accepted", "Accepted", by_status(TaskStatus.ACCEPTED)))
+    cols.append(("rejected", "Rejected", by_status(TaskStatus.REJECTED)))
+    return cols
+
+
 def operator_stage(task: Task) -> str:
     if task.status is TaskStatus.PENDING:
         return "pending"
@@ -67,9 +178,9 @@ def build_kanban_snapshot(store: SqliteStore, project_id: str | None = None, sta
                 {
                     "id": column_id,
                     "title": title,
-                    "cards": [_task_card(index, task) for task in tasks if task.status is status],
+                    "cards": [_task_card(index, task) for task in tasks if predicate(task)],
                 }
-            for column_id, title, status in KANBAN_COLUMNS
+            for column_id, title, predicate in _internal_columns(store, tasks)
         ]
     }
 

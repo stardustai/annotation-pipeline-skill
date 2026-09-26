@@ -90,9 +90,17 @@ export function KanbanBoard({ snapshot, selectedTaskId, onSelectTask, onMoveTask
     }
   }
 
+  const columns = visibleColumns(snapshot);
   return (
-    <section className="kanban-board" aria-label="Task Kanban board">
-      {visibleColumns(snapshot).map((column) => {
+    <section
+      className="kanban-board"
+      aria-label="Task Kanban board"
+      // Track count follows the actual columns (the multi-annotation board has
+      // fewer columns than the classic 7), so columns fill the width instead of
+      // leaving empty grid tracks.
+      style={{ gridTemplateColumns: `repeat(${columns.length}, minmax(180px, 1fr))` }}
+    >
+      {columns.map((column) => {
         const { page, filter } = getState(column.id);
         const sorted = [...column.cards].sort((a, b) => a.status_age_seconds - b.status_age_seconds);
         const filtered = filter ? sorted.filter((card) => filterCard(card, filter)) : sorted;
@@ -183,8 +191,8 @@ export function KanbanBoard({ snapshot, selectedTaskId, onSelectTask, onMoveTask
                       {card.attempt_count} {card.attempt_count === 1 ? "attempt" : "attempts"}
                     </span>
                     <span className="badges">
-                      {card.annotator_model ? <span className="badge model-a" title="Annotator model">A: {card.annotator_model}</span> : null}
-                      {card.qc_model ? <span className="badge model-q" title="QC model">Q: {card.qc_model}</span> : null}
+                      {card.annotator_model ? <span className="badge model-a" title={`Annotator model: ${card.annotator_model}`}>A:&nbsp;<span className="badge-value">{card.annotator_model}</span></span> : null}
+                      {card.qc_model ? <span className="badge model-q" title={`QC model: ${card.qc_model}`}>Q:&nbsp;<span className="badge-value">{card.qc_model}</span></span> : null}
                       {card.feedback_count > 0 ? <span className="badge warn">{card.feedback_count} feedback</span> : null}
                       {card.retry_pending ? (
                         <span className={`badge ${(card.retry_wait_seconds ?? 0) > 0 ? "retry-wait" : "retry-ready"}`}>

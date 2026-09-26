@@ -32,7 +32,7 @@ import { RuntimePanel, type RuntimeSubtab } from "./components/RuntimePanel";
 import { TaskDrawer } from "./components/TaskDrawer";
 import { countCards } from "./kanban";
 import type { KanbanSnapshot, ProjectSummary, StoreInfo, TaskCard, TaskDetail } from "./types";
-import { useUrlState, type UrlState } from "./url_state";
+import { useUrlState, resolveStoreForProject, type UrlState } from "./url_state";
 
 const emptySnapshot: KanbanSnapshot = { project_id: null, columns: [] };
 // Top-level dashboard tabs. "statistics" hosts Duplicates+Scatter+Statistics
@@ -175,9 +175,13 @@ export default function App() {
         setStores(snap.stores);
         setWorkspacePath(snap.workspace_path ?? null);
         if (snap.stores.length > 0) {
-          const valid = snap.stores.some((s) => s.key === selectedStoreKey);
-          if (!valid) {
-            setStore(snap.stores[0].key);
+          // Resolve the store from the project in the URL rather than blindly
+          // defaulting to the first (demo) store. Adopt with keepProjectTask so
+          // the project survives (it's what we resolved the store from) — this
+          // is the "refresh → demo" fix.
+          const resolved = resolveStoreForProject(snap.stores, selectedProjectId, selectedStoreKey);
+          if (resolved !== selectedStoreKey) {
+            setStore(resolved, { keepProjectTask: true });
           }
         }
       })

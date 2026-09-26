@@ -58,6 +58,9 @@ export interface StoreInfo {
   path: string;
   pipeline_count: number;
   task_count: number;
+  // Project ids this store holds. Used to resolve a URL ?project=<id> back to
+  // its owning store on load. Optional for backward-compat with older API.
+  project_ids?: string[];
 }
 
 export interface StoresSnapshot {

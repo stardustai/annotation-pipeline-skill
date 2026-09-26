@@ -1785,12 +1785,18 @@ class DashboardApi:
         result = []
         for key, s in self._stores.items():
             tasks = s.list_tasks()
+            pipeline_ids = sorted({task.pipeline_id for task in tasks})
             result.append({
                 "key": key,
                 "name": s.root.parent.name,
                 "path": str(s.root.parent),
-                "pipeline_count": len({task.pipeline_id for task in tasks}),
+                "pipeline_count": len(pipeline_ids),
                 "task_count": len(tasks),
+                # Project ids held by this store. project ids are globally unique
+                # (api.py _resolve_store relies on this), so the frontend can map
+                # a URL ?project=<id> back to its owning store on load instead of
+                # falling back to the first (demo) store.
+                "project_ids": pipeline_ids,
             })
         return result
 

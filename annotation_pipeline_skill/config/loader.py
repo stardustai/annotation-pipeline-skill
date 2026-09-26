@@ -60,10 +60,21 @@ def build_project_config_from_data(
         callbacks=callbacks_data.get("callbacks", {}),
         workflow=workflow_data,
         runtime=RuntimeConfig.from_dict(workflow_data.get("runtime") or {}),
-        annotation=AnnotationConfig.from_dict(
-            (workflow_data.get("stages") or {}).get("annotation") or {}
-        ),
+        annotation=_annotation_config(workflow_data),
     )
+
+
+def _annotation_config(workflow_data: dict) -> AnnotationConfig:
+    return AnnotationConfig.from_dict((workflow_data.get("stages") or {}).get("annotation") or {})
+
+
+def load_annotation_config(project_root: Path | str) -> AnnotationConfig:
+    """The annotation stage of workflow.yaml (replicas / targets / arbiter), and nothing else.
+
+    Unlike load_project_config this does not resolve llm_profiles.yaml, so callers that only
+    need the annotation shape (the dashboard board, the scheduler's hot reload) do not depend on
+    where the workspace keeps its profiles. A missing workflow.yaml is the default config."""
+    return _annotation_config(read_yaml(Path(project_root) / ".annotation-pipeline" / "workflow.yaml"))
 
 
 def load_runtime_config(project_root: Path | str) -> RuntimeConfig:

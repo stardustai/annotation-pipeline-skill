@@ -367,7 +367,13 @@ class SubagentRuntime:
             self._transition(task, TaskStatus.ANNOTATING,
                              reason=f"consensus annotation: {self.annotation_config.replicas} replicas",
                              stage="annotation", attempt_id=self._next_attempt_id(task))
-            artifact, attempt_id, text = await self._produce_consensus_annotation(task)
+            try:
+                artifact, attempt_id, text = await self._produce_consensus_annotation(task)
+            finally:
+                # Clear the live sub-stage even if the cycle raised, so a failed
+                # task isn't left stamped "arbitrating" (which would briefly
+                # mis-place it in the Arbiter column before the bail handler runs).
+                self._persist_substage(task, None)
             if self.annotation_config.accept_directly:
                 # accept_directly skips _run_validation_and_qc, so run the
                 # deterministic validation here too — otherwise schema/coverage/
@@ -3593,6 +3599,20 @@ class SubagentRuntime:
         # tasks transiting ANNOTATING → VALIDATING → QC, not just PENDING → ACCEPTED.
         self.store.save_task(task)
 
+    def _persist_substage(self, task: "Task", value: str | None) -> None:
+        """Record the live multi-annotation sub-stage on the in-flight task so the
+        dashboard can place it precisely: the N annotators run in PARALLEL
+        ("annotating"), then the arbiter resolves disagreements ("arbitrating").
+        Task status stays ANNOTATING throughout — only this metadata flips, and
+        the board reads it for ANNOTATING tasks only (terminal tasks ignore it)."""
+        meta = task.metadata if isinstance(task.metadata, dict) else {}
+        if value is None:
+            meta.pop("runtime_substage", None)
+        else:
+            meta["runtime_substage"] = value
+        task.metadata = meta
+        self.store.save_task(task)
+
     async def _produce_consensus_annotation(self, task: "Task"):
         """Run N annotators, build consensus, arbitrate disagreements, and write a
         single final annotation_result artifact. Returns (artifact, attempt_id, text)."""
@@ -3617,6 +3637,7 @@ class SubagentRuntime:
         # Tolerate partial failure: one annotator raising / returning bad JSON
         # must not abort the whole round. Keep only the dict results.
         started_at = utc_now()
+        self._persist_substage(task, "annotating")  # N annotators run in parallel
         results = await asyncio.gather(*[_one(t) for t in cfg.targets], return_exceptions=True)
         drafts = [d for d in results if isinstance(d, dict)]
         if len(drafts) < cfg.keep_threshold:
@@ -3635,6 +3656,7 @@ class SubagentRuntime:
         if disagreements and cfg.on_disagree == "arbiter":
             merge_prompt = _consensus.build_arbiter_merge_prompt(
                 source_rows=src_rows, consensus=consensus, disagreements=disagreements)
+            self._persist_substage(task, "arbitrating")  # arbiter resolves disagreements
             arb = await self._generate_async(cfg.arbiter_target, LLMGenerateRequest(
                 instructions=instr, prompt=merge_prompt,
                 response_format=self._build_response_format(cfg.arbiter_target, stage="annotation", output_schema=schema),

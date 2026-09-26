@@ -304,3 +304,55 @@ def test_annotation_instructions_empty_row_example_carries_row_keys():
     instr = _annotation_instructions(t)
     assert '{"output": {"entities": {}, "json_structures": {}}}' not in instr
     assert '"row_index": <that row\'s row_index>, "row_id": "<that row\'s row_id>"' in instr
+
+
+def _substage(store, task_id):
+    return store.load_task(task_id).metadata.get("runtime_substage")
+
+
+def test_substage_marks_annotating_then_arbitrating_and_is_cleared_when_done(tmp_path, monkeypatch):
+    """The dashboard places an in-flight multi-annotation task by runtime_substage: the annotators
+    run in parallel ("annotating"), the arbiter after them ("arbitrating"); it is cleared afterwards."""
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t_sub", pipeline_id="p",
+                 source_ref={"kind": "jsonl", "payload": {"rows": [{"row_index": 0, "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    seen: dict[str, list] = {"a": [], "b": [], "arbiter": []}
+    canned = {"a": _ann([["Alice", "Bob"]]), "b": _ann([["Alice"]]),
+              "arbiter": json.dumps({"rows": [{"row_index": 0, "output": {"entities": {"person": ["Alice", "Bob"]}}}]})}
+
+    class _Observing(_StubClient):
+        def __init__(self, target):
+            super().__init__(canned[target])
+            self._target = target
+
+        async def generate(self, request):
+            seen[self._target].append(_substage(store, "t_sub"))
+            return await super().generate(request)
+
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2,
+                                      "arbiter_target": "arbiter", "accept_directly": True})
+    rt = SubagentRuntime(store, client_factory=lambda target: _Observing(target), annotation_config=cfg)
+    asyncio.run(rt._run_task(store.load_task("t_sub"), "annotation"))
+
+    assert seen["a"] == ["annotating"] and seen["b"] == ["annotating"]
+    assert seen["arbiter"] == ["arbitrating"]
+    assert _substage(store, "t_sub") is None
+    assert store.load_task("t_sub").status is TaskStatus.ACCEPTED
+
+
+def test_substage_is_cleared_when_the_consensus_cycle_raises(tmp_path):
+    """A failed cycle must not leave the task stamped "annotating"/"arbitrating" on the board."""
+    store = SqliteStore.open(tmp_path / ".annotation-pipeline")
+    t = Task.new(task_id="t_fail", pipeline_id="p",
+                 source_ref={"kind": "jsonl", "payload": {"rows": [{"row_index": 0, "input": "Alice and Bob"}]}})
+    t.status = TaskStatus.PENDING
+    store.save_task(t)
+    cfg = AnnotationConfig.from_dict({"replicas": 2, "targets": ["a", "b"], "keep_threshold": 2,
+                                      "accept_directly": True})
+    rt = SubagentRuntime(store, client_factory=lambda target: _BadJsonStubClient(), annotation_config=cfg)
+    import pytest
+    with pytest.raises(RuntimeError, match="keep_threshold"):
+        asyncio.run(rt._run_task(store.load_task("t_fail"), "annotation"))
+    assert _substage(store, "t_fail") is None

@@ -562,6 +562,10 @@ button {
   display: grid;
   gap: 5px;
   min-height: 116px;
+  /* min-width:0 so a wide child (long model badge) can't push the card past its
+     grid column; combined with .badges min-width:0 and .badge-value ellipsis the
+     content shrinks instead of overflowing the column. */
+  min-width: 0;
   padding: 10px;
   text-align: left;
   width: 100%;
@@ -592,6 +596,10 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+  /* Grid item of the card: without min-width:0 the default min-width:auto lets
+     a long model badge (A: annotation,claude_haiku) set a min-content floor that
+     overflows the card. This lets the row shrink so the badge can truncate. */
+  min-width: 0;
 }
 
 .badge.warn {
@@ -618,8 +626,10 @@ button {
   border-color: #a8d4c8;
   color: #1a5244;
   max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Flex item must be allowed to shrink below its content (the model name) so
+     max-width can cap it at the card width; otherwise min-width:auto keeps the
+     nowrap pill full-width and it spills past the column (HR/accepted cards). */
+  min-width: 0;
 }
 
 .badge.model-q {
@@ -627,8 +637,17 @@ button {
   border-color: #c5b8ec;
   color: #3a2466;
   max-width: 100%;
+  min-width: 0;
+}
+
+/* The model name lives in an inner element so it can ellipsize — text-overflow
+   does NOT apply to the badge's own text because the badge is display:inline-flex.
+   Full name is available via the badge's title (hover). */
+.badge-value {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .task-drawer-backdrop {

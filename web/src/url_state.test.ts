@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildSearch, parseUrlState, writeUrl, type UrlState } from "./url_state";
+import { buildSearch, parseUrlState, resolveStoreForProject, writeUrl, type UrlState } from "./url_state";
 
 const defaults: UrlState = { view: "kanban", store: null, project: null, task: null };
 
@@ -210,5 +210,43 @@ describe("useUrlState initial-state derivation", () => {
     fake.localStorage.setItem("storeKey", "stored");
     fake.location.search = "?store=from-url";
     expect(initialState()).toEqual({ ...defaults, store: "from-url" });
+  });
+});
+
+describe("resolveStoreForProject", () => {
+  const stores = [
+    { key: "demo-key", project_ids: [] },
+    { key: "v5-key", project_ids: ["v5_ner_phrase"] },
+    { key: "v4-key", project_ids: ["v4_ner_phrase"] },
+  ];
+
+  it("resolves a URL ?project to its OWNING store, not the first (demo) store", () => {
+    // The "refresh → demo" bug: project present, store null. Must pick v5, not demo.
+    expect(resolveStoreForProject(stores, "v5_ner_phrase", null)).toBe("v5-key");
+  });
+
+  it("keeps the current store when it is still valid", () => {
+    expect(resolveStoreForProject(stores, "v5_ner_phrase", "v5-key")).toBe("v5-key");
+    // even if a different project is in the URL, a valid current store wins
+    expect(resolveStoreForProject(stores, "v4_ner_phrase", "v5-key")).toBe("v5-key");
+  });
+
+  it("falls back to the first store only when there is NO project", () => {
+    expect(resolveStoreForProject(stores, null, null)).toBe("demo-key");
+    expect(resolveStoreForProject(stores, null, "stale-invalid")).toBe("demo-key");
+  });
+
+  it("returns null (let backend resolve) when the project belongs to no known store", () => {
+    expect(resolveStoreForProject(stores, "unknown_project", null)).toBeNull();
+  });
+
+  it("tolerates stores missing project_ids (older API) without throwing", () => {
+    const legacy = [{ key: "a" }, { key: "b" }];
+    expect(resolveStoreForProject(legacy, "p", null)).toBeNull();
+    expect(resolveStoreForProject(legacy, null, null)).toBe("a");
+  });
+
+  it("returns the current key unchanged when there are no stores yet", () => {
+    expect(resolveStoreForProject([], "v5_ner_phrase", "whatever")).toBe("whatever");
   });
 });
