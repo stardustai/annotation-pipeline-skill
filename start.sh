@@ -19,7 +19,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_BIN="${REPO_ROOT}/.venv/bin"
+export PYTHONNOUSERSITE=1
+VENV_BIN="${VENV_BIN:-/home/derek/miniforge3/envs/annotation-pipeline-skill/bin}"
 HOST="${SERVE_HOST:-0.0.0.0}"
 PORT="${SERVE_PORT:-8509}"
 WORKSPACE="${SERVE_WORKSPACE:-${REPO_ROOT}/projects}"

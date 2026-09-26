@@ -37,3 +37,6 @@ graphify-out/
 # the projects/ pattern above — listed explicitly here so the intent is
 # obvious to anyone reading this file.)
 projects/v3_initial_deployment/.annotation-pipeline/llm_profiles.yaml
+# Local workspaces: their llm_profiles.yaml holds live API keys and the stores are large — never commit.
+projects_zh/
+.db-snapshots/

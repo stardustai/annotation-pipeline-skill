@@ -1801,7 +1801,7 @@ Change the following profiles (leave `claude_*` and `codex_*` unchanged):
     reasoning_effort: low
     timeout_seconds: 900
     disable_continuity: true
-    api_key: sk-be84988a7682453aaf4f96331a77ea3a
+    api_key: <DEEPSEEK_API_KEY>
 
   glm_46:
     runtime: openai_sdk          # was: anthropic_sdk
@@ -1812,7 +1812,7 @@ Change the following profiles (leave `claude_*` and `codex_*` unchanged):
     base_url: https://open.bigmodel.cn/api/paas/v4   # was: https://open.bigmodel.cn/api/anthropic
     timeout_seconds: 900
     disable_continuity: true
-    api_key: 6add81a3696dbff37b3ebf80dc216d3a.VoTFesrSd1co27Qh
+    api_key: <GLM_API_KEY>
 
   glm_51:
     runtime: openai_sdk          # was: anthropic_sdk
@@ -1823,7 +1823,7 @@ Change the following profiles (leave `claude_*` and `codex_*` unchanged):
     base_url: https://open.bigmodel.cn/api/paas/v4   # was: https://open.bigmodel.cn/api/anthropic
     timeout_seconds: 900
     disable_continuity: true
-    api_key: 6add81a3696dbff37b3ebf80dc216d3a.VoTFesrSd1co27Qh
+    api_key: <GLM_API_KEY>
 
   minimax_2.7:
     runtime: openai_sdk          # was: anthropic_sdk
