@@ -36,7 +36,7 @@ def test_codex_shell_environment_allows_only_safe_keys():
 
 
 def test_build_codex_command_includes_json_resume_and_model():
-    command, prompt_file = build_codex_command(
+    command, prompt_file, prompt_bytes = build_codex_command(
         binary="codex",
         prompt="Annotate this",
         developer_instructions="Return JSON",
@@ -54,9 +54,11 @@ def test_build_codex_command_includes_json_resume_and_model():
     assert "--model" in command
     assert "gpt-5.4-mini" in command
     assert "--developer-message" not in command
-    assert command[-2:] == ["thread-1", prompt_file.read_text(encoding="utf-8")]
-    assert "Return JSON" in prompt_file.read_text(encoding="utf-8")
-    assert "Annotate this" in prompt_file.read_text(encoding="utf-8")
+    # The prompt goes over stdin ("-"), not as a positional argument, to stay under ARG_MAX.
+    assert command[-2:] == ["thread-1", "-"]
+    assert prompt_bytes == prompt_file.read_bytes()
+    assert "Return JSON" in prompt_bytes.decode("utf-8")
+    assert "Annotate this" in prompt_bytes.decode("utf-8")
     prompt_file.unlink()
 
 
@@ -162,7 +164,7 @@ async def test_local_codex_client_propagates_continuity_handle(tmp_path: Path, m
 
     def fake_build_codex_command(**kwargs):
         captured["thread_id"] = kwargs["thread_id"]
-        return ["codex", "exec", "--json", "prompt"], prompt_file
+        return ["codex", "exec", "--json", "-"], prompt_file, b"prompt"
 
     @contextmanager
     def fake_isolated_codex_home(env, *, model, reasoning_effort, home_id, thread_id, provider_api_key=None, provider_base_url=None):
@@ -174,7 +176,8 @@ async def test_local_codex_client_propagates_continuity_handle(tmp_path: Path, m
     class FakeProcess:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, input=None):
+            captured["stdin"] = input
             return (
                 b'{"type":"thread.started","thread_id":"thread-new"}\n'
                 b'{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}\n',

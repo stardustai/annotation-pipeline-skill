@@ -896,7 +896,9 @@ def test_cli_import_jsonl_prelabeled_creates_tasks_with_prelabel_metadata(tmp_pa
     guidance = task0.source_ref["payload"]["annotation_guidance"]
     # Per-task source_ref no longer carries the schema -- it lives at the project level.
     assert "output_schema" not in guidance
-    assert guidance == {"rules_path": "annotation_rules.yaml"}
+    # Rules live in the DB (documents), not on disk: guidance carries only the version label,
+    # which is None until an annotation_rules document exists.
+    assert guidance == {"rules_version": None}
     project_schema_path = tmp_path / ".annotation-pipeline" / "output_schema.json"
     assert project_schema_path.exists()
     batched = json.loads(project_schema_path.read_text(encoding="utf-8"))
@@ -1010,8 +1012,9 @@ def test_cli_import_omits_per_task_inline_schema(tmp_path):
     task = store.load_task("v3-000000")
     guidance = task.source_ref["payload"]["annotation_guidance"]
     assert "output_schema" not in guidance
-    # rules_path is still present for the annotator instructions.
-    assert guidance.get("rules_path") == "annotation_rules.yaml"
+    # Rules are versioned in the DB; there is no rules_path on disk any more.
+    assert "rules_path" not in guidance
+    assert guidance.get("rules_version") is None
 
 
 def test_cli_import_normalizes_empty_json_structures_array(tmp_path):

@@ -7,6 +7,7 @@ error paths.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from annotation_pipeline_skill.core.models import Task
@@ -103,15 +104,21 @@ def test_distribution_scan_populates_cache_and_get_returns_payload(tmp_path):
         "umap_neighbors": 3,
     }).encode()
 
+    # The scan runs on a background thread: POST answers 202 with the job descriptor and the
+    # client polls GET /api/jobs/<id> until it is done, then reads the cached payload.
     status, _headers, body = api.handle_post("/api/distribution/scan?project=proj", scan_body)
-
-    assert status == 200
-    result = json.loads(body.decode("utf-8"))
-    assert result["cached"] is True
-    assert result["payload"] is not None
-    assert result["payload"]["task_count"] == 6
-    assert len(result["payload"]["coords"]) == 6
-    assert result["available_profiles"] == ["random_baseline"]
+    assert status == 202
+    started = json.loads(body.decode("utf-8"))
+    assert started["started"] is True
+    assert started["available_profiles"] == ["random_baseline"]
+    job = started["job"]
+    deadline = time.monotonic() + 60
+    while job["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+        job_status, _h, job_body = api.handle_get(f"/api/jobs/{job['job_id']}")
+        assert job_status == 200
+        job = json.loads(job_body.decode("utf-8"))
+    assert job["status"] == "done", job.get("error")
 
     # Now GET should return the cached payload.
     status2, _h2, body2 = api.handle_get("/api/distribution?project=proj&profile=random_baseline")

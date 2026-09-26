@@ -409,23 +409,28 @@ def test_dashboard_api_rejects_invalid_task_qc_policy(tmp_path):
 
 def test_dashboard_api_returns_config_files_and_can_update_allowed_yaml(tmp_path):
     store = SqliteStore.open(tmp_path)
-    (tmp_path / "annotation_rules.yaml").write_text("rules:\n  - id: default\n", encoding="utf-8")
+    (tmp_path / "callbacks.yaml").write_text("callbacks: []\n", encoding="utf-8")
     api = DashboardApi(store)
 
     status, _headers, body = api.handle_get("/api/config")
     payload = json.loads(body.decode("utf-8"))
 
     assert status == 200
-    assert any(item["id"] == "annotation_rules.yaml" for item in payload["files"])
+    ids = {item["id"] for item in payload["files"]}
+    assert ids == {"annotators.yaml", "workflow.yaml", "external_tasks.yaml", "callbacks.yaml"}
+    # annotation rules are versioned DB documents, not an editable config file
+    assert "annotation_rules.yaml" not in ids
+    callbacks = next(item for item in payload["files"] if item["id"] == "callbacks.yaml")
+    assert callbacks["exists"] is True
 
     status, _headers, body = api.handle_put(
-        "/api/config/annotation_rules.yaml",
-        b"rules:\n  - id: updated\n    instruction: Label named entities.\n",
+        "/api/config/callbacks.yaml",
+        b"callbacks:\n  - id: updated\n",
     )
 
     assert status == 200
     assert json.loads(body.decode("utf-8"))["ok"] is True
-    assert "updated" in (tmp_path / "annotation_rules.yaml").read_text(encoding="utf-8")
+    assert "updated" in (tmp_path / "callbacks.yaml").read_text(encoding="utf-8")
 
 
 def test_dashboard_api_rejects_invalid_config_name(tmp_path):

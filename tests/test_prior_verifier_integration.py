@@ -667,14 +667,15 @@ def test_second_arbiter_writes_artifact_with_target_metadata(tmp_path):
     assert art_meta.get("prior_dominant_type") == "organization"
 
 
-def test_second_arbiter_verbatim_retry_exhausted_routes_to_hr_not_silent_drop(tmp_path):
-    """REGRESSION: when the second arbiter's corrected_annotation contains
-    a non-verbatim span and retries are exhausted, the old code silently
-    set corrected_annotation=None and then fell through to the verdict-only
-    path — accepting based on a high-confidence verdict even though the
-    arbiter's attempted fix was broken. New behavior: explicit HR routing,
-    failed correction preserved in event metadata so HR can see what the
-    arbiter tried."""
+def test_second_arbiter_hallucinated_span_is_stripped_and_verdict_decides(tmp_path):
+    """The second arbiter's corrected_annotation contains a span that is not in
+    the input (verbatim violation). Once retries are exhausted the runtime strips
+    the hallucinated span instead of routing to HR — the arbiter's decision on the
+    disputed span is usually right even when it invents an unrelated entity — and
+    only flags the correction as exhausted if violations REMAIN after stripping.
+    Here nothing remains, so the arbiter's verdict ('annotator', certain: agree
+    with the first arbiter) decides. What must never happen: the invented span
+    leaking into the accepted annotation."""
     store = SqliteStore.open(tmp_path)
     project = "p"
     _seed_prior(store, project_id=project, span="Apple",
@@ -736,21 +737,10 @@ def test_second_arbiter_verbatim_retry_exhausted_routes_to_hr_not_silent_drop(tm
     runtime = SubagentRuntime(store=store, client_factory=lambda _t: _Client())
     runtime._resolve_first_arbiter_divergence(store.load_task("t-verbatim"))
     after = store.load_task("t-verbatim")
-    assert after.status is TaskStatus.HUMAN_REVIEW, (
-        "task with verbatim-failing second-arbiter correction must NOT be "
-        "silently accepted via verdict fallthrough"
-    )
-    assert after.metadata.get("prior_verifier_action") == "second_arbiter_verbatim_failed"
-    # The bad correction should be preserved in the HR transition event so
-    # operators can see what the arbiter tried.
-    events = store.list_events("t-verbatim")
-    hr_events = [e for e in events if e.next_status is TaskStatus.HUMAN_REVIEW]
-    assert hr_events, "expected at least one HR transition event"
-    final_event_md = hr_events[-1].metadata
-    assert final_event_md.get("prior_verifier_action") == "second_arbiter_verbatim_failed"
-    assert final_event_md.get("failed_correction") is not None, (
-        "the failed corrected_annotation must be preserved for HR visibility"
-    )
-    assert "Apricot" in json.dumps(final_event_md["failed_correction"]), (
-        "the preserved correction should contain the verbatim-failing span"
-    )
+    assert after.status is TaskStatus.ACCEPTED
+    assert after.metadata.get("prior_verifier_action") == "resolved_to_first"
+    # The hallucinated span must not reach any stored annotation artifact.
+    for artifact in store.list_artifacts("t-verbatim"):
+        payload_path = store.root / artifact.path
+        if payload_path.exists():
+            assert "Apricot" not in payload_path.read_text(encoding="utf-8"), artifact.path
