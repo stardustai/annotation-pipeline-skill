@@ -730,3 +730,96 @@ def test_scheduler_routes_uncertain_flag_to_second_arbiter(tmp_path):
         f"_resolve_uncertain_arbiter must be called for the flagged task; got {resolver_called}"
     )
 
+
+
+# ── active_probe_targets ────────────────────────────────────────────────────
+# The provider health probe must follow the ACTIVE pipeline: in multi-annotation
+# qc and arbiter_secondary are never invoked, so probing them produces false
+# "operator action required" 429 alerts. Regression for the v5 arbiter_secondary
+# 429 noise (2026-06-19).
+from annotation_pipeline_skill.core.runtime import AnnotationConfig
+from annotation_pipeline_skill.runtime.local_scheduler import active_probe_targets
+
+_DEFAULT_PROBE = ("annotation", "qc", "arbiter", "arbiter_secondary", "fallback")
+
+
+def test_active_probe_targets_single_annotation_uses_full_default():
+    cfg = AnnotationConfig(replicas=1)
+    assert active_probe_targets(cfg, _DEFAULT_PROBE) == _DEFAULT_PROBE
+
+
+def test_active_probe_targets_multi_annotation_excludes_qc_and_secondary():
+    cfg = AnnotationConfig(
+        replicas=2,
+        targets=["annotation", "claude_haiku"],
+        arbiter_target="arbiter",
+    )
+    result = active_probe_targets(cfg, _DEFAULT_PROBE)
+    assert "qc" not in result
+    assert "arbiter_secondary" not in result
+    # annotators + arbiter + fallback, in order, de-duplicated
+    assert result == ("annotation", "claude_haiku", "arbiter", "fallback")
+
+
+def test_active_probe_targets_multi_dedupes_when_annotator_is_also_arbiter():
+    cfg = AnnotationConfig(replicas=2, targets=["annotation", "arbiter"], arbiter_target="arbiter")
+    result = active_probe_targets(cfg, _DEFAULT_PROBE)
+    assert result == ("annotation", "arbiter", "fallback")
+    assert len(result) == len(set(result))
+
+
+# ── hot reload of the annotation stage ─────────────────────────────────────
+
+
+def _hot_reload_scheduler(tmp_path, annotation):
+    import yaml as _yaml
+
+    root = tmp_path / "proj" / ".annotation-pipeline"
+    root.mkdir(parents=True)
+    workflow = root / "workflow.yaml"
+    workflow.write_text(_yaml.safe_dump({"stages": {"annotation": annotation}}), encoding="utf-8")
+    store = SqliteStore.open(root)
+    scheduler = LocalRuntimeScheduler(
+        store=store, client_factory=passing_client_factory, config=RuntimeConfig(max_concurrent_tasks=1),
+        annotation_config=AnnotationConfig(replicas=1),
+    )
+    return scheduler, workflow
+
+
+class _FakeRuntime:
+    annotation_config = None
+
+
+def _bump_mtime(path):
+    import os
+    os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 5))
+
+
+def test_hot_reload_applies_a_workflow_edit_to_the_scheduler_and_runtime(tmp_path):
+    scheduler, workflow = _hot_reload_scheduler(tmp_path, {"replicas": 2, "targets": ["annotation", "annotation_2"]})
+    runtime = _FakeRuntime()
+
+    scheduler.reload_annotation_config(runtime)
+
+    assert scheduler.annotation_config.replicas == 2
+    assert runtime.annotation_config is scheduler.annotation_config
+    assert scheduler.annotation_config.targets == ["annotation", "annotation_2"]
+    # an unchanged file is not re-read
+    before = scheduler.annotation_config
+    scheduler.reload_annotation_config(runtime)
+    assert scheduler.annotation_config is before
+
+
+def test_hot_reload_keeps_the_last_good_config_and_alerts_on_a_bad_edit(tmp_path):
+    scheduler, workflow = _hot_reload_scheduler(tmp_path, {"replicas": 2, "targets": ["annotation", "annotation_2"]})
+    runtime = _FakeRuntime()
+    scheduler.reload_annotation_config(runtime)
+    good = scheduler.annotation_config
+
+    workflow.write_text("stages: [unclosed", encoding="utf-8")
+    _bump_mtime(workflow)
+    scheduler.reload_annotation_config(runtime)
+
+    assert scheduler.annotation_config is good
+    alerts = (scheduler.store.root / "alerts.jsonl").read_text(encoding="utf-8")
+    assert "config_reload_error" in alerts

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+import yaml
+
 from annotation_pipeline_skill.core.models import Task
 from annotation_pipeline_skill.core.runtime import ActiveRun, AnnotationConfig, RuntimeConfig, RuntimeLease, RuntimeSnapshot
 from annotation_pipeline_skill.core.states import TaskStatus
@@ -17,6 +19,34 @@ from annotation_pipeline_skill.llm.client import LLMClient
 from annotation_pipeline_skill.runtime.snapshot import build_runtime_snapshot
 from annotation_pipeline_skill.runtime.subagent_cycle import SubagentRuntime
 from annotation_pipeline_skill.store.sqlite_store import SqliteStore
+
+
+def active_probe_targets(
+    annotation_config: AnnotationConfig,
+    default_targets: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Targets worth health-probing for the ACTIVE pipeline.
+
+    Multi-annotation (``replicas > 1``) runs N annotators + one arbiter and
+    accepts directly — ``qc`` and ``arbiter_secondary`` are never invoked. The
+    health probe pings ``provider_health`` for each target on a 5-minute
+    cadence; probing a target the pipeline never calls only produces false
+    "operator action required" alerts (e.g. a 429 on ``arbiter_secondary``
+    when it isn't part of the workflow). So in multi-annotation we probe the
+    annotators + arbiter + fallback only. Single-annotation (``replicas == 1``)
+    uses the full default set (it does use qc and arbiter_secondary).
+    """
+    if annotation_config.replicas <= 1:
+        return default_targets
+    ordered: list[str] = []
+    for target in [
+        *(annotation_config.targets or ["annotation"]),
+        annotation_config.arbiter_target or "arbiter",
+        "fallback",
+    ]:
+        if target and target not in ordered:
+            ordered.append(target)
+    return tuple(ordered)
 
 
 class SchedulerAlreadyRunningError(RuntimeError):
@@ -137,6 +167,12 @@ class LocalRuntimeScheduler:
         # edit went unapplied for hours), so target/profile changes are also
         # picked up synchronously on the next client build via a cheap stat().
         self._resolve_reload_mtime: float = 0.0
+        # Hot-reload tracker for the annotation stage config (replicas / targets /
+        # keep_threshold / arbiter / accept_directly) in workflow.yaml, so a
+        # Providers-UI edit takes effect on the next task WITHOUT a runtime
+        # restart — mirrors the llm_profiles hot-swap above.
+        self._workflow_path: Path = store.root / "workflow.yaml"
+        self._workflow_mtime: float = 0.0
         # Per-target cooldown for the provider health probe — once the
         # observer ticks at PROBE_INTERVAL_SECONDS it walks PROBE_TARGETS
         # in order; this tracks last successful probe timestamps so a
@@ -260,16 +296,16 @@ class LocalRuntimeScheduler:
             continuity_handle=None,
             response_format={"type": "json_object"},
         )
-        for target in self.PROBE_TARGETS:
+        for target in active_probe_targets(self.annotation_config, self.PROBE_TARGETS):
             try:
                 client = self.client_factory(target)
             except Exception:  # noqa: BLE001 — target may not be configured
                 continue
-            # codex_cli authenticates via OAuth auth.json, not an API key,
-            # and spawns a full CLI process — the probe's ephemeral isolated
-            # home lacks project-trust config, causing false-positive failures.
-            # Balance / auth errors don't apply to OAuth sessions, so skip.
-            if getattr(getattr(client, "profile", None), "runtime", None) == "codex_cli":
+            # CLI runtimes (codex_cli, claude_cli) authenticate via OAuth /
+            # CLI sessions, not API keys. Probing them is meaningless for
+            # balance/auth detection and can produce false-positive failures
+            # (isolated home dirs lack project-trust / session files).
+            if getattr(getattr(client, "profile", None), "runtime", None) in {"codex_cli", "claude_cli"}:
                 continue
             # Skip local endpoints (127.x / localhost / ::1). The probe
             # exists to catch remote wallet/auth failures; pinging a local
@@ -440,6 +476,52 @@ class LocalRuntimeScheduler:
                 f"reset {reset} ANNOTATING task(s) to pending",
                 file=sys.stderr,
             )
+
+    def reload_annotation_config(self, runtime) -> None:
+        """Re-read stages.annotation from workflow.yaml; if it changed, swap
+        both ``self.annotation_config`` (used for the health probe) and the
+        live runtime's copy (used per task) so replicas/targets/keep_threshold/
+        arbiter/accept_directly edits take effect on the NEXT claimed task —
+        no restart. A bad edit keeps the last good config."""
+        path = self._workflow_path
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._workflow_mtime:
+            return
+        self._workflow_mtime = mtime
+        from annotation_pipeline_skill.config.loader import load_annotation_config
+        from annotation_pipeline_skill.runtime.alerts import append_alert
+        try:
+            new_cfg = load_annotation_config(self.store.root.parent)
+        except (yaml.YAMLError, ValueError, TypeError) as exc:
+            # A bad edit keeps the last good config, and says so.
+            append_alert(self.store.root, {
+                "ts": self._now_fn().isoformat(),
+                "kind": "config_reload_error",
+                "message": f"workflow.yaml annotation stage not reloaded: {type(exc).__name__}: {exc}",
+            })
+            return
+        old_cfg = self.annotation_config
+        if old_cfg == new_cfg:
+            return
+        self.annotation_config = new_cfg
+        if runtime is not None:
+            runtime.annotation_config = new_cfg
+        import sys
+        msg = (
+            f"annotation: replicas {old_cfg.replicas}→{new_cfg.replicas}, "
+            f"targets {old_cfg.targets}→{new_cfg.targets}, "
+            f"keep_threshold {old_cfg.keep_threshold}→{new_cfg.keep_threshold}, "
+            f"arbiter {old_cfg.arbiter_target}→{new_cfg.arbiter_target}"
+        )
+        print(f"[scheduler] hot-reload {msg}", file=sys.stderr, flush=True)
+        append_alert(self.store.root, {
+            "ts": self._now_fn().isoformat(),
+            "kind": "config_reload",
+            "message": msg,
+        })
 
     async def run_forever(
         self,
@@ -910,11 +992,15 @@ class LocalRuntimeScheduler:
                     })
                 self._registry = reg
 
+        def reload_annotation_config_from_yaml() -> None:
+            self.reload_annotation_config(runtime)
+
         async def config_watcher() -> None:
             """Fast-tick watcher dedicated to hot-reloading
-            `max_concurrent_tasks` from the yaml. Independent of the
-            (slow, snapshot-cadence) observer so concurrency edits show
-            up within seconds, not 30s+."""
+            `max_concurrent_tasks` (llm_profiles.yaml) and the annotation stage
+            config (workflow.yaml) from disk. Independent of the (slow,
+            snapshot-cadence) observer so config edits show up within seconds,
+            not 30s+."""
             while not stop.is_set():
                 try:
                     await asyncio.wait_for(
@@ -926,6 +1012,10 @@ class LocalRuntimeScheduler:
                     return
                 try:
                     await reload_max_workers_from_yaml()
+                except Exception:  # noqa: BLE001 — never let reload tank watcher
+                    pass
+                try:
+                    reload_annotation_config_from_yaml()
                 except Exception:  # noqa: BLE001 — never let reload tank watcher
                     pass
 
