@@ -12,6 +12,7 @@ level — no real HTTP / no real API key needed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 from pathlib import Path
@@ -569,3 +570,32 @@ def test_anthropic_tool_use_content_to_openai():
     assert tc["id"] == "toolu_1"
     assert tc["function"]["name"] == "check"
     assert json.loads(tc["function"]["arguments"]) == {"x": 1}
+
+
+def _capture_client_kwargs(monkeypatch) -> list[dict]:
+    import annotation_pipeline_skill.llm.anthropic_sdk as module
+
+    captured: list[dict] = []
+
+    class _FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr(module, "AsyncAnthropic", _FakeAsyncAnthropic)
+    return captured
+
+
+def test_oauth_access_token_is_sent_as_auth_token_not_api_key(monkeypatch):
+    captured = _capture_client_kwargs(monkeypatch)
+    profile = dataclasses.replace(_profile(), api_key="sk-ant-oat01-oauth-access-token")
+    AnthropicSDKClient(profile)._get_client()
+    assert captured[0]["auth_token"] == "sk-ant-oat01-oauth-access-token"
+    assert "api_key" not in captured[0]
+
+
+def test_regular_api_key_is_sent_as_api_key(monkeypatch):
+    captured = _capture_client_kwargs(monkeypatch)
+    profile = dataclasses.replace(_profile(), api_key="sk-ant-api03-regular-key")
+    AnthropicSDKClient(profile)._get_client()
+    assert captured[0]["api_key"] == "sk-ant-api03-regular-key"
+    assert "auth_token" not in captured[0]

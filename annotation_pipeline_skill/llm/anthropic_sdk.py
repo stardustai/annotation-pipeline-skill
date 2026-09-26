@@ -50,9 +50,17 @@ class AnthropicSDKClient(BaseSdkClient):
     def _get_client(self) -> AsyncAnthropic:
         """Return a cached AsyncAnthropic client, rebuilding it if the
         resolved key/token has changed since last call (e.g. after re-login)."""
-        api_key = self.profile.resolve_api_key() or None
+        resolved = self.profile.resolve_api_key() or None
         auth_token: str | None = None
-        if not api_key:
+        api_key: str | None = None
+        if resolved:
+            # OAuth access tokens (sk-ant-oat01-*) must use auth_token=,
+            # not api_key=; regular API keys (sk-ant-api03-*) use api_key=.
+            if resolved.startswith("sk-ant-oat"):
+                auth_token = resolved
+            else:
+                api_key = resolved
+        if not auth_token and not api_key:
             auth_token = _read_oauth_access_token(os.environ)
         current_key = auth_token or api_key or "sk-no-key-configured"
         if self._client is None or current_key != self._client_key:
