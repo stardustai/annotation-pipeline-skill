@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 logger = logging.getLogger("annotation_pipeline_skill.runtime.subagent_cycle")
 
+from robust_json import extract as _robust_json_extract
 from robust_json import loads as _robust_json_loads
 
 from annotation_pipeline_skill.core.models import ArtifactRef, Attempt, FeedbackDiscussionEntry, FeedbackRecord, Task, utc_now
@@ -3646,12 +3647,21 @@ class SubagentRuntime:
         instr = _annotation_instructions(task, guideline=guideline, output_schema=schema)
 
         async def _one(target: str):
-            res = await self._generate_complete(target, LLMGenerateRequest(
-                instructions=instr, prompt=user_prompt,
-                response_format=self._build_response_format(target, stage="annotation", output_schema=schema),
-                task_id=task.task_id))
-            cleaned, _, _ = _serialize_llm_json(res.final_text, task=task)
-            return json.loads(cleaned)
+            # One retry: a draft whose JSON can't be parsed, or whose lenient repair
+            # misaligned rows (_serialize_llm_json then returns the raw text), would
+            # otherwise be dropped from consensus or carry annotations on wrong rows.
+            for attempt in range(2):
+                res = await self._generate_complete(target, LLMGenerateRequest(
+                    instructions=instr, prompt=user_prompt,
+                    response_format=self._build_response_format(target, stage="annotation", output_schema=schema),
+                    task_id=task.task_id))
+                cleaned, _, _ = _serialize_llm_json(res.final_text, task=task)
+                try:
+                    return json.loads(cleaned)
+                except ValueError:
+                    if attempt == 1:
+                        raise
+                    logger.warning("consensus_draft_retry task=%s target=%s", task.task_id, target)
 
         # Tolerate partial failure: one annotator raising / returning bad JSON
         # must not abort the whole round. Keep only the dict results.
@@ -4189,6 +4199,70 @@ def _parse_llm_json(text: str) -> Any:
         raise primary_err
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _llm_json_is_clean(text: str) -> bool:
+    """True when the JSON payload in ``text`` is strict JSON with no repeated keys.
+
+    ``_parse_llm_json`` repairs malformed JSON leniently. When a model drops the
+    brace that closes one row object, the repair folds the next row's keys into
+    it: the later ``output`` silently overwrites the earlier one and a row goes
+    missing. A payload that needed no repair (only fences or prose around it)
+    cannot have been misaligned that way.
+    """
+    stripped = _strip_think_blocks(text) or text
+    extraction = _robust_json_extract(stripped)
+    if extraction is None or extraction.is_partial:
+        return False
+    try:
+        json.loads(extraction.text, object_pairs_hook=_reject_duplicate_keys)
+    except ValueError:
+        return False
+    return True
+
+
+def _repaired_rows_misaligned(task: Task, text: str, parsed: Any) -> str | None:
+    """Describe why a leniently repaired annotation can't be trusted, else None.
+
+    Only payloads that needed a repair (or repeat keys) are checked; clean JSON
+    that merely drops rows keeps going through ``_auto_fill_missing_rows``.
+    """
+    if _llm_json_is_clean(text):
+        return None
+    rows = parsed.get("rows") if isinstance(parsed, dict) else None
+    try:
+        src_rows = task.source_ref.get("payload", {}).get("rows", [])
+    except (AttributeError, TypeError):
+        return None
+    if not isinstance(rows, list) or not isinstance(src_rows, list) or not src_rows:
+        return None
+    for key in ("row_id", "row_index"):
+        expected = {r.get(key) for r in src_rows if isinstance(r, dict) and r.get(key) is not None}
+        got = [r.get(key) if isinstance(r, dict) else None for r in rows]
+        if not expected or all(value is None for value in got):
+            continue
+        if any(value is None for value in got):
+            # A brace missing inside a row's `output` makes the repair close `output`
+            # early and swallow that row's keys, leaving a row with no key at all.
+            return f"lenient JSON repair left a row without {key}"
+        missing = expected - set(got)
+        duplicated = {value for value in got if got.count(value) > 1}
+        if missing or duplicated:
+            return (
+                f"lenient JSON repair left rows misaligned by {key}: "
+                f"missing {sorted(map(str, missing))}, duplicated {sorted(map(str, duplicated))}"
+            )
+        return None
+    return None
+
+
 def _auto_fill_missing_rows(task: Task, parsed: Any) -> int:
     """Insert empty `{entities: {}, json_structures: {}}` stubs for any
     source row the annotator dropped from its output. Returns the count
@@ -4290,6 +4364,12 @@ def _serialize_llm_json(
     except (ValueError, TypeError):
         return text, 0, 0
     if task is not None:
+        misaligned = _repaired_rows_misaligned(task, text, parsed)
+        if misaligned:
+            # Return the raw text: validation then reports the missing row and the
+            # annotator retries, instead of an empty stub hiding the lost output.
+            logger.warning("llm_json_misaligned_repair task=%s %s", task.task_id, misaligned)
+            return text, 0, 0
         try:
             from annotation_pipeline_skill.core.schema_validation import (
                 auto_fix_safe_spans_in_place,
